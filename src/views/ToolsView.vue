@@ -77,6 +77,10 @@ const openPrivacy = (): void => {
   void act(() => invoke('open_external_page', { page: 'privacy' }), '已在浏览器打开隐私说明');
 };
 
+const checkUpdate = (): void => {
+  void act(() => invoke('open_external_page', { page: 'releases' }), '已在浏览器打开版本发布页');
+};
+
 onMounted(async () => {
   try {
     const st = JSON.parse(String(await invoke<string>('app_state_json')) || '{}');
@@ -118,6 +122,15 @@ onMounted(async () => {
         <input ref="fileInput" type="file" accept="application/json,.json" hidden @change="importSettings" />
       </div>
       <p v-if="backupStatus" class="status-line">{{ backupStatus }}</p>
+    </Card>
+
+    <Card title="版本与更新" icon="update">
+      <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px">
+        <span style="font-family: var(--mono); font-size: 12px; color: var(--muted)">
+          当前版本 {{ store.version || 'v0.1.0' }}
+        </span>
+        <button class="btn" :disabled="store.busy" @click="checkUpdate">检查更新</button>
+      </div>
     </Card>
 
     <Card title="恢复与隐私" icon="shield">

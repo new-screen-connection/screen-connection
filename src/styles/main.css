@@ -4,21 +4,22 @@
    ============================================================ */
 
 :root {
-  --bg: #0e1014;
-  --bg-sidebar: #12151b;
-  --panel: #171b23;
-  --panel-2: #1d232e;
-  --border: #262d3a;
-  --border-soft: #202632;
-  --text: #e8ebf2;
-  --muted: #8b95a8;
-  --faint: #5c6678;
-  --accent: #4da3ff;
-  --accent-strong: #2f8bff;
-  --accent-dim: rgba(77, 163, 255, 0.14);
-  --ok: #3fcf8e;
-  --warn: #f0b429;
-  --err: #ff6b6b;
+  /* 色板与官网 screenguard 站点保持一致 */
+  --bg: #101526;
+  --bg-sidebar: #121830;
+  --panel: #171f34;
+  --panel-2: #1c2542;
+  --border: #263050;
+  --border-soft: #212a46;
+  --text: #f5f7ff;
+  --muted: #aeb7cf;
+  --faint: #727e9c;
+  --accent: #6b8cff;
+  --accent-strong: #85a1ff;
+  --accent-dim: rgba(107, 140, 255, 0.15);
+  --ok: #55c9a5;
+  --warn: #ffc07a;
+  --err: #ff8080;
   --radius: 10px;
   --radius-sm: 7px;
   --font: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
@@ -27,18 +28,21 @@
 
 @media (prefers-color-scheme: light) {
   :root {
-    --bg: #f4f6f9;
-    --bg-sidebar: #eceff4;
+    --bg: #f2f5fc;
+    --bg-sidebar: #e9edf8;
     --panel: #ffffff;
-    --panel-2: #f2f5f9;
-    --border: #dde3ec;
-    --border-soft: #e7ecf3;
-    --text: #1b2330;
-    --muted: #5d6b80;
-    --faint: #98a3b5;
-    --accent: #2f7fe8;
-    --accent-strong: #1f6fd8;
-    --accent-dim: rgba(47, 127, 232, 0.1);
+    --panel-2: #f3f6fd;
+    --border: #dfe5f3;
+    --border-soft: #e8edf7;
+    --text: #1c2440;
+    --muted: #5f6b8a;
+    --faint: #97a1ba;
+    --accent: #5578e8;
+    --accent-strong: #4064d8;
+    --accent-dim: rgba(85, 120, 232, 0.1);
+    --ok: #2fae8b;
+    --warn: #e8a356;
+    --err: #e05c5c;
   }
 }
 
@@ -110,11 +114,8 @@ body {
   width: 32px;
   height: 32px;
   border-radius: 8px;
-  background: linear-gradient(135deg, var(--accent), #7c5cff);
-  display: grid;
-  place-items: center;
-  color: #fff;
   flex: none;
+  display: block;
 }
 
 .brand-name {
@@ -163,6 +164,11 @@ body {
   font-weight: 600;
 }
 
+/* 宽窗口侧边栏：总览排第一；窄窗口底部标签栏恢复 DOM 顺序（居中） */
+.nav-item.nav-overview {
+  order: -1;
+}
+
 .nav-item .ic {
   width: 17px;
   height: 17px;
@@ -203,7 +209,7 @@ body {
 }
 
 .view {
-  max-width: 860px;
+  width: 100%;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -733,30 +739,46 @@ input[type='range']:disabled {
   .shell {
     grid-template-columns: 1fr;
     grid-template-areas:
-      'side'
       'main'
-      'statusbar';
-    grid-template-rows: auto 1fr auto;
+      'statusbar'
+      'side';
+    grid-template-rows: 1fr auto auto;
   }
   .sidebar {
     flex-direction: row;
     align-items: center;
-    padding: 8px 12px;
+    padding: 6px 10px;
     border-right: none;
-    border-bottom: 1px solid var(--border-soft);
+    border-top: 1px solid var(--border-soft);
+    border-bottom: none;
   }
   .brand {
-    padding: 0 10px 0 0;
+    display: none;
   }
   .brand-text {
     display: none;
   }
   .nav {
+    flex: 1;
     flex-direction: row;
+    justify-content: space-around;
     overflow-x: auto;
   }
+  .nav-item {
+    flex-direction: column;
+    gap: 3px;
+    padding: 6px 12px;
+  }
   .nav-item span {
-    display: none;
+    display: block;
+    font-size: 10.5px;
+  }
+  .nav-item .ic {
+    width: 19px;
+    height: 19px;
+  }
+  .nav-item.nav-overview {
+    order: 0;
   }
   .side-foot {
     display: none;
