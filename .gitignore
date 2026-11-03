@@ -17,3 +17,6 @@ dist/
 .env.local
 
 .DS_Store
+
+# Vite 依赖缓存
+.vite/
