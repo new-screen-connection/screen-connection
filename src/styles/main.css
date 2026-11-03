@@ -78,11 +78,6 @@ body {
   letter-spacing: 0.02em;
 }
 
-.brand-ver {
-  font-size: 11px;
-  color: var(--faint);
-  font-family: var(--mono);
-}
 
 .nav {
   display: flex;
@@ -388,6 +383,12 @@ body {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+/* 刷新按钮贴卡片底部：滑块数量不同的卡片位置也一致 */
+.display-foot {
+  margin-top: auto;
+  padding-top: 10px;
 }
 
 .display-top {

@@ -1,0 +1,193 @@
+/* Agent 对话窗样式：主窗口与托盘面板共用，compact 模式适配小窗 */
+
+.chat {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.chat-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 2px;
+}
+
+.chat-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.chat-list::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+
+.chat-row {
+  display: flex;
+}
+
+.chat-row.user {
+  justify-content: flex-end;
+}
+
+.chat-bubble {
+  max-width: 78%;
+  padding: 8px 12px;
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chat-row.agent .chat-bubble {
+  background: var(--panel-2);
+  border: 1px solid var(--border-soft);
+  color: var(--text);
+  border-top-left-radius: 4px;
+}
+
+.chat-row.user .chat-bubble {
+  background: var(--accent-dim);
+  border: 1px solid var(--accent);
+  color: var(--text);
+  border-top-right-radius: 4px;
+}
+
+/* 打字中动画 */
+.chat-bubble.typing {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  padding: 11px 14px;
+}
+
+.chat-bubble.typing span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--faint);
+  animation: chat-blink 1.1s infinite;
+}
+
+.chat-bubble.typing span:nth-child(2) {
+  animation-delay: 0.18s;
+}
+
+.chat-bubble.typing span:nth-child(3) {
+  animation-delay: 0.36s;
+}
+
+@keyframes chat-blink {
+  0%,
+  60%,
+  100% {
+    opacity: 0.3;
+  }
+  30% {
+    opacity: 1;
+  }
+}
+
+/* 快捷提问 */
+.chat-suggest {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 0 2px;
+}
+
+.chat-chip {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 4px 11px;
+  font-size: 12px;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: border-color 0.12s, color 0.12s;
+}
+
+.chat-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* 输入区 */
+.chat-input-row {
+  display: flex;
+  gap: 7px;
+  padding-top: 8px;
+  flex: none;
+}
+
+.chat-input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.12s;
+}
+
+.chat-input:focus {
+  border-color: var(--accent);
+}
+
+.chat-send {
+  flex: none;
+  width: 34px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--muted);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  transition: border-color 0.12s, color 0.12s;
+}
+
+.chat-send:not(:disabled):hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.chat-send:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* ── compact：托盘小窗 ── */
+.chat.compact .chat-list {
+  gap: 7px;
+}
+
+.chat.compact .chat-bubble {
+  max-width: 88%;
+  font-size: 12px;
+  padding: 6px 10px;
+}
+
+.chat.compact .chat-chip {
+  font-size: 11px;
+  padding: 3px 9px;
+}
+
+.chat.compact .chat-input {
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+.chat.compact .chat-input-row {
+  padding-top: 6px;
+}

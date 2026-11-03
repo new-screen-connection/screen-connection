@@ -15,6 +15,6 @@ const emit = defineEmits<{ (e: 'update:modelValue', v: boolean): void }>();
     @click="emit('update:modelValue', !modelValue)"
   >
     <span class="switch-track"></span>
-    <span>{{ modelValue ? onText : offText }}</span>
+    <span v-if="modelValue ? onText : offText">{{ modelValue ? onText : offText }}</span>
   </button>
 </template>

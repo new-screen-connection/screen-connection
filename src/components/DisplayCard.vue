@@ -25,6 +25,7 @@ function pushBrightness(): void {
 }
 
 function pushVolume(): void {
+  if (props.display.volume === null) return;
   sendVCP('volume', props.display.id, volume.value, invoke);
 }
 
@@ -66,14 +67,15 @@ async function refreshInfo(): Promise<void> {
       @commit="pushBrightness"
     />
     <SliderRow
-      v-if="display.ddc && display.volume !== null"
+      v-if="display.ddc"
       v-model="volume"
       label="音量"
       unit="%"
+      :disabled="display.volume === null"
       @commit="pushVolume"
     />
 
-    <div class="btn-grid" style="margin-top: 2px">
+    <div class="btn-grid display-foot">
       <button class="btn sm" @click="refreshInfo">
         <Icon name="refresh" :size="13" />刷新信息
       </button>

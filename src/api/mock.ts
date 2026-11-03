@@ -53,7 +53,7 @@ const state = {
   gamma: 100,
   powerLink: false,
   hotkey: 'Ctrl+Alt+D',
-  version: '0.1.0 (预览数据)',
+  version: 'v0.2.0',
   platform: 'windows',
   mitv: false,
   autostart: false,

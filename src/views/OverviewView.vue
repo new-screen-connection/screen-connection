@@ -110,7 +110,7 @@ onMounted(async () => {
     <!-- 电源联动 -->
     <Card title="电源联动" icon="power">
       <template #actions>
-        <ToggleSwitch v-model="powerLink" on-text="开启" off-text="关闭" @update:model-value="togglePowerLink" />
+        <ToggleSwitch v-model="powerLink" on-text="" off-text="" @update:model-value="togglePowerLink" />
       </template>
       <div style="display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--muted)">
         <Icon name="keyboard" :size="16" />

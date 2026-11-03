@@ -61,4 +61,6 @@ export const ICONS: Record<string, IconDef> = {
   plug: { paths: ['M9 3v5 M15 3v5 M6 8h12v3a6 6 0 0 1-12 0Z M12 17v4'] },
   list: { paths: ['M8 6h13 M8 12h13 M8 18h13'], circles: [{ cx: 4, cy: 6, r: 1 }, { cx: 4, cy: 12, r: 1 }, { cx: 4, cy: 18, r: 1 }] },
   volume: { paths: ['M4 9.5v5h3.5L12 19V5L7.5 9.5H4Z M15.5 9a4.2 4.2 0 0 1 0 6 M18 6.8a8 8 0 0 1 0 10.4'] },
+  chat: { paths: ['M4 5.5h16v10.5H9.5L4 20V5.5Z M8 9.5h8 M8 12.5h5'] },
+  send: { paths: ['M3.5 11.5 20.5 4l-4.5 16.5-5-6.5-7.5-2.5Z M11 14l9.5-10'] },
 };

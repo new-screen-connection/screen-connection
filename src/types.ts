@@ -101,6 +101,7 @@ export const CMD = {
   openMain: 'open_main',
   hidePanel: 'hide_panel',
   quitApp: 'quit_app',
+  agentChat: 'agent_chat',
   getPowerLinkPreference: 'get_power_link_preference',
   setPowerLinkPreference: 'set_power_link_preference',
   hotkeyStart: 'hotkey_start',

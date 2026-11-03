@@ -9,6 +9,7 @@ import QualityView from './views/QualityView.vue';
 import LayoutView from './views/LayoutView.vue';
 import DevicesView from './views/DevicesView.vue';
 import ToolsView from './views/ToolsView.vue';
+import AgentView from './views/AgentView.vue';
 
 const views = {
   quality: { label: '画质', icon: 'palette', comp: QualityView },
@@ -16,6 +17,7 @@ const views = {
   overview: { label: '总览', icon: 'monitor', comp: OverviewView },
   devices: { label: '设备', icon: 'battery', comp: DevicesView },
   tools: { label: '工具', icon: 'wrench', comp: ToolsView },
+  agent: { label: '助手', icon: 'chat', comp: AgentView },
 } as const;
 
 type ViewKey = keyof typeof views;
@@ -44,7 +46,6 @@ onMounted(async () => {
         <img class="brand-mark" :src="appIcon" alt="屏幕连接助手" />
         <div class="brand-text">
           <div class="brand-name">屏幕连接助手</div>
-          <div class="brand-ver">v0.1.0</div>
         </div>
       </div>
 

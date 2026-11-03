@@ -28,6 +28,6 @@ function onCommit(): void {
       @input="onInput"
       @change="onCommit"
     />
-    <span class="val">{{ modelValue }}{{ unit }}</span>
+    <span class="val">{{ disabled ? '—' : `${modelValue}${unit}` }}</span>
   </div>
 </template>

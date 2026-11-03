@@ -5,10 +5,11 @@
   margin: 0;
 }
 
+/* 高度跟随内容，不撑满视口（浏览器预览与 Tauri 内一致由脚本校准窗口高度） */
 html,
 body,
 #panel {
-  height: 100%;
+  height: auto;
 }
 
 body {
@@ -20,11 +21,15 @@ body {
   user-select: none;
 }
 
-/* 窗口本身 transparent，圆角画在这里 */
+/* 窗口本身 transparent，圆角画在这里；超高时内部滚动。
+   max-width + 居中：真机窗口即此宽度，浏览器预览时按真实宽度居中显示 */
 .panel-shell {
-  height: 100%;
   display: flex;
   flex-direction: column;
+  width: 100%;
+  max-width: 360px;
+  margin: 0 auto;
+  max-height: 100vh;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -55,17 +60,20 @@ body {
   gap: 7px;
   flex: 1;
   min-width: 0;
+  white-space: nowrap;
 }
 
 .p-title strong {
   font-size: 13.5px;
   font-weight: 600;
+  flex: none;
 }
 
 .p-ver {
   font-size: 11px;
   color: var(--faint);
   font-family: var(--mono);
+  flex: none;
 }
 
 .p-head-btns {
@@ -114,7 +122,8 @@ body {
 
 /* ── 滚动区 ───────────────────────── */
 .p-scroll {
-  flex: 1;
+  flex: 0 1 auto;
+  min-height: 0;
   overflow-y: auto;
   padding: 10px 12px 6px;
   display: flex;
@@ -138,7 +147,7 @@ body {
   margin-bottom: 7px;
 }
 
-/* 快捷宫格 */
+/* 快捷宫格：4 列，8 项正好两行，末行两项横向排满 */
 .p-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -150,8 +159,8 @@ body {
   background: var(--panel);
   color: var(--text);
   border-radius: var(--radius-sm);
-  padding: 9px 4px;
-  font-size: 12px;
+  padding: 9px 2px;
+  font-size: 11.5px;
   font-family: var(--font);
   cursor: pointer;
   white-space: nowrap;
@@ -217,16 +226,15 @@ body {
   cursor: pointer;
 }
 
-/* 电源行 */
-.p-power-state {
+/* 电源行：名称占满剩余宽度，尽量少截断 */
+.p-power-row .p-slider-name {
+  width: auto;
   flex: 1;
-  font-size: 11.5px;
-  color: var(--ok);
-  font-family: var(--mono);
+  min-width: 0;
 }
 
-.p-power-state.off {
-  color: var(--faint);
+.p-power-row .p-btn.sm {
+  flex: none;
 }
 
 /* 开关行 */
@@ -280,15 +288,39 @@ body {
   background: var(--accent);
 }
 
+/* ── 对话助手区块（常驻嵌入） ─────── */
+.p-chat-sec {
+  display: flex;
+  flex-direction: column;
+}
+
+.p-chat-embed {
+  height: 340px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
 /* ── 底栏 ─────────────────────────── */
 .p-foot {
   flex: none;
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   padding: 8px 12px;
   border-top: 1px solid var(--border-soft);
   background: var(--bg-sidebar);
+}
+
+.p-foot-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .p-foot-link {

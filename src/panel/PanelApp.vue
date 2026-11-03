@@ -4,10 +4,11 @@
  * 定位：高频单手操作——亮度、音量、快捷动作、屏幕电源。
  * 复杂配置仍放主窗口，这里只保留"一眼可达"的能力。
  */
-import { computed, onMounted, ref } from 'vue';
-import { invoke, listenEvent, errText } from '../api/tauri';
+import { computed, nextTick, onMounted, ref } from 'vue';
+import { invoke, isTauri, listenEvent, errText } from '../api/tauri';
 import { sendVCP } from '../api/vcp';
 import type { DisplayInfo, SystemAudio } from '../types';
+import ChatPanel from '../components/ChatPanel.vue';
 import appIcon from '../assets/app-icon.png';
 
 interface PowerRow {
@@ -116,11 +117,6 @@ const allBrightness = computed<number>({
   },
 });
 
-function powerLabel(mode: number | null): string {
-  if (mode === null) return '未知';
-  return { 1: '开', 2: '待机', 4: '软关', 5: '硬关' }[mode] ?? String(mode);
-}
-
 /** 切换单屏电源；点亮后 DDC 通道需 2~5 秒恢复（旧版实测），延迟回读避免读到瞬态 */
 async function togglePower(row: PowerRow, on: boolean): Promise<void> {
   const mode = on ? 1 : 4;
@@ -210,6 +206,28 @@ const quickActions = computed(() => [
   { key: 'repair', label: '修复显示器', icon: 'wrench', run: () => act(() => invoke('repair_display')) },
 ]);
 
+/** 把窗口高度校准为内容实际高度，消除底部留白（浏览器预览下跳过） */
+async function fitWindow(): Promise<void> {
+  if (!isTauri()) return;
+  await nextTick();
+  try {
+    const t = (window as unknown as {
+      __TAURI__?: {
+        window: { getCurrentWindow: () => { setSize: (s: unknown) => Promise<void> } };
+        dpi: { LogicalSize: new (w: number, h: number) => unknown };
+      };
+    }).__TAURI__;
+    if (!t?.window) return;
+    const shell = document.querySelector('.panel-shell');
+    if (!shell) return;
+    const h = Math.ceil(shell.getBoundingClientRect().height);
+    // 宽度取窗口当前宽，高度校准为内容实际高度
+    await t.window.getCurrentWindow().setSize(new t.dpi.LogicalSize(Math.round(window.innerWidth), Math.min(Math.max(h, 320), 860)));
+  } catch {
+    /* 权限或 API 不可用时保持配置的固定高度 */
+  }
+}
+
 const openMain = (): void => {
   void act(() => invoke('open_main'));
 };
@@ -244,6 +262,7 @@ onMounted(async () => {
   await listenEvent('power-link-status', (payload) => {
     flash(typeof payload === 'string' ? payload : JSON.stringify(payload));
   });
+  await fitWindow();
 });
 </script>
 
@@ -253,7 +272,6 @@ onMounted(async () => {
       <img class="p-icon" :src="appIcon" alt="" />
       <div class="p-title">
         <strong>屏幕连接助手</strong>
-        <span v-if="version" class="p-ver">{{ version }}</span>
       </div>
       <div class="p-head-btns">
         <button class="p-btn ghost" title="打开主窗口" @click="openMain">主窗</button>
@@ -316,9 +334,6 @@ onMounted(async () => {
         <div class="p-sec-label">屏幕电源</div>
         <div v-for="row in powerRows" :key="row.id" class="p-power-row">
           <span class="p-slider-name" :title="row.name">{{ row.name }}</span>
-          <span class="p-power-state" :class="{ off: row.mode !== null && row.mode !== 1 }">
-            {{ row.pending ? '…' : powerLabel(row.mode) }}
-          </span>
           <button class="p-btn sm" :disabled="row.pending" @click="togglePower(row, true)">开</button>
           <button class="p-btn sm" :disabled="row.pending" @click="togglePower(row, false)">关</button>
         </div>
@@ -335,13 +350,23 @@ onMounted(async () => {
           </button>
         </div>
       </section>
+
+      <section class="p-sec p-chat-sec">
+        <div class="p-sec-label">对话助手</div>
+        <div class="p-chat-embed">
+          <ChatPanel compact />
+        </div>
+      </section>
     </div>
 
     <footer class="p-foot">
       <button class="p-foot-link" @click="toggleAutostart">
         开机自启<span class="dot" :class="{ on: autostart }" />{{ autostart ? '已开启' : '已关闭' }}
       </button>
-      <button class="p-foot-link danger" @click="quitApp">退出应用</button>
+      <div class="p-foot-right">
+        <span v-if="version" class="p-ver">{{ version }}</span>
+        <button class="p-foot-link danger" @click="quitApp">退出应用</button>
+      </div>
     </footer>
 
     <transition name="toast">
