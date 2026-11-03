@@ -1,0 +1,90 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ScreenConnection",
+  "version": "0.1.0",
+  "identifier": "com.nanyu.screenguard",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "title": "屏幕连接助手",
+        "label": "main",
+        "width": 780,
+        "height": 760,
+        "minWidth": 420,
+        "minHeight": 520,
+        "resizable": true,
+        "center": true
+      },
+      {
+        "label": "panel",
+        "url": "panel.html",
+        "width": 380,
+        "height": 568,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "visible": false,
+        "skipTaskbar": true,
+        "resizable": false,
+        "shadow": true
+      },
+      {
+        "label": "notify",
+        "url": "notify.html",
+        "width": 360,
+        "height": 104,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "visible": false,
+        "skipTaskbar": true,
+        "resizable": false,
+        "focus": false,
+        "shadow": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "resources": [
+      "resources/displayplacer/"
+    ],
+    "category": "Utility",
+    "publisher": "nanyu",
+    "copyright": "Copyright © 2026 陆冠霖",
+    "shortDescription": "跨平台显示器控制与多屏助手",
+    "longDescription": "屏幕连接助手（ScreenConnection）：跨平台显示器控制与多屏助手。DDC/CI 亮度音量、色彩同步、副屏横竖切换、双屏铺满看电影、开机自启。",
+    "license": "MIT",
+    "licenseFile": "../LICENSE",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "offlineInstaller",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": [
+          "SimpChinese",
+          "English"
+        ]
+      }
+    }
+  }
+}

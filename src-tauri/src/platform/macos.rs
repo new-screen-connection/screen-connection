@@ -1,0 +1,2636 @@
+use super::{run_cmd, AudioEndpoint, BatteryInfo, DisplayInfo, DisplayMode, SystemAudio};
+use core_foundation::base::{CFType, TCFType};
+use core_foundation::dictionary::CFDictionary;
+use core_foundation::string::CFString;
+use core_foundation::url::CFURL;
+use core_foundation::uuid::CFUUID;
+use serde::{Deserialize, Serialize};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+type CGDisplayConfigRef = *mut std::ffi::c_void;
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGBeginDisplayConfiguration(config: *mut CGDisplayConfigRef) -> i32;
+    fn CGCancelDisplayConfiguration(config: CGDisplayConfigRef) -> i32;
+    fn CGConfigureDisplayOrigin(config: CGDisplayConfigRef, display: u32, x: i32, y: i32) -> i32;
+    fn CGConfigureDisplayMirrorOfDisplay(config: CGDisplayConfigRef, display: u32, master: u32) -> i32;
+    fn CGCompleteDisplayConfiguration(config: CGDisplayConfigRef, option: u32) -> i32;
+    fn CGDisplayIsAsleep(display: u32) -> u32;
+    fn CGDisplayCreateUUIDFromDisplayID(display: u32) -> *const std::ffi::c_void;
+    fn CGDisplayIsBuiltin(display: u32) -> bool;
+}
+
+#[link(name = "ColorSync", kind = "framework")]
+extern "C" {
+    fn ColorSyncDeviceSetCustomProfiles(
+        device_class: *const std::ffi::c_void,
+        device_id: *const std::ffi::c_void,
+        profile_info: *const std::ffi::c_void,
+    ) -> bool;
+    static kColorSyncDeviceDefaultProfileID: *const std::ffi::c_void;
+}
+
+const K_CG_CONFIGURE_PERMANENTLY: u32 = 2;
+
+pub fn platform_name() -> &'static str { "macOS" }
+
+// Carbon global hotkeys do not require Accessibility permission. The app event
+// handler is installed once during Tauri setup and stays active for the process.
+type EventRef = *mut std::ffi::c_void;
+type EventHandlerProc = unsafe extern "C" fn(EventRef, EventRef, *mut std::ffi::c_void) -> i32;
+
+#[repr(C)]
+struct CarbonEventTypeSpec {
+    event_class: u32,
+    event_kind: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CarbonEventHotKeyId {
+    signature: u32,
+    id: u32,
+}
+
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+    fn GetApplicationEventTarget() -> EventRef;
+    fn InstallEventHandler(
+        target: EventRef,
+        handler: EventHandlerProc,
+        count: u32,
+        types: *const CarbonEventTypeSpec,
+        user_data: *mut std::ffi::c_void,
+        out_handler: *mut EventRef,
+    ) -> i32;
+    fn RemoveEventHandler(handler: EventRef) -> i32;
+    fn RegisterEventHotKey(
+        key_code: u32,
+        modifiers: u32,
+        hotkey_id: CarbonEventHotKeyId,
+        target: EventRef,
+        options: u32,
+        out_hotkey: *mut EventRef,
+    ) -> i32;
+    fn UnregisterEventHotKey(hotkey: EventRef) -> i32;
+    fn GetEventParameter(
+        event: EventRef,
+        name: u32,
+        desired_type: u32,
+        actual_type: *mut u32,
+        buffer_size: u32,
+        actual_size: *mut u32,
+        data: *mut std::ffi::c_void,
+    ) -> i32;
+}
+
+const CARBON_EVENT_CLASS_KEYBOARD: u32 = u32::from_be_bytes(*b"keyb");
+const CARBON_EVENT_HOTKEY_PRESSED: u32 = 5;
+const CARBON_EVENT_PARAM_DIRECT_OBJECT: u32 = u32::from_be_bytes(*b"----");
+const CARBON_TYPE_EVENT_HOTKEY_ID: u32 = u32::from_be_bytes(*b"hkid");
+const CARBON_HOTKEY_SIGNATURE: u32 = u32::from_be_bytes(*b"SGHK");
+const CARBON_MODIFIER_CONTROL: u32 = 1 << 12;
+const CARBON_MODIFIER_OPTION: u32 = 1 << 11;
+const CARBON_KEY_L: u32 = 0x25;
+const CARBON_KEY_R: u32 = 0x0f;
+const CARBON_HOTKEY_TOGGLE_ID: u32 = 1;
+const CARBON_HOTKEY_RESTORE_ID: u32 = 2;
+
+fn hotkeys_registered() -> &'static AtomicBool {
+    static REGISTERED: AtomicBool = AtomicBool::new(false);
+    &REGISTERED
+}
+
+fn hotkey_screen_asleep() -> &'static Mutex<bool> {
+    static ASLEEP: OnceLock<Mutex<bool>> = OnceLock::new();
+    ASLEEP.get_or_init(|| Mutex::new(false))
+}
+
+unsafe extern "C" fn carbon_hotkey_handler(
+    _next_handler: EventRef,
+    event: EventRef,
+    _user_data: *mut std::ffi::c_void,
+) -> i32 {
+    let mut hotkey = CarbonEventHotKeyId { signature: 0, id: 0 };
+    let status = GetEventParameter(
+        event,
+        CARBON_EVENT_PARAM_DIRECT_OBJECT,
+        CARBON_TYPE_EVENT_HOTKEY_ID,
+        std::ptr::null_mut(),
+        std::mem::size_of::<CarbonEventHotKeyId>() as u32,
+        std::ptr::null_mut(),
+        (&mut hotkey as *mut CarbonEventHotKeyId).cast(),
+    );
+    if status != 0 || hotkey.signature != CARBON_HOTKEY_SIGNATURE {
+        return 0;
+    }
+
+    match hotkey.id {
+        CARBON_HOTKEY_TOGGLE_ID => {
+            std::thread::spawn(|| {
+                let mut asleep = hotkey_screen_asleep().lock().unwrap_or_else(|e| e.into_inner());
+                let observed = display_sleep_states();
+                let current_asleep = if observed.is_empty() {
+                    *asleep
+                } else {
+                    observed.iter().all(|display| display.asleep)
+                };
+                let result = if current_asleep { screen_wake() } else { screen_off() };
+                if let Err(error) = result {
+                    eprintln!("[screenguard] macOS 快捷键屏幕操作失败：{}", error);
+                } else {
+                    *asleep = !current_asleep;
+                }
+            });
+        }
+        CARBON_HOTKEY_RESTORE_ID => {
+            std::thread::spawn(|| {
+                if let Err(error) = restore_foreground() {
+                    eprintln!("[screenguard] macOS 快捷键窗口还原失败：{}", error);
+                }
+            });
+        }
+        _ => {}
+    }
+    0
+}
+
+/// Register Control+Option+L (all-screen sleep/wake toggle) and
+/// Control+Option+R (restore the previously spanned window).
+pub fn hotkey_start() -> Result<String, String> {
+    if hotkeys_registered().load(Ordering::Acquire) {
+        return Ok("Control+Option+L".to_string());
+    }
+
+    unsafe {
+        let target = GetApplicationEventTarget();
+        if target.is_null() {
+            return Err("无法获取 macOS 应用事件目标，未注册全局快捷键".into());
+        }
+        let event_type = CarbonEventTypeSpec {
+            event_class: CARBON_EVENT_CLASS_KEYBOARD,
+            event_kind: CARBON_EVENT_HOTKEY_PRESSED,
+        };
+        let mut handler = std::ptr::null_mut();
+        let status = InstallEventHandler(
+            target,
+            carbon_hotkey_handler,
+            1,
+            &event_type,
+            std::ptr::null_mut(),
+            &mut handler,
+        );
+        if status != 0 {
+            return Err(format!("安装 macOS 全局快捷键事件处理器失败（Carbon 错误码 {}）", status));
+        }
+
+        let mut toggle = std::ptr::null_mut();
+        let modifiers = CARBON_MODIFIER_CONTROL | CARBON_MODIFIER_OPTION;
+        let status = RegisterEventHotKey(
+            CARBON_KEY_L,
+            modifiers,
+            CarbonEventHotKeyId { signature: CARBON_HOTKEY_SIGNATURE, id: CARBON_HOTKEY_TOGGLE_ID },
+            target,
+            0,
+            &mut toggle,
+        );
+        if status != 0 {
+            RemoveEventHandler(handler);
+            return Err(format!("注册 Control+Option+L 失败（快捷键可能被占用，Carbon 错误码 {}）", status));
+        }
+
+        let mut restore = std::ptr::null_mut();
+        let status = RegisterEventHotKey(
+            CARBON_KEY_R,
+            modifiers,
+            CarbonEventHotKeyId { signature: CARBON_HOTKEY_SIGNATURE, id: CARBON_HOTKEY_RESTORE_ID },
+            target,
+            0,
+            &mut restore,
+        );
+        if status != 0 {
+            UnregisterEventHotKey(toggle);
+            RemoveEventHandler(handler);
+            return Err(format!("注册 Control+Option+R 失败（快捷键可能被占用，Carbon 错误码 {}）", status));
+        }
+
+        hotkeys_registered().store(true, Ordering::Release);
+    }
+    Ok("Control+Option+L".to_string())
+}
+
+pub fn hotkey_label() -> String {
+    if hotkeys_registered().load(Ordering::Acquire) {
+        "Control+Option+L".to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn parse_internal_battery(output: &str) -> Option<BatteryInfo> {
+    let header = output.lines().next().unwrap_or_default();
+    let line = output
+        .lines()
+        .find(|line| line.contains("InternalBattery"))?;
+    if line.contains("present: false") {
+        return None;
+    }
+    let percent = line
+        .split('%')
+        .next()?
+        .rsplit(|ch: char| !ch.is_ascii_digit())
+        .next()?
+        .parse::<i32>()
+        .ok()?;
+    if !(0..=100).contains(&percent) {
+        return None;
+    }
+    let lower = line.to_ascii_lowercase();
+    Some(BatteryInfo {
+        name: "Mac 内置电池".into(),
+        percent,
+        charging: lower.contains("charging") && !lower.contains("not charging"),
+        on_ac: header.contains("AC Power") || lower.contains("ac attached"),
+        conn: "内置".into(),
+        health: -1,
+        cap_mwh: 0,
+        full_mwh: 0,
+    })
+}
+
+/// Parse `osascript -e 'get volume settings'` without treating `missing value` as zero.
+fn parse_system_audio(output: &str) -> Result<SystemAudio, String> {
+    let mut volume = None;
+    let mut mute = None;
+    for field in output.split(',') {
+        let Some((key, value)) = field.trim().split_once(':') else {
+            continue;
+        };
+        match key.trim() {
+            "output volume" => {
+                volume = value.trim().parse::<u32>().ok().filter(|v| *v <= 100);
+            }
+            "output muted" => {
+                mute = match value.trim() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
+    }
+    let adjustable = volume.is_some() && mute.is_some();
+    Ok(SystemAudio {
+        name: "macOS 系统默认输出".into(),
+        volume: volume.unwrap_or(0),
+        mute: mute.unwrap_or(false),
+        adjustable,
+        form_factor: 0,
+    })
+}
+
+fn require_adjustable_system_audio() -> Result<SystemAudio, String> {
+    let output = run_cmd("/usr/bin/osascript", &["-e", "get volume settings"])
+        .map_err(|error| format!("读取 macOS 系统音量失败：{}", error))?;
+    let audio = parse_system_audio(&output)?;
+    if !audio.adjustable {
+        return Err("macOS 当前没有提供可调节的系统默认输出音量".into());
+    }
+    Ok(audio)
+}
+
+/// Read the macOS system default output; no per-device routing is exposed by this control.
+pub fn get_system_audio() -> Result<SystemAudio, String> {
+    let output = run_cmd("/usr/bin/osascript", &["-e", "get volume settings"])
+        .map_err(|error| format!("读取 macOS 系统音量失败：{}", error))?;
+    parse_system_audio(&output)
+}
+
+pub fn set_system_volume(value: u32) -> Result<(), String> {
+    require_adjustable_system_audio()?;
+    let script = format!("set volume output volume {}", value.min(100));
+    run_cmd("/usr/bin/osascript", &["-e", &script])
+        .map(|_| ())
+        .map_err(|error| format!("设置 macOS 系统音量失败：{}", error))
+}
+
+pub fn set_system_mute(on: bool) -> Result<(), String> {
+    require_adjustable_system_audio()?;
+    let script = format!("set volume output muted {}", if on { "true" } else { "false" });
+    run_cmd("/usr/bin/osascript", &["-e", &script])
+        .map(|_| ())
+        .map_err(|error| format!("设置 macOS 系统静音失败：{}", error))
+}
+
+pub fn audio_endpoints() -> Result<Vec<AudioEndpoint>, String> {
+    let audio = get_system_audio()?;
+    Ok(vec![AudioEndpoint {
+        id: "macos-system-default".into(),
+        name: audio.name,
+        volume: audio.volume,
+        mute: audio.mute,
+        adjustable: audio.adjustable,
+        form_factor: audio.form_factor,
+        selected: true,
+        is_default: true,
+    }])
+}
+
+pub fn set_audio_device(id: &str) -> Result<(), String> {
+    if id == "macos-system-default" {
+        Ok(())
+    } else {
+        Err("macOS 输出设备切换请在系统设置中进行".into())
+    }
+}
+
+pub fn set_system_volume_sel(value: u32) -> Result<(), String> {
+    set_system_volume(value)
+}
+
+pub fn set_system_mute_sel(on: bool) -> Result<(), String> {
+    set_system_mute(on)
+}
+
+pub fn get_batteries() -> Result<Vec<BatteryInfo>, String> {
+    let output = run_cmd("/usr/bin/pmset", &["-g", "batt"])
+        .map_err(|error| format!("读取 Mac 内置电池状态失败：{}", error))?;
+    Ok(parse_internal_battery(&output).into_iter().collect())
+}
+
+fn adb_managed_dir() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home)
+        .join("Library/Application Support/Screenguard/android-platform-tools"))
+}
+
+pub fn adb_exe() -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(dir) = adb_managed_dir() {
+        candidates.push(dir.join("platform-tools/adb"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("platform-tools/adb"));
+            candidates.push(dir.join("adb"));
+        }
+    }
+    for key in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
+        if let Some(root) = std::env::var_os(key) {
+            candidates.push(std::path::PathBuf::from(root).join("platform-tools/adb"));
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(std::path::PathBuf::from(home).join("Library/Android/sdk/platform-tools/adb"));
+    }
+    for path in ["/opt/homebrew/bin/adb", "/usr/local/bin/adb", "/usr/bin/adb"] {
+        candidates.push(std::path::PathBuf::from(path));
+    }
+    if let Ok(path) = run_cmd("which", &["adb"]) {
+        let path = std::path::PathBuf::from(path.trim());
+        if !path.as_os_str().is_empty() {
+            candidates.push(path);
+        }
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn run_adb(exe: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(exe)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("adb 执行失败：{}", error))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.status.success() {
+        Ok(stdout)
+    } else if stderr.is_empty() {
+        Err(stdout.trim().to_string())
+    } else if stdout.trim().is_empty() {
+        Err(stderr)
+    } else {
+        Err(format!("{}{}", stdout, stderr).trim().to_string())
+    }
+}
+
+fn parse_adb_devices(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 2 && fields[1] == "device" && !fields[0].starts_with('*') {
+                Some(fields[0].to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+pub fn adb_status() -> super::AdbStatus {
+    match adb_exe() {
+        None => super::AdbStatus {
+            available: false,
+            path: String::new(),
+            devices: Vec::new(),
+            tip: "未找到 adb。点击「获取 ADB」从 Google 官方下载 Android Platform-Tools；下载前需确认 SDK 条款。".into(),
+        },
+        Some(exe) => {
+            let devices = run_adb(&exe, &["devices"])
+                .map(|output| parse_adb_devices(&output))
+                .unwrap_or_default();
+            super::AdbStatus {
+                available: true,
+                path: exe.display().to_string(),
+                devices,
+                tip: "adb 就绪".into(),
+            }
+        }
+    }
+}
+
+pub fn adb_connect(addr: &str) -> Result<String, String> {
+    let exe = adb_exe().ok_or("未找到 adb，请先获取 Android Platform-Tools")?;
+    run_adb(&exe, &["connect", addr])
+}
+
+pub fn adb_shell(serial: &str, cmd: &str) -> Result<String, String> {
+    let exe = adb_exe().ok_or("未找到 adb，请先获取 Android Platform-Tools")?;
+    run_adb(&exe, &["-s", serial, "shell", cmd])
+}
+
+pub fn adb_power(serial: &str) -> Result<String, String> {
+    adb_shell(serial, "input keyevent 26")
+}
+
+pub fn adb_volume(serial: &str, up: bool) -> Result<String, String> {
+    adb_shell(serial, if up { "input keyevent 24" } else { "input keyevent 25" })
+}
+
+pub fn adb_download() -> Result<String, String> {
+    static DOWNLOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _lock = DOWNLOAD_LOCK.lock().map_err(|_| "ADB 下载状态不可用")?;
+    if let Some(exe) = adb_exe() {
+        return Ok(exe.display().to_string());
+    }
+
+    let root = adb_managed_dir().ok_or("无法确定用户目录")?;
+    let archive = root.join("platform-tools-macos.zip");
+    let temp = root.join(format!("extract-{}", std::process::id()));
+    let install_dir = root.join("platform-tools");
+    std::fs::create_dir_all(&root).map_err(|error| format!("创建 ADB 目录失败：{}", error))?;
+    let _ = std::fs::remove_file(&archive);
+    let _ = std::fs::remove_dir_all(&temp);
+    let result = (|| {
+        let archive_arg = archive.to_str().ok_or("ADB 下载路径编码无效")?;
+        run_cmd(
+            "/usr/bin/curl",
+            &[
+                "--fail", "--location", "--silent", "--show-error", "--connect-timeout",
+                "15", "--max-time", "300", "--output", archive_arg,
+                "https://dl.google.com/android/repository/platform-tools-latest-darwin.zip",
+            ],
+        )
+        .map_err(|error| format!("下载 Google Android Platform-Tools 失败：{}", error))?;
+        std::fs::create_dir_all(&temp).map_err(|error| format!("创建临时目录失败：{}", error))?;
+        let archive_arg = archive.to_str().ok_or("ADB 下载路径编码无效")?;
+        let temp_arg = temp.to_str().ok_or("ADB 临时路径编码无效")?;
+        run_cmd("/usr/bin/unzip", &["-q", archive_arg, "-d", temp_arg])
+            .map_err(|error| format!("解压 Android Platform-Tools 失败：{}", error))?;
+        let extracted = temp.join("platform-tools");
+        let adb = extracted.join("adb");
+        if !adb.is_file() {
+            return Err("官方压缩包中未找到 macOS adb 可执行文件".into());
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&adb)
+            .map_err(|error| format!("读取 adb 文件权限失败：{}", error))?
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&adb, permissions)
+            .map_err(|error| format!("设置 adb 执行权限失败：{}", error))?;
+        if install_dir.exists() {
+            return Err("应用托管的 Platform-Tools 目录已存在；为保留现有工具，未覆盖它".into());
+        }
+        std::fs::rename(&extracted, &install_dir)
+            .map_err(|error| format!("安装 Android Platform-Tools 失败：{}", error))?;
+        let installed_adb = install_dir.join("adb");
+        run_adb(&installed_adb, &["version"])
+            .map_err(|error| format!("下载完成，但 adb 启动验证失败：{}", error))?;
+        Ok(installed_adb.display().to_string())
+    })();
+    let _ = std::fs::remove_file(&archive);
+    let _ = std::fs::remove_dir_all(&temp);
+    result
+}
+
+/// Sleep the complete macOS display system without requiring a monitor-specific DDC command.
+pub fn screen_off() -> Result<(), String> {
+    run_cmd("/usr/bin/pmset", &["displaysleepnow"])
+        .map(|_| ())
+        .map_err(|error| format!("macOS 让显示器待机失败：{}", error))
+}
+
+/// Ask macOS to wake the displays by briefly asserting user activity.
+pub fn screen_wake() -> Result<(), String> {
+    run_cmd("/usr/bin/caffeinate", &["-u", "-t", "2"])
+        .map(|_| ())
+        .map_err(|error| format!("macOS 唤醒显示器失败：{}", error))
+}
+
+/// Write the standard DDC/CI power-mode feature directly through the in-process driver.
+pub fn set_display_power(display_id: &str, mode: u32) -> Result<(), String> {
+    if !matches!(mode, 1 | 2 | 4) { return Err("显示器电源模式只支持 1（开）、2（待机）或 4（软关）".into()); }
+    use ddc::Ddc;
+    let cgid = find_ddc_id(display_id)?;
+    with_ddc_monitor(cgid, move |monitor| monitor.set_vcp_feature(0xD6, mode as u16))?
+        .map_err(|error| format!("无法设置显示器电源 VCP 0xD6：{}", error))
+}
+
+fn parse_display_power_mode(output: &str) -> Option<u32> {
+    output.split(|ch: char| !ch.is_ascii_alphanumeric()).filter_map(|token| {
+        if let Some(hex) = token.strip_prefix("0x").or_else(|| token.strip_prefix("0X")) { u32::from_str_radix(hex, 16).ok() }
+        else { token.parse::<u32>().ok() }
+    }).find(|value| matches!(value, 1 | 2 | 3 | 4 | 5))
+}
+
+pub fn get_display_power(display_id: &str) -> Result<u32, String> {
+    use ddc::Ddc;
+    let cgid = find_ddc_id(display_id)?;
+    with_ddc_monitor(cgid, |monitor| monitor.get_vcp_feature(0xD6))?
+        .map(|value| value.value() as u32)
+        .map_err(|error| format!("无法读取显示器电源 VCP 0xD6：{}", error))
+}
+
+#[cfg(test)]
+mod display_power_mode_tests {
+    use super::parse_display_power_mode;
+
+    #[test]
+    fn parses_all_mccs_vcp_d6_power_modes() {
+        for mode in 1..=5 {
+            let output = format!("VCP 0xD6 current value = 0x{mode:02X}");
+            assert_eq!(parse_display_power_mode(&output), Some(mode), "{output}");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_power_modes_instead_of_matching_the_vcp_code() {
+        assert_eq!(parse_display_power_mode("VCP 0xD6 current value = 0x00"), None);
+        assert_eq!(parse_display_power_mode("VCP 0xD6 value unavailable"), None);
+    }
+}
+
+/// Stable active display identifiers used by the macOS attach/detach watcher.
+pub fn display_snapshot() -> Vec<String> {
+    let mut ids: Vec<String> = parse_screens()
+        .into_iter()
+        .filter(|screen| screen.enabled)
+        .map(|screen| screen.id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Per-display macOS sleep state reported by Quartz, independent of DDC/CI.
+pub fn display_sleep_states() -> Vec<super::DisplaySleepState> {
+    parse_screens()
+        .into_iter()
+        .filter(|screen| screen.enabled)
+        .filter_map(|screen| {
+            screen.ctx.map(|display| {
+                let asleep = unsafe { CGDisplayIsAsleep(display) != 0 };
+                super::DisplaySleepState { id: screen.id, asleep }
+            })
+        })
+        .collect()
+}
+
+// ===== 开机自启（LaunchAgent）=====
+const LA_LABEL: &str = "com.nanyu.screenguard";
+const LA_PLIST: &str = "com.nanyu.screenguard.plist";
+const LA_BIN: &str = "/Applications/Screenguard.app/Contents/MacOS/screenguard";
+
+fn launch_agents_plist() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(std::path::PathBuf::from(home).join("Library/LaunchAgents").join(LA_PLIST))
+}
+
+fn current_uid() -> String {
+    std::env::var("UID")
+        .unwrap_or_else(|_| run_cmd("id", &["-u"]).unwrap_or_default().trim().to_string())
+}
+
+/// LaunchAgent 当前是否已加载到 launchd（在跑或曾跑过）
+fn la_loaded(label: &str) -> bool {
+    let uid = current_uid();
+    run_cmd("launchctl", &["print", &format!("gui/{}/{}", uid, label)]).is_ok()
+}
+
+/// 是否已有另一个本程序实例在运行（防 bootstrap 双开）
+pub fn another_instance_running() -> bool {
+    run_cmd("pgrep", &["-x", "screenguard"])
+        .map(|o| o.lines().count() > 1)
+        .unwrap_or(false)
+}
+
+fn la_plist_xml() -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>
+"#,
+        LA_LABEL, LA_BIN
+    )
+}
+
+/// 开机自启是否已启用（LaunchAgent plist 存在 = 下次登录会自启）
+pub fn autostart_enabled() -> bool {
+    launch_agents_plist()
+        .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
+pub fn set_autostart(enabled: bool) -> Result<(), String> {
+    let plist = launch_agents_plist().ok_or("无法定位 ~/Library/LaunchAgents")?;
+    let uid = current_uid();
+    let domain = format!("gui/{}", uid);
+    if enabled {
+        // 写入 plist（覆盖旧内容，保证指向当前安装路径）
+        std::fs::create_dir_all(plist.parent().ok_or("无效路径")?)
+            .map_err(|e| format!("创建 LaunchAgents 目录失败：{}", e))?;
+        std::fs::write(&plist, la_plist_xml())
+            .map_err(|e| format!("写入自启配置失败：{}", e))?;
+        // 仅当 agent 尚未加载时才 bootstrap（已加载时重复加载会报错；
+        // 新拉起的实例会因单实例自检自动退出，不会双开）
+        if !la_loaded(LA_LABEL) {
+            run_cmd("launchctl", &["bootstrap", &domain, &plist.to_string_lossy()])
+                .map(|_| ())
+                .map_err(|e| format!("注册自启失败：{}", e.trim()))?;
+        }
+        Ok(())
+    } else {
+        // 只删 plist（下次登录不再自启），不 bootout——
+        // bootout 会终止当前由 launchd 拉起的自身实例，等于点"关"把自己杀掉
+        match std::fs::remove_file(&plist) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("移除自启配置失败：{}", e)),
+        }
+    }
+}
+
+/// Use the layout helper bundled inside the app, or the repository copy for development.
+fn displayplacer_path() -> Option<std::path::PathBuf> {
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(contents) = executable.parent().and_then(|p| p.parent()) {
+            let bundled = contents.join("Resources/resources/displayplacer/displayplacer");
+            if bundled.is_file() { return Some(bundled); }
+        }
+    }
+    let development = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("resources/displayplacer/displayplacer");
+    if development.is_file() { return Some(development); }
+    None
+}
+
+fn run_displayplacer(args: &[&str]) -> Result<String, String> {
+    let path = displayplacer_path().ok_or_else(|| "Screenguard 内置布局组件缺失；请重新安装 Screenguard".to_string())?;
+    run_cmd(&path.to_string_lossy(), args).map_err(|e| format!("显示器布局操作失败：{}", e.trim()))
+}
+
+fn mode_property<'a>(prop: &'a str, prefix: &str, props: &'a [&'a str], index: usize) -> Option<&'a str> {
+    prop.strip_prefix(prefix)
+        .filter(|v| !v.is_empty())
+        .or_else(|| if prop == prefix { props.get(index + 1).copied() } else { None })
+}
+
+#[derive(Clone, Debug)]
+struct ScreenMode {
+    index: u32,
+    w: u32,
+    h: u32,
+    hz: Option<u32>,
+    depth: u32,
+    scaling: bool,
+    current: bool,
+}
+
+/// displayplacer 解析出的单屏结构（内部用）
+#[derive(Clone, Debug)]
+struct Screen {
+    id: String,
+    /// 原始 Type 描述（如 "27 inch external screen"），仅用于展示兜底
+    type_raw: String,
+    w: u32,
+    h: u32,
+    hz: Option<u32>,
+    ox: i32,
+    oy: i32,
+    enabled: bool,
+    main: bool,
+    degree: u32,
+    scaling: bool,
+    color_depth: u32,
+    modes: Vec<ScreenMode>,
+    /// Mode selected for a pending layout. Parsed screens leave this empty and
+    /// use their explicitly marked current mode instead of mixing backing pixels
+    /// from `Resolution:` with desktop-coordinate mode dimensions.
+    requested_mode: Option<ScreenMode>,
+    /// Contextual screen id（可当 CGDirectDisplayID 用）
+    ctx: Option<u32>,
+}
+
+impl Screen {
+    fn res_str(&self) -> String {
+        format!("{}x{}", self.w, self.h)
+    }
+
+    fn active_mode(&self) -> Option<&ScreenMode> {
+        self.modes.iter().find(|m| m.current)
+    }
+
+    fn layout_mode(&self) -> Option<&ScreenMode> {
+        self.requested_mode.as_ref().or_else(|| self.active_mode())
+    }
+
+    /// displayplacer mode rows and origins use desktop logical points, while its
+    /// Resolution line is CGDisplayPixelsWide/High (backing pixels).
+    fn frame_w(&self) -> u32 {
+        self.layout_mode().map(|m| m.w).unwrap_or_else(|| if self.scaling { self.w / 2 } else { self.w })
+    }
+
+    fn frame_h(&self) -> u32 {
+        self.layout_mode().map(|m| m.h).unwrap_or_else(|| if self.scaling { self.h / 2 } else { self.h })
+    }
+
+    fn layout_resolution(&self) -> (u32, u32) {
+        self.layout_mode().map(|m| (m.w, m.h)).unwrap_or_else(|| {
+            if self.scaling { (self.w / 2, self.h / 2) } else { (self.w, self.h) }
+        })
+    }
+}
+
+/// 解析 displayplacer list 输出（动态，不依赖任何硬编码 id / 分辨率）
+fn parse_screens() -> Vec<Screen> {
+    let raw = run_displayplacer(&["list"]).unwrap_or_default();
+    let mut result = Vec::new();
+    let mut cur: Option<Screen> = None;
+
+    for line in raw.lines() {
+        let t = line.trim();
+        if let Some(v) = t.strip_prefix("Persistent screen id:") {
+            if let Some(s) = cur.take() {
+                result.push(s);
+            }
+            cur = Some(Screen {
+                id: v.trim().to_string(),
+                type_raw: String::new(),
+                w: 0,
+                h: 0,
+                hz: None,
+                ox: 0,
+                oy: 0,
+                enabled: true,
+                main: false,
+                degree: 0,
+                scaling: false,
+                color_depth: 8,
+                modes: Vec::new(),
+                requested_mode: None,
+                ctx: None,
+            });
+        } else if let Some(s) = cur.as_mut() {
+            if let Some(v) = t.strip_prefix("Contextual screen id:") {
+                s.ctx = v.trim().parse::<u32>().ok();
+            } else if let Some(v) = t.strip_prefix("Type:") {
+                s.type_raw = v.trim().to_string();
+            } else if let Some(v) = t.strip_prefix("Resolution:") {
+                let v = v.trim();
+                if let Some((a, b)) = v.split_once('x') {
+                    s.w = a.trim().parse().unwrap_or(0);
+                    s.h = b.trim().parse().unwrap_or(0);
+                }
+            } else if let Some(v) = t.strip_prefix("Hertz:") {
+                s.hz = v.trim().parse::<u32>().ok();
+            } else if let Some(v) = t.strip_prefix("Color Depth:") {
+                s.color_depth = v.trim().parse::<u32>().unwrap_or(8);
+            } else if let Some(v) = t.strip_prefix("Scaling:") {
+                s.scaling = v.trim().eq_ignore_ascii_case("on");
+            } else if let Some(v) = t.strip_prefix("Origin:") {
+                // " (0,0)" 或 " (1920,0) - main display"
+                s.main = v.contains("main display");
+                if let Some(open) = v.find('(') {
+                    if let Some(close) = v.find(')') {
+                        let inner = &v[open + 1..close];
+                        if let Some((x, y)) = inner.split_once(',') {
+                            s.ox = x.trim().parse().unwrap_or(0);
+                            s.oy = y.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+            } else if let Some(v) = t.strip_prefix("Enabled:") {
+                s.enabled = v.trim().eq_ignore_ascii_case("true");
+            } else if let Some(v) = t.strip_prefix("Rotation:") {
+                s.degree = v.trim().parse().unwrap_or(0);
+            } else if let Some(v) = t.strip_prefix("mode ") {
+                if let Some((n, props)) = v.split_once(':') {
+                    let index = n.trim().parse::<u32>().ok();
+                    let mut w = 0;
+                    let mut h = 0;
+                    let mut hz = None;
+                    let mut depth = 8;
+                    let mut scaling = false;
+                    let current = t.contains("<-- current mode");
+                    let props: Vec<&str> = props.split_whitespace().collect();
+                    let mut pi = 0;
+                    while pi < props.len() {
+                        let prop = props[pi];
+                        if let Some(res) = mode_property(prop, "res:", &props, pi) {
+                            if let Some((a, b)) = res.split_once('x') {
+                                w = a.trim().parse().unwrap_or(0);
+                                h = b.trim().parse().unwrap_or(0);
+                            }
+                        } else if let Some(v) = mode_property(prop, "hz:", &props, pi) {
+                            hz = v.parse::<f64>().ok().map(|n| n.round() as u32);
+                        } else if let Some(v) = mode_property(prop, "color_depth:", &props, pi) {
+                            depth = v.parse().unwrap_or(8);
+                        } else if let Some(v) = mode_property(prop, "scaling:", &props, pi) {
+                            scaling = v.eq_ignore_ascii_case("on");
+                        }
+                        pi += if prop.ends_with(':') && pi + 1 < props.len() { 2 } else { 1 };
+                    }
+                    if let Some(index) = index {
+                        if w > 0 && h > 0 {
+                            s.modes.push(ScreenMode { index, w, h, hz, depth, scaling, current });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(s) = cur.take() {
+        result.push(s);
+    }
+    result
+}
+
+/// Return the exact modes reported by displayplacer, including the active mode.
+pub fn get_display_modes(display_id: &str) -> Result<Vec<DisplayMode>, String> {
+    let screen = parse_screens()
+        .into_iter()
+        .find(|screen| screen.id == display_id && screen.enabled)
+        .ok_or_else(|| "未找到该显示器；请刷新显示器列表".to_string())?;
+    if screen.modes.is_empty() {
+        return Err("Screenguard 内置显示布局组件没有返回可用分辨率档位；请刷新显示器列表后重试".into());
+    }
+    Ok(screen
+        .modes
+        .iter()
+        .map(|mode| DisplayMode {
+            mode: mode.index,
+            resolution: format!("{}x{}", mode.w, mode.h),
+            hz: mode.hz.unwrap_or(screen.hz.unwrap_or(60)),
+            color_depth: mode.depth,
+            scaled: mode.scaling,
+            current: mode.current,
+        })
+        .collect())
+}
+
+/// Apply a selected mode by its displayplacer index, then read it back and roll back on mismatch.
+pub fn set_display_mode(display_id: &str, mode_index: u32) -> Result<String, String> {
+    let mut screens = parse_screens();
+    let original = screens.clone();
+    let target = screens
+        .iter_mut()
+        .find(|screen| screen.id == display_id && screen.enabled)
+        .ok_or_else(|| "未找到该显示器；请刷新显示器列表".to_string())?;
+    let selected = target
+        .modes
+        .iter()
+        .find(|mode| mode.index == mode_index)
+        .cloned()
+        .ok_or_else(|| "所选显示模式已不可用；请刷新显示器列表".to_string())?;
+    target.requested_mode = Some(selected.clone());
+    apply_screen_layout(&screens)?;
+
+    let applied = parse_screens();
+    let matches = applied
+        .iter()
+        .find(|screen| screen.id == display_id && screen.enabled)
+        .and_then(Screen::active_mode)
+        .is_some_and(|actual| {
+            actual.index == selected.index
+                && actual.w == selected.w
+                && actual.h == selected.h
+                && actual.hz == selected.hz
+                && actual.depth == selected.depth
+                && actual.scaling == selected.scaling
+        });
+    if !matches {
+        return Err(match apply_screen_layout(&original) {
+            Ok(()) => "系统未应用所选显示模式，已恢复切换前的显示配置".into(),
+            Err(error) => format!("显示模式未核验，恢复原配置失败：{}", error),
+        });
+    }
+    Ok(format!(
+        "已核验显示模式 {}x{} @ {}Hz",
+        selected.w,
+        selected.h,
+        selected.hz.unwrap_or(60)
+    ))
+}
+
+/// 主屏 = 带 main display 标记的；副屏 = 其余第一块（本项目为双屏工具）
+fn main_secondary(screens: &[Screen]) -> Result<(&Screen, &Screen), String> {
+    let active: Vec<&Screen> = screens.iter().filter(|s| s.enabled).collect();
+    let main = active
+        .iter()
+        .copied()
+        .find(|s| s.main)
+        .ok_or_else(|| "未找到主屏（请检查 displayplacer 输出）".to_string())?;
+    let sec = active
+        .iter()
+        .copied()
+        .find(|s| !s.main)
+        .ok_or_else(|| "需要主屏 + 副屏各一块才能使用此功能".to_string())?;
+    Ok((main, sec))
+}
+
+/// 界面名字：只按角色命名，不猜品牌/尺寸（EDID 上报尺寸可能失真）
+fn role_name(is_main: bool) -> String {
+    if is_main {
+        "主屏".to_string()
+    } else {
+        "副屏".to_string()
+    }
+}
+
+pub fn get_displays() -> Vec<DisplayInfo> {
+    let screens = parse_screens();
+    screens
+        .into_iter()
+        .map(|s| {
+            let (b, vol) = match s.ctx {
+                Some(c) => (read_ddc_brightness(c), read_ddc_volume(c)),
+                _ => (None, None),
+            };
+            let prof = s.ctx.and_then(read_color_profile);
+            DisplayInfo {
+                id: s.id.clone(),
+                name: role_name(s.main),
+                resolution: s.res_str(),
+                hz: s.hz,
+                main: s.main,
+                connected: true,
+                ddc: b.is_some(),
+                brightness: b,
+                volume: vol,
+                color_profile: prof,
+                ddc_id: s.ctx,
+            }
+        })
+        .collect()
+}
+
+// DDC/CI 标准亮度 VCP 0x10，使用显示器报告的最大值换算成百分比。
+fn read_ddc_brightness(cgid: u32) -> Option<u32> {
+    read_vcp_percent(cgid, 0x10)
+}
+fn read_ddc_volume(cgid: u32) -> Option<u32> {
+    read_vcp_percent(cgid, 0x62)
+}
+
+static DDC_CALL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+struct DdcCallGuard;
+
+impl Drop for DdcCallGuard {
+    fn drop(&mut self) {
+        DDC_CALL_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+/// Run DDC off the caller thread. IOAVService calls cannot be cancelled, so a
+/// timeout blocks later requests for this app session instead of accumulating
+/// more stalled worker threads.
+fn with_ddc_monitor<T: Send + 'static>(
+    cgid: u32,
+    operation: impl FnOnce(&mut ddc_macos::Monitor) -> T + Send + 'static,
+) -> Result<T, String> {
+    DDC_CALL_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| "DDC 通道正在处理请求，或此前请求无响应；请稍后重试，若持续发生请重启 Screenguard".to_string())?;
+
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let guard = DdcCallGuard;
+        let result = ddc_macos::Monitor::enumerate()
+            .map_err(|error| format!("无法枚举 DDC 显示器：{}", error))
+            .and_then(|monitors| {
+                let mut monitor = monitors
+                    .into_iter()
+                    .find(|monitor| monitor.handle().id == cgid)
+                    .ok_or_else(|| "无法连接此显示器的 DDC/CI 通道".to_string())?;
+                Ok(operation(&mut monitor))
+            });
+        drop(guard);
+        let _ = sender.send(result);
+    });
+
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(6))
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout =>
+                "DDC 请求超过 6 秒无响应；本次运行已暂停后续 DDC 访问，以避免堆积阻塞任务。请重启 Screenguard 后再试".to_string(),
+            std::sync::mpsc::RecvTimeoutError::Disconnected => "DDC 工作线程异常结束".to_string(),
+        })?
+}
+
+fn read_vcp_percent(cgid: u32, code: u8) -> Option<u32> {
+    use ddc::Ddc;
+    with_ddc_monitor(cgid, move |monitor| monitor.get_vcp_feature(code))
+        .ok()?
+        .ok()
+        .and_then(|value| {
+            let max = value.maximum();
+            (max > 0).then(|| ((value.value() as u32 * 100 + max as u32 / 2) / max as u32).min(100))
+        })
+}
+
+/// 按 displayplacer 持久 id 找到对应显示器的 DDC 句柄
+fn find_ddc_id(display_id: &str) -> Result<u32, String> {
+    let screen = parse_screens()
+        .into_iter()
+        .find(|screen| screen.id == display_id && screen.enabled)
+        .ok_or("未找到显示器")?;
+    screen.ctx
+        .ok_or("该显示器或当前连接链路无法访问 DDC/CI".into())
+}
+
+/// 设置亮度 0-100
+pub fn set_brightness(display_id: &str, value: u32) -> Result<(), String> {
+    use ddc::Ddc;
+    let cgid = find_ddc_id(display_id)?;
+    with_ddc_monitor(cgid, move |monitor| {
+        monitor.get_vcp_feature(0x10).and_then(|current| {
+            let max = current.maximum();
+            if max == 0 { return Err(ddc_macos::Error::Ddc(ddc::ErrorCode::Invalid("monitor reported no brightness range".into()))); }
+            monitor.set_vcp_feature(0x10, ((value.clamp(0, 100) as u32 * max as u32 + 50) / 100) as u16)
+        })
+    })?
+    .map_err(|e| format!("DDC/CI 亮度写入失败：{}", e))
+}
+
+/// 设置音量 0-100
+pub fn set_volume(display_id: &str, value: u32) -> Result<(), String> {
+    use ddc::Ddc;
+    let cgid = find_ddc_id(display_id)?;
+    with_ddc_monitor(cgid, move |monitor| {
+        monitor.get_vcp_feature(0x62).and_then(|current| {
+            let max = current.maximum();
+            if max == 0 { return Err(ddc_macos::Error::Ddc(ddc::ErrorCode::Invalid("monitor reported no volume range".into()))); }
+            monitor.set_vcp_feature(0x62, ((value.clamp(0, 100) as u32 * max as u32 + 50) / 100) as u16)
+        })
+    })?
+    .map_err(|e| format!("DDC/CI 音量写入失败：{}", e))
+}
+
+// ===== 色彩 / 布局 =====
+/// 读某显示器当前 ColorSync profile 文件名
+fn read_color_profile(cgid: u32) -> Option<String> {
+    let _ = cgid;
+    None
+}
+
+fn system_color_profile(space: &str) -> Result<std::path::PathBuf, String> {
+    let filename = match space {
+        "sRGB" | "srgb" => "sRGB Profile.icc",
+        "p3" => "Display P3.icc",
+        "adobergb" | "adobeRGB" => "AdobeRGB1998.icc",
+        "dcip3" => "DCI(P3) RGB.icc",
+        "rec709" => "ITU-709.icc",
+        "rec2020" => "ITU-2020.icc",
+        "gray" => "Generic Gray Gamma 2.2 Profile.icc",
+        "prophoto" => return Err("当前 macOS 没有内置 ProPhoto RGB 配置文件；请改用系统已有色彩空间".into()),
+        _ => return Err("未知的色彩空间".into()),
+    };
+    let path = std::path::PathBuf::from("/System/Library/ColorSync/Profiles").join(filename);
+    if path.is_file() { Ok(path) } else { Err(format!("macOS 未找到系统色彩配置文件：{}", filename)) }
+}
+
+fn set_color_profile(cgid: u32, profile_path: &std::path::Path) -> Result<(), String> {
+    let display_class = CFString::new("display");
+    let profile_url = CFURL::from_path(profile_path, false)
+        .ok_or("无法创建 ColorSync 配置文件 URL")?;
+    let default_profile_key = unsafe {
+        CFString::wrap_under_get_rule(kColorSyncDeviceDefaultProfileID.cast())
+    };
+    let entries = [(default_profile_key.as_CFType(), profile_url.as_CFType())];
+    let profiles = CFDictionary::<CFType, CFType>::from_CFType_pairs(&entries);
+    let uuid_ref = unsafe { CGDisplayCreateUUIDFromDisplayID(cgid) };
+    if uuid_ref.is_null() { return Err("macOS 无法为显示器生成 ColorSync 标识".into()); }
+    let uuid = unsafe { CFUUID::wrap_under_create_rule(uuid_ref.cast()) };
+    let applied = unsafe {
+        ColorSyncDeviceSetCustomProfiles(
+            display_class.as_concrete_TypeRef().cast(),
+            uuid.as_concrete_TypeRef().cast(),
+            profiles.as_concrete_TypeRef().cast(),
+        )
+    };
+    if applied { Ok(()) } else { Err("ColorSync 拒绝设置此显示器的色彩配置".into()) }
+}
+
+fn apply_profile_to_screens(screens: impl Iterator<Item = Screen>, space: &str) -> Result<String, String> {
+    let profile = system_color_profile(space)?;
+    let screens: Vec<Screen> = screens.collect();
+    if screens.is_empty() { return Err("没有可设置色彩配置的显示器".into()); }
+    let mut applied = 0usize;
+    let mut errors = Vec::new();
+    for screen in &screens {
+        match screen.ctx.ok_or_else(|| "无法取得显示器 ColorSync 标识".to_string())
+            .and_then(|id| set_color_profile(id, &profile)) {
+            Ok(()) => applied += 1,
+            Err(error) => errors.push(format!("{}：{}", screen.type_raw, error)),
+        }
+    }
+    if applied == screens.len() {
+        Ok(format!("已通过 macOS ColorSync 设置 {} 台显示器的 {} 配置", applied, space))
+    } else if applied == 0 {
+        Err(format!("ColorSync 未能应用色彩配置：{}", errors.join("；")))
+    } else {
+        Err(format!("仅有 {}/{} 台显示器接受了 ColorSync 配置；{}", applied, screens.len(), errors.join("；")))
+    }
+}
+
+/// Set the system ColorSync display profile on every connected display.
+pub fn apply_color_space(space: &str) -> Result<(), String> {
+    apply_profile_to_screens(parse_screens().into_iter().filter(|screen| screen.enabled), space)
+        .map(|_| ())
+}
+
+pub fn match_mac() -> Result<(), String> {
+    let external_screens = parse_screens().into_iter().filter(|screen| {
+        screen.enabled && screen.ctx.is_some_and(|id| unsafe { !CGDisplayIsBuiltin(id) })
+    });
+    apply_profile_to_screens(external_screens, "p3").map(|_| ())
+}
+
+/// 用 displayplacer 完整设置两块屏的布局（主屏保持现状，只动副屏的 res/方向）
+fn apply_sec_layout(main: &Screen, sec: &Screen, sec_res: &str, sec_deg: u32) -> Result<(), String> {
+    let (main_w, main_h) = main.layout_resolution();
+    let main_hz = main.hz.map(|v| format!(" hz:{}", v)).unwrap_or_default();
+    let sec_hz = sec.hz.map(|v| format!(" hz:{}", v)).unwrap_or_default();
+    let main_spec = format!(
+        "id:{} res:{}x{}{} color_depth:{} enabled:true scaling:{} origin:({},{}) degree:{}",
+        main.id,
+        main_w,
+        main_h,
+        main_hz,
+        main.color_depth.max(8),
+        if main.scaling { "on" } else { "off" },
+        main.ox,
+        main.oy,
+        main.degree
+    );
+    let sec_spec = format!(
+        "id:{} res:{}{} color_depth:8 enabled:true scaling:on origin:({},{}) degree:{}",
+        sec.id, sec_res, sec_hz, sec.ox, sec.oy, sec_deg
+    );
+    run_displayplacer(&[&main_spec, &sec_spec]).map(|_| ())
+}
+
+// ===== 原生分辨率探测：目标档位全部动态推导，不硬编码任何分辨率 =====
+/// 从 "3840 x 2160 (4K UHD)" / "1920 x 1080 @ 60.00Hz" 之类的字符串里取出宽高
+fn parse_wh(s: &str) -> Option<(u32, u32)> {
+    let t: Vec<&str> = s.split_whitespace().collect();
+    for w in t.windows(3) {
+        if w[1].eq_ignore_ascii_case("x") {
+            if let (Ok(a), Ok(b)) = (w[0].parse::<u32>(), w[2].parse::<u32>()) {
+                return Some((a, b));
+            }
+        }
+    }
+    None
+}
+
+/// (原生宽, 原生高, 逻辑宽, 逻辑高)
+type SpScreen = (u32, u32, u32, u32);
+
+/// 解析 `system_profiler SPDisplaysDataType`，得到每块屏的原生像素与逻辑像素。
+/// 解析失败返回空表 —— 调用方回退到「跟随主屏逻辑分辨率」，功能不会因此不可用。
+fn screens_native() -> Vec<SpScreen> {
+    let raw = match run_cmd("system_profiler", &["SPDisplaysDataType"]) {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<SpScreen> = Vec::new();
+    let mut native: Option<(u32, u32)> = None;
+    let mut logical: Option<(u32, u32)> = None;
+    for line in raw.lines() {
+        let indent = line.len() - line.trim_start().len();
+        let t = line.trim();
+        // 8 空格缩进且以冒号结尾 = 新的一块显示器，落盘上一块
+        if indent == 8 && t.ends_with(':') && !t.is_empty() {
+            if let Some(n) = native {
+                let l = logical.unwrap_or(n);
+                out.push((n.0, n.1, l.0, l.1));
+            }
+            native = None;
+            logical = None;
+            continue;
+        }
+        if let Some(v) = t.strip_prefix("Resolution:") {
+            if let Some(wh) = parse_wh(v) {
+                // 外接 1x 屏此处就是当前分辨率；内建 Retina 屏是原生像素
+                native = Some(wh);
+            }
+        } else if let Some(v) = t.strip_prefix("UI Looks like:") {
+            if let Some(wh) = parse_wh(v) {
+                logical = Some(wh);
+            }
+        }
+    }
+    if let Some(n) = native {
+        let l = logical.unwrap_or(n);
+        out.push((n.0, n.1, l.0, l.1));
+    }
+    out
+}
+
+/// 在探测表里按「逻辑分辨率」匹配同一块屏（横竖屏都试）
+fn find_native<'a>(sps: &'a [SpScreen], s: &Screen) -> Option<&'a SpScreen> {
+    sps.iter()
+        .find(|(_, _, lw, lh)| (*lw, *lh) == (s.w, s.h) || (*lh, *lw) == (s.w, s.h))
+}
+
+/// 副屏的「2x 逻辑档」目标 = 原生像素 ÷ 2（方向随横竖屏）。
+/// 5K 面板得 2560x1440、4K 面板得 1920x1080、2K 面板得 1280x720，
+/// 不再硬编码 1920x1080。探不到原生信息时回退为「跟随主屏逻辑分辨率」。
+fn hidpi_target(sps: &[SpScreen], main: &Screen, sec: &Screen, portrait: bool) -> (String, u32) {
+    let (lw, lh) = match find_native(sps, sec) {
+        Some((nw, nh, _, _)) => ((nw / 2).max(1), (nh / 2).max(1)),
+        None => (main.w.max(1), main.h.max(1)),
+    };
+    if portrait {
+        (format!("{}x{}", lh, lw), 270)
+    } else {
+        (format!("{}x{}", lw, lh), 0)
+    }
+}
+
+/// 主屏是否已处于 2x 档（原生像素 = 逻辑像素 × 2）；探不到时返回 None（不阻塞）
+fn main_at_2x(sps: &[SpScreen], main: &Screen) -> Option<bool> {
+    find_native(sps, main).map(|(nw, nh, _, _)| (main.w, main.h) == (nw / 2, nh / 2))
+}
+
+/// "窗口拖到另一屏不变小"：让副屏处于与主屏一致的 2x 逻辑档位。
+/// 只按副屏原生像素推导目标档、只动副屏，绝不动主屏、绝不把高分辨率面板降到低物理档。
+pub fn match_ppi() -> Result<(), String> {
+    let screens = parse_screens();
+    if screens.is_empty() {
+        return Err("displayplacer 不可用或没有显示器".into());
+    }
+    let (main, sec) = main_secondary(&screens)?;
+    let sps = screens_native();
+    if let Some(false) = main_at_2x(&sps, main) {
+        return Err(format!(
+            "主屏当前逻辑分辨率为 {}，不是其原生像素的 2x 档；请先在「系统设置 → 显示器」把它设为 2x 档再匹配",
+            main.res_str()
+        ));
+    }
+    let portrait = sec.degree != 0;
+    let (target, deg) = hidpi_target(&sps, main, sec, portrait);
+    if format!("{}x{}", sec.w, sec.h) == target && sec.degree == deg {
+        return Ok(()); // 已就位，不动
+    }
+    match apply_sec_layout(main, sec, &target, deg) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("匹配失败：{}", e.trim())),
+    }
+}
+
+/// 副屏横/竖屏切换（再点一次转回，可恢复）
+pub fn rotate_secondary() -> Result<(), String> {
+    let screens = parse_screens();
+    let (main, sec) = main_secondary(&screens)?;
+    let sps = screens_native();
+    let portrait = sec.degree == 0; // 当前横屏 → 转竖屏
+    let (target, deg) = hidpi_target(&sps, main, sec, portrait);
+    apply_sec_layout(main, sec, &target, deg)
+}
+
+/// 恢复副屏为竖屏（安全复位）
+pub fn restore_secondary() -> Result<(), String> {
+    let screens = parse_screens();
+    let (main, sec) = main_secondary(&screens)?;
+    if sec.degree != 0 {
+        return Ok(()); // 已是竖屏，不动
+    }
+    let sps = screens_native();
+    let (target, deg) = hidpi_target(&sps, main, sec, true);
+    apply_sec_layout(main, sec, &target, deg)
+}
+
+/// 所有已连接屏幕的包围盒（逻辑坐标），用于跨屏铺满
+fn union_bounds(screens: &[Screen]) -> Option<(i32, i32, i32, i32)> {
+    let active: Vec<&Screen> = screens.iter().filter(|s| s.enabled).collect();
+    if active.is_empty() || active.iter().any(|s| s.layout_mode().is_none()) {
+        return None;
+    }
+    let mut min_x = i32::MAX;
+    let mut min_y = i32::MAX;
+    let mut max_x = i32::MIN;
+    let mut max_y = i32::MIN;
+    for s in active {
+        min_x = min_x.min(s.ox);
+        min_y = min_y.min(s.oy);
+        max_x = max_x.max(s.ox + s.frame_w() as i32);
+        max_y = max_y.max(s.oy + s.frame_h() as i32);
+    }
+    Some((min_x, min_y, max_x, max_y))
+}
+
+#[cfg(test)]
+mod window_span_geometry_tests {
+    use super::{
+        should_restore_aligned_layout, union_bounds, SavedWindow, Screen, ScreenMode,
+    };
+
+    fn screen(id: &str, enabled: bool, origin: (i32, i32), size: (u32, u32), main: bool) -> Screen {
+        Screen {
+            id: id.into(),
+            type_raw: String::new(),
+            w: size.0,
+            h: size.1,
+            hz: Some(60),
+            ox: origin.0,
+            oy: origin.1,
+            enabled,
+            main,
+            degree: 0,
+            scaling: false,
+            color_depth: 8,
+            modes: vec![ScreenMode {
+                index: 1,
+                w: size.0,
+                h: size.1,
+                hz: Some(60),
+                depth: 8,
+                scaling: false,
+                current: true,
+            }],
+            requested_mode: None,
+            ctx: None,
+        }
+    }
+
+    #[test]
+    fn unions_side_by_side_landscape_and_portrait_displays() {
+        let screens = [
+            screen("main", true, (0, 0), (3840, 2160), true),
+            screen("portrait", true, (3840, 0), (2160, 3840), false),
+        ];
+
+        assert_eq!(union_bounds(&screens), Some((0, 0, 6000, 3840)));
+    }
+
+    #[test]
+    fn includes_negative_origins_and_ignores_disabled_displays() {
+        let mut disabled = screen("offline", false, (5000, 0), (4000, 2000), false);
+        disabled.modes.clear();
+        let screens = [
+            screen("main", true, (0, 0), (1920, 1080), true),
+            screen("left", true, (-1080, 0), (1080, 1920), false),
+            disabled,
+        ];
+
+        assert_eq!(union_bounds(&screens), Some((-1080, 0, 1920, 1920)));
+    }
+
+    #[test]
+    fn rejects_enabled_displays_without_a_known_desktop_mode() {
+        let mut unknown = screen("unknown", true, (0, 0), (1920, 1080), true);
+        unknown.modes.clear();
+
+        assert_eq!(union_bounds(&[unknown]), None);
+        assert_eq!(union_bounds(&[]), None);
+    }
+
+    #[test]
+    fn restores_display_modes_only_when_this_span_applied_alignment() {
+        assert!(should_restore_aligned_layout(Some(true), true));
+        assert!(!should_restore_aligned_layout(Some(true), false));
+        assert!(!should_restore_aligned_layout(Some(false), true));
+        // Older window backups lack this field; retain their previous recovery path.
+        assert!(should_restore_aligned_layout(None, true));
+        assert!(!should_restore_aligned_layout(None, false));
+    }
+
+    #[test]
+    fn reads_legacy_window_backup_without_alignment_metadata() {
+        let old = r#"{"token":65537,"x":10,"y":20,"w":800,"h":600,"title":"Browser — Page"}"#;
+        let saved: SavedWindow =
+            serde_json::from_str(old).expect("legacy backup remains readable");
+        assert_eq!(saved.alignment_applied, None);
+        assert!(should_restore_aligned_layout(saved.alignment_applied, true));
+    }
+}
+
+// ===== 双屏逻辑高度对齐：保存完整布局，切换后重新枚举并校验 =====
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SavedScreenLayout {
+    id: String,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    w: u32,
+    h: u32,
+    #[serde(default)]
+    mode_index: Option<u32>,
+    #[serde(default)]
+    hz: Option<u32>,
+    depth: u32,
+    scaling: bool,
+    ox: i32,
+    oy: i32,
+    degree: u32,
+    main: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SavedLayout {
+    screens: Vec<SavedScreenLayout>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MacAppState {
+    #[serde(default = "default_enabled")]
+    revert_on_exit: bool,
+    #[serde(default)]
+    baseline_taken: bool,
+    #[serde(default)]
+    baseline_layout: Option<SavedLayout>,
+    /// Readable DDC power states only; unsupported displays are left untouched on restore.
+    #[serde(default)]
+    baseline_power: Vec<String>,
+}
+
+impl Default for MacAppState {
+    fn default() -> Self {
+        Self { revert_on_exit: true, baseline_taken: false, baseline_layout: None, baseline_power: Vec::new() }
+    }
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn app_support_dir() -> Result<std::path::PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "无法定位当前用户主目录".to_string())?;
+    let dir = std::path::PathBuf::from(home)
+        .join("Library")
+        .join("Application Support")
+        .join("Screenguard");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建 ScreenGuard 数据目录失败：{}", e))?;
+    Ok(dir)
+}
+
+fn layout_backup_path() -> Result<std::path::PathBuf, String> {
+    Ok(app_support_dir()?.join("display-layout-backup.json"))
+}
+
+fn mac_app_state_path() -> Result<std::path::PathBuf, String> {
+    Ok(app_support_dir()?.join("state.json"))
+}
+
+fn mac_app_state() -> MacAppState {
+    mac_app_state_path().ok()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_mac_app_state(state: &MacAppState) -> Result<(), String> {
+    save_json_atomic(&mac_app_state_path()?, state)
+}
+
+pub fn app_state_json() -> String {
+    serde_json::json!({ "revert_on_exit": mac_app_state().revert_on_exit }).to_string()
+}
+
+pub fn user_settings_json() -> String {
+    serde_json::json!({ "revert_on_exit": mac_app_state().revert_on_exit }).to_string()
+}
+
+pub fn import_user_settings_json(raw: &str) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| format!("设置文件中的 macOS 偏好无效：{}", e))?;
+    let mut state = mac_app_state();
+    if let Some(value) = value.get("revert_on_exit") {
+        state.revert_on_exit = value.as_bool().ok_or("退出还原设置必须是布尔值")?;
+    }
+    save_mac_app_state(&state)?;
+    Ok("macOS 偏好已导入；本机恢复基线保持不变".into())
+}
+
+pub fn set_revert_on_exit(enabled: bool) -> Result<(), String> {
+    let mut state = mac_app_state();
+    state.revert_on_exit = enabled;
+    save_mac_app_state(&state)
+}
+
+/// Capture the display layout and DDC power states that macOS can read safely.
+/// This baseline is local to this Mac and is never included in user settings exports.
+pub fn capture_baseline() -> Result<String, String> {
+    let mut state = mac_app_state();
+    if state.baseline_taken { return Ok("macOS 恢复基线已存在".into()); }
+    let screens = parse_screens().into_iter().filter(|screen| screen.enabled).collect::<Vec<_>>();
+    if screens.is_empty() { return Err("当前没有可记录的显示器；稍后重新启动 Screenguard 再采集基线".into()); }
+    state.baseline_layout = Some(saved_layout(&screens));
+    state.baseline_power = screens.iter().filter_map(|screen| {
+        get_display_power(&screen.id).ok().filter(|mode| matches!(mode, 1 | 2 | 4))
+            .map(|mode| format!("{}|{}", screen.id, mode))
+    }).collect();
+    state.baseline_taken = true;
+    save_mac_app_state(&state)?;
+    Ok(format!("macOS 恢复基线已采集：{} 台显示器布局、{} 台可读电源状态", screens.len(), state.baseline_power.len()))
+}
+
+/// Restore only states with a local baseline and a supported read/write path.
+/// ColorSync profiles and hardware brightness/volume are deliberately not claimed here.
+pub fn restore_defaults() -> Result<String, String> {
+    let state = mac_app_state();
+    let mut done = Vec::new();
+    let mut warnings = Vec::new();
+    match restore_foreground() {
+        Ok(()) => done.push("已检查铺满窗口还原状态".into()),
+        Err(error) => warnings.push(format!("铺满窗口：{}", error)),
+    }
+    if screen_wake().is_ok() { done.push("已请求唤醒显示器".into()); }
+    if let Some(layout) = state.baseline_layout.as_ref() {
+        match restore_saved_layout(layout) {
+            Ok(()) => done.push(format!("显示布局已还原（{} 台）", layout.screens.len())),
+            Err(error) => warnings.push(format!("显示布局：{}", error)),
+        }
+    } else {
+        warnings.push("尚无显示布局基线".into());
+    }
+    for entry in &state.baseline_power {
+        let mut parts = entry.splitn(2, '|');
+        let (Some(id), Some(mode)) = (parts.next(), parts.next()) else { continue; };
+        if let Ok(mode) = mode.parse::<u32>() {
+            match set_display_power(id, mode) {
+                Ok(()) => done.push(format!("显示器 {} 电源状态已恢复", id)),
+                Err(error) => warnings.push(format!("显示器 {} 电源状态：{}", id, error)),
+            }
+        }
+    }
+    let mut message = format!("已恢复 macOS 可恢复状态：{}。本功能不恢复 ColorSync 配置及显示器硬件亮度/音量。", done.join("；"));
+    if !warnings.is_empty() { message.push_str(&format!("未完成：{}。", warnings.join("；"))); }
+    Ok(message)
+}
+
+fn save_json_atomic(path: &std::path::Path, value: &impl Serialize) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|e| format!("序列化备份失败：{}", e))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes).map_err(|e| format!("写入备份失败：{}", e))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("提交备份失败：{}", e))
+}
+
+fn saved_layout(screens: &[Screen]) -> SavedLayout {
+    SavedLayout {
+        screens: screens
+            .iter()
+            .map(|s| SavedScreenLayout {
+                id: s.id.clone(),
+                enabled: s.enabled,
+                w: s.layout_resolution().0,
+                h: s.layout_resolution().1,
+                mode_index: s.active_mode().map(|m| m.index),
+                hz: s.hz,
+                depth: s.color_depth.max(8),
+                scaling: s.scaling,
+                ox: s.ox,
+                oy: s.oy,
+                degree: s.degree,
+                main: s.main,
+            })
+            .collect(),
+    }
+}
+
+fn save_original_layout(screens: &[Screen]) -> Result<(), String> {
+    let path = layout_backup_path()?;
+    // Keep the first pre-change snapshot until the user explicitly restores it.
+    if path.exists() {
+        return Ok(());
+    }
+    save_json_atomic(&path, &saved_layout(screens))
+}
+
+fn clear_layout_backup() -> Result<(), String> {
+    let path = layout_backup_path()?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("删除对齐失败后的布局备份失败：{}", e)),
+    }
+}
+
+fn screen_spec(s: &Screen) -> String {
+    if !s.enabled {
+        return format!("id:{} enabled:false", s.id);
+    }
+    if let Some(mode) = &s.requested_mode {
+        // Address the selected row directly so identical logical dimensions with
+        // different Retina scaling profiles cannot resolve to a different mode.
+        return format!("id:{} mode:{} enabled:true origin:({},{}) degree:{}", s.id, mode.index, s.ox, s.oy, s.degree);
+    }
+    let (w, h) = s.layout_resolution();
+    let hz = s.hz.map(|v| format!(" hz:{}", v)).unwrap_or_default();
+    format!(
+        "id:{} res:{}{} color_depth:{} enabled:true scaling:{} origin:({},{}) degree:{}",
+        s.id,
+        format!("{}x{}", w, h),
+        hz,
+        s.color_depth.max(8),
+        if s.scaling { "on" } else { "off" },
+        s.ox,
+        s.oy,
+        s.degree
+    )
+}
+
+fn screen_layout_matches(actual: &Screen, wanted: &Screen) -> bool {
+    if actual.id != wanted.id || actual.enabled != wanted.enabled {
+        return false;
+    }
+    if !wanted.enabled {
+        return true;
+    }
+    let mode_matches = match &wanted.requested_mode {
+        Some(requested) => actual.active_mode().map(|m| m.index) == Some(requested.index),
+        None => actual.layout_mode().map(|m| (m.w, m.h, m.hz, m.depth, m.scaling))
+            == wanted.layout_mode().map(|m| (m.w, m.h, m.hz, m.depth, m.scaling)),
+    };
+    mode_matches
+        && actual.ox == wanted.ox
+        && actual.oy == wanted.oy
+        && actual.degree == wanted.degree
+        && actual.main == wanted.main
+}
+
+fn layouts_match(actual: &[Screen], wanted: &[Screen]) -> bool {
+    actual.len() == wanted.len()
+        && wanted.iter().all(|w| actual.iter().find(|a| a.id == w.id).is_some_and(|a| screen_layout_matches(a, w)))
+}
+
+fn apply_screen_layout(screens: &[Screen]) -> Result<(), String> {
+    if screens.is_empty() {
+        return Err("没有可应用的显示器布局".into());
+    }
+    if layouts_match(&parse_screens(), screens) {
+        return Ok(());
+    }
+    let specs: Vec<String> = screens.iter().map(screen_spec).collect();
+    let args: Vec<&str> = specs.iter().map(String::as_str).collect();
+    run_displayplacer(&args).map(|_| ())
+}
+
+/// macOS native display actions exposed by the UI.
+pub fn display_action(
+    action: &str,
+    display_id: &str,
+    target_id: Option<&str>,
+    value: Option<&str>,
+) -> Result<String, String> {
+    let screens = parse_screens();
+    let source = screens
+        .iter()
+        .find(|screen| screen.id == display_id && screen.enabled)
+        .ok_or_else(|| "源显示器已断开；请刷新显示器列表".to_string())?;
+    let target = match target_id {
+        Some(id) => Some(
+            screens
+                .iter()
+                .find(|screen| screen.id == id && screen.enabled)
+                .ok_or_else(|| "目标显示器已断开；请刷新显示器列表".to_string())?,
+        ),
+        None => None,
+    };
+    if target.is_some_and(|screen| screen.id == source.id) {
+        return Err("源显示器和目标显示器不能相同".into());
+    }
+
+    if let Some(direction) = action.strip_prefix("place-") {
+        let anchor = target.ok_or("排列显示器需要选择目标显示器")?;
+        let (x, y) = match direction {
+            "left" => (anchor.ox - source.frame_w() as i32, anchor.oy),
+            "right" => (anchor.ox + anchor.frame_w() as i32, anchor.oy),
+            "above" => (anchor.ox, anchor.oy - source.frame_h() as i32),
+            "below" => (anchor.ox, anchor.oy + anchor.frame_h() as i32),
+            _ => return Err("不支持的显示器排列方向".into()),
+        };
+        let before = screens.clone();
+        let mut arranged = before.clone();
+        let moved = arranged
+            .iter_mut()
+            .find(|screen| screen.id == display_id)
+            .ok_or("源显示器已断开")?;
+        moved.ox = x;
+        moved.oy = y;
+        if let Err(error) = apply_screen_origins_only(&arranged) {
+            let rollback = apply_screen_origins_only(&before);
+            return Err(match rollback {
+                Ok(()) => format!("显示器排列未核验，已恢复原布局：{}", error),
+                Err(rollback_error) => format!(
+                    "显示器排列失败：{}；恢复原布局也失败：{}",
+                    error, rollback_error
+                ),
+            });
+        }
+        return Ok(format!("已将「{}」移到目标屏幕{}侧", source.type_raw, direction));
+    }
+
+    match action {
+        "set-main" => {
+            let mut arranged = screens.clone();
+            let old_main = arranged.iter().find(|screen| screen.main).map(|screen| (screen.ox, screen.oy));
+            if let Some(screen) = arranged.iter_mut().find(|screen| screen.id == display_id) {
+                screen.ox = 0;
+                screen.oy = 0;
+                if let Some((x, y)) = old_main.filter(|_| !source.main) {
+                    if let Some(previous) = arranged.iter_mut().find(|s| s.main && s.id != display_id) {
+                        previous.ox = x.max(1);
+                        previous.oy = y;
+                    }
+                }
+            }
+            apply_screen_origins_only(&arranged)?;
+            Ok("已通过 macOS CoreGraphics 设置主屏".into())
+        }
+        "mirror-on" | "mirror-off" => {
+            let source_id = source.ctx.ok_or("无法取得显示器系统标识")?;
+            let master_id = if action == "mirror-on" {
+                target.ok_or("镜像操作需要选择目标显示器")?.ctx.ok_or("无法取得目标显示器系统标识")?
+            } else { 0 };
+            let mut config = std::ptr::null_mut();
+            let begin = unsafe { CGBeginDisplayConfiguration(&mut config) };
+            if begin != 0 { return Err(format!("无法开始显示配置事务：CoreGraphics {}", begin)); }
+            let configure = unsafe { CGConfigureDisplayMirrorOfDisplay(config, source_id, master_id) };
+            if configure != 0 {
+                unsafe { CGCancelDisplayConfiguration(config); }
+                return Err(format!("macOS 拒绝更改镜像配置：CoreGraphics {}", configure));
+            }
+            let complete = unsafe { CGCompleteDisplayConfiguration(config, K_CG_CONFIGURE_PERMANENTLY) };
+            if complete != 0 { return Err(format!("macOS 未能提交镜像配置：CoreGraphics {}", complete)); }
+            Ok(if action == "mirror-on" { "已提交 macOS 镜像配置；请检查显示器画面" } else { "已提交关闭镜像请求；请检查显示器画面" }.into())
+        }
+        "input-source" => {
+            use ddc::Ddc;
+            let code = value
+                .ok_or("请输入显示器支持的输入源 VCP 代码")?
+                .parse::<u32>()
+                .map_err(|_| "输入源代码必须是 1 到 255 的整数")?;
+            if !(1..=255).contains(&code) {
+                return Err("输入源代码必须是 1 到 255 的整数".into());
+            }
+            let cgid = source.ctx.ok_or("无法取得显示器系统标识")?;
+            with_ddc_monitor(cgid, move |monitor| monitor.set_vcp_feature(0x60, code as u16))?
+                .map_err(|error| format!("输入源切换失败：{}", error))?;
+            return Ok("已发送 DDC/CI 输入源切换命令；实际输入源取决于显示器支持".into());
+        }
+        "pip-on" | "pip-off" | "stream-on" | "stream-off" |
+        "hdr-on" | "hdr-off" | "connect-on" | "connect-off" |
+        "protect-resolution-on" | "protect-resolution-off" |
+        "protect-refresh-on" | "protect-refresh-off" |
+        "protect-rotation-on" | "protect-rotation-off" |
+        "protect-main-on" | "protect-main-off" | "virtual-16-9" | "virtual-21-9" =>
+            return Err("此功能目前没有可随 Screenguard 分发的可靠原生实现，已从单应用支持范围停用。".into()),
+        _ => return Err("不支持的 macOS 显示操作".into()),
+    }
+}
+
+/// Apply only desktop origins through Quartz. This avoids resubmitting already
+/// active display modes when alignment needs to move screens but keep their
+/// current signal/scaling configuration intact.
+fn apply_screen_origins_only(screens: &[Screen]) -> Result<(), String> {
+    let current = parse_screens();
+    let mut changed: Vec<(&Screen, u32)> = Vec::new();
+    for wanted in screens.iter().filter(|s| s.enabled) {
+        let actual = current
+            .iter()
+            .find(|s| s.id == wanted.id && s.enabled)
+            .ok_or_else(|| format!("原点更新前找不到活动显示器 {}", wanted.id))?;
+        let mode_matches = match &wanted.requested_mode {
+            Some(requested) => actual.active_mode().map(|m| {
+                (m.index, m.w, m.h, m.hz, m.depth, m.scaling)
+            }) == Some((
+                requested.index,
+                requested.w,
+                requested.h,
+                requested.hz,
+                requested.depth,
+                requested.scaling,
+            )),
+            None => actual.active_mode().map(|m| {
+                (m.w, m.h, m.hz, m.depth, m.scaling)
+            }) == wanted.active_mode().map(|m| {
+                (m.w, m.h, m.hz, m.depth, m.scaling)
+            }),
+        } && actual.degree == wanted.degree;
+        if !mode_matches {
+            return Err(format!("显示器 {} 的当前模式已变化，取消仅位置调整", wanted.id));
+        }
+        if actual.ox != wanted.ox || actual.oy != wanted.oy {
+            let display_id = actual
+                .ctx
+                .ok_or_else(|| format!("显示器 {} 缺少本次枚举的 Core Graphics ID", wanted.id))?;
+            changed.push((wanted, display_id));
+        }
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+
+    let latest = parse_screens();
+    for (wanted, display_id) in &changed {
+        let still_same_display = latest.iter().any(|screen| {
+            screen.id == wanted.id && screen.enabled && screen.ctx == Some(*display_id)
+        });
+        if !still_same_display {
+            return Err(format!(
+                "显示器 {} 在位置事务开始前已重新枚举，取消原点更新",
+                wanted.id
+            ));
+        }
+    }
+
+    let mut config = std::ptr::null_mut();
+    let begin = unsafe { CGBeginDisplayConfiguration(&mut config) };
+    if begin != 0 || config.is_null() {
+        return Err(format!("创建 Core Graphics 显示布局事务失败（码 {}）", begin));
+    }
+    // Contextual display IDs can change when macOS re-enumerates displays.
+    // Bind each persistent ID to the contextual ID from the same fresh snapshot.
+    for (wanted, display_id) in &changed {
+        let result = unsafe {
+            CGConfigureDisplayOrigin(config, *display_id, wanted.ox, wanted.oy)
+        };
+        if result != 0 {
+            unsafe { CGCancelDisplayConfiguration(config) };
+            return Err(format!(
+                "设置显示器 {} 的桌面原点失败（码 {}）",
+                wanted.id, result
+            ));
+        }
+    }
+    // Keep the existing permanent-layout behavior explicit. Saved-layout restore
+    // remains responsible for returning the original origins on exit/rollback.
+    let result = unsafe { CGCompleteDisplayConfiguration(config, K_CG_CONFIGURE_PERMANENTLY) };
+    if result != 0 {
+        return Err(format!("提交 Core Graphics 显示布局事务失败（码 {}）", result));
+    }
+
+    for _ in 0..12 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if layouts_match(&parse_screens(), screens) {
+            return Ok(());
+        }
+    }
+    Err("Core Graphics 已提交位置，但回读原点/模式索引与目标不一致".into())
+}
+
+fn restore_saved_layout(saved: &SavedLayout) -> Result<(), String> {
+    let connected = parse_screens();
+    let connected_ids: std::collections::HashSet<&str> =
+        connected.iter().map(|s| s.id.as_str()).collect();
+    let missing: Vec<&str> = saved
+        .screens
+        .iter()
+        .filter(|s| !connected_ids.contains(s.id.as_str()))
+        .map(|s| s.id.as_str())
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "原布局包含当前未连接的显示器（{}），请接回显示器后再还原；备份已保留",
+            missing.join("、")
+        ));
+    }
+    let already_restored = saved.screens.iter().all(|wanted| {
+        connected.iter().find(|s| s.id == wanted.id).is_some_and(|actual| {
+            actual.enabled == wanted.enabled
+                && (!wanted.enabled || (actual.layout_mode().is_some()
+                    && actual.frame_w() == wanted.w
+                    && actual.frame_h() == wanted.h
+                    && wanted.mode_index.map_or(true, |index| actual.active_mode().map(|m| m.index) == Some(index))
+                    && actual.hz == wanted.hz
+                    && actual.color_depth == wanted.depth
+                    && actual.ox == wanted.ox
+                    && actual.oy == wanted.oy
+                    && actual.degree == wanted.degree
+                    && actual.scaling == wanted.scaling
+                    && actual.main == wanted.main))
+        })
+    });
+    if already_restored {
+        return Ok(());
+    }
+    let specs: Vec<String> = saved
+        .screens
+        .iter()
+        .map(|s| {
+            if !s.enabled {
+                return format!("id:{} enabled:false", s.id);
+            }
+            if let Some(mode_index) = s.mode_index {
+                return format!(
+                    "id:{} mode:{} enabled:true origin:({},{}) degree:{}",
+                    s.id, mode_index, s.ox, s.oy, s.degree
+                );
+            }
+            format!(
+                "id:{} res:{}x{}{} color_depth:{} enabled:true scaling:{} origin:({},{}) degree:{}",
+                s.id,
+                s.w,
+                s.h,
+                s.hz.map(|v| format!(" hz:{}", v)).unwrap_or_default(),
+                s.depth,
+                if s.scaling { "on" } else { "off" },
+                s.ox,
+                s.oy,
+                s.degree
+            )
+        })
+        .collect();
+    let args: Vec<&str> = specs.iter().map(String::as_str).collect();
+    run_displayplacer(&args)?;
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    let after = parse_screens();
+    for wanted in &saved.screens {
+        let actual = after.iter().find(|s| s.id == wanted.id).ok_or_else(|| {
+            format!("还原后找不到显示器 {}；布局备份已保留", wanted.id)
+        })?;
+        if actual.enabled != wanted.enabled
+            || (wanted.enabled && (actual.frame_w() != wanted.w
+            || actual.frame_h() != wanted.h
+            || wanted.mode_index.is_some_and(|index| actual.active_mode().map(|m| m.index) != Some(index))
+            || actual.hz != wanted.hz
+            || actual.color_depth != wanted.depth
+            || actual.ox != wanted.ox
+            || actual.oy != wanted.oy
+            || actual.degree != wanted.degree
+            || actual.scaling != wanted.scaling
+            || actual.main != wanted.main))
+        {
+            return Err(format!(
+                "显示器 {} 未恢复到原布局：目标 {}x{}@{}、位置 ({},{}), 方向 {}°；实际 {}x{}@{}、位置 ({},{}), 方向 {}°。备份已保留",
+                wanted.id, wanted.w, wanted.h, hz_label(wanted.hz), wanted.ox, wanted.oy, wanted.degree,
+                actual.frame_w(), actual.frame_h(), hz_label(actual.hz), actual.ox, actual.oy, actual.degree
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn hz_label(hz: Option<u32>) -> String {
+    hz.map(|v| v.to_string()).unwrap_or_else(|| "默认".into())
+}
+
+fn option_delta(a: Option<u32>, b: Option<u32>) -> f64 {
+    match (a, b) {
+        (Some(a), Some(b)) => a.abs_diff(b) as f64,
+        _ => 0.0,
+    }
+}
+
+pub fn align_restore_modes() -> Result<String, String> {
+    let path = layout_backup_path()?;
+    if !path.exists() {
+        return Ok("没有记录过原始显示布局，无需还原".into());
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("读取布局备份失败：{}", e))?;
+    let saved: SavedLayout = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("布局备份损坏，未改动当前显示：{}", e))?;
+    restore_saved_layout(&saved)?;
+    std::fs::remove_file(&path).map_err(|e| format!("布局已还原，但删除备份失败：{}", e))?;
+    Ok(format!("已还原 {} 台显示器的分辨率、方向、缩放和桌面位置", saved.screens.len()))
+}
+
+fn mode_height(mode: &ScreenMode) -> u32 {
+    // displayplacer lists modes for the display's current rotation, so res:h is
+    // already the desktop's vertical axis. Swapping again double-rotates portrait modes.
+    mode.h
+}
+
+fn mode_matches(actual: &Screen, wanted: &ScreenMode, degree: u32) -> bool {
+    actual.active_mode().map(|m| (m.index, m.w, m.h, m.hz, m.depth, m.scaling))
+        == Some((wanted.index, wanted.w, wanted.h, wanted.hz, wanted.depth, wanted.scaling))
+        && actual.degree == degree
+}
+
+/// 体检 Mac 当前两屏模式与共同逻辑高度候选；EDID 物理尺寸因显示器/系统而异，此处不伪报物理高度。
+pub fn align_report() -> Result<String, String> {
+    let screens = parse_screens();
+    if screens.len() < 2 {
+        return Err("双屏对齐需要两块已连接的显示器".into());
+    }
+    let (main, sec) = main_secondary(&screens)?;
+    if main.modes.is_empty() || sec.modes.is_empty() {
+        return Err("Screenguard 内置显示布局组件没有提供可用模式列表；请刷新显示器列表后重试".into());
+    }
+    let common: std::collections::BTreeSet<u32> = main
+        .modes
+        .iter()
+        .flat_map(|a| sec.modes.iter().filter(move |b| mode_height(a) == mode_height(b)))
+        .map(mode_height)
+        .collect();
+    let mut out = format!(
+        "主屏当前：{} {}x{}@{}，方向 {}°；副屏当前：{} {}x{}@{}，方向 {}°。\n",
+        main.id, main.frame_w(), main.frame_h(), hz_label(main.hz), main.degree,
+        sec.id, sec.frame_w(), sec.frame_h(), hz_label(sec.hz), sec.degree
+    );
+    if common.is_empty() {
+        out.push_str("两屏当前列出的模式没有相同逻辑高度。请检查系统显示设置是否提供共同高度模式。\n");
+    } else {
+        out.push_str(&format!("找到 {} 个共同逻辑高度：{}。\n", common.len(), common.iter().map(u32::to_string).collect::<Vec<_>>().join("、")));
+        out.push_str("一键对齐会优先保留当前模式比例/刷新率，并把并排显示器的顶边对齐。逻辑高度相同不等于面板物理高度相同；实际物理边缘仍需目测确认。\n");
+    }
+    out.push_str("模式清单（主/副）：\n");
+    out.push_str(&format!("主屏：{}\n", main.modes.iter().map(|m| format!("#{} {}x{}@{} {}bit {}", m.index, m.w, m.h, hz_label(m.hz), m.depth, if m.scaling { "scaled" } else { "native" })).collect::<Vec<_>>().join("；")));
+    out.push_str(&format!("副屏：{}", sec.modes.iter().map(|m| format!("#{} {}x{}@{} {}bit {}", m.index, m.w, m.h, hz_label(m.hz), m.depth, if m.scaling { "scaled" } else { "native" })).collect::<Vec<_>>().join("；")));
+    Ok(out)
+}
+
+/// 从两屏共同支持的模式中选择相同逻辑高度，备份全布局，应用并读取回实际状态；失败则回滚。
+pub fn align_apply() -> Result<String, String> {
+    let original = parse_screens();
+    if original.len() < 2 {
+        return Err("双屏对齐需要两块已连接的显示器".into());
+    }
+    let (main, sec) = main_secondary(&original)?;
+    if main.modes.is_empty() || sec.modes.is_empty() {
+        return Err("内置显示布局组件未列出两屏可用模式，无法安全对齐；请重新安装 Screenguard 后重试".into());
+    }
+    if main.active_mode().is_none() || sec.active_mode().is_none() {
+        return Err("内置显示布局组件无法识别两屏当前模式，无法安全计算桌面尺寸；请重新安装 Screenguard 后重试".into());
+    }
+    let side_by_side = main.ox + main.frame_w() as i32 <= sec.ox || sec.ox + sec.frame_w() as i32 <= main.ox;
+    if !side_by_side {
+        return Err("当前两屏不是左右并排布局。请先在 macOS「显示器」设置中把两屏左右并排，再运行对齐".into());
+    }
+    let mut candidates: Vec<(f64, ScreenMode, ScreenMode, u32)> = Vec::new();
+    for a in &main.modes {
+        for b in &sec.modes {
+            let ha = mode_height(a);
+            let hb = mode_height(b);
+            if ha != hb { continue; }
+            let cur_a = main.active_mode().map(|m| (m.index, m.w, m.h, m.hz, m.depth, m.scaling))
+                == Some((a.index, a.w, a.h, a.hz, a.depth, a.scaling));
+            let cur_b = sec.active_mode().map(|m| (m.index, m.w, m.h, m.hz, m.depth, m.scaling))
+                == Some((b.index, b.w, b.h, b.hz, b.depth, b.scaling));
+            let aspect_delta = ((a.w as f64 / a.h as f64) - (main.frame_w() as f64 / main.frame_h().max(1) as f64)).abs()
+                + ((b.w as f64 / b.h as f64) - (sec.frame_w() as f64 / sec.frame_h().max(1) as f64)).abs();
+            let refresh_delta = option_delta(a.hz, main.hz) + option_delta(b.hz, sec.hz);
+            let area = (a.w as f64 * a.h as f64 + b.w as f64 * b.h as f64).sqrt().max(1.0);
+            let current_penalty = (if cur_a { 0.0 } else { 1.0 }) + (if cur_b { 0.0 } else { 1.0 });
+            let score = current_penalty * 10000.0
+                + aspect_delta * 100.0 + refresh_delta + 10000.0 / area;
+            candidates.push((score, a.clone(), b.clone(), ha));
+        }
+    }
+    candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    if candidates.is_empty() {
+        return Err("两块屏没有相同逻辑高度的共同显示模式，未更改布局".into());
+    }
+    save_original_layout(&original)?;
+    let mut failures = Vec::new();
+    for (_, main_mode, sec_mode, height) in candidates.iter().take(16) {
+        let mut target = original.clone();
+        let mi = target.iter().position(|s| s.id == main.id).ok_or("主屏已断开")?;
+        let si = target.iter().position(|s| s.id == sec.id).ok_or("副屏已断开")?;
+        target[mi].w = main_mode.w;
+        target[mi].h = main_mode.h;
+        target[mi].hz = main_mode.hz;
+        target[mi].color_depth = main_mode.depth;
+        target[mi].scaling = main_mode.scaling;
+        target[mi].requested_mode = Some(main_mode.clone());
+        target[si].w = sec_mode.w;
+        target[si].h = sec_mode.h;
+        target[si].hz = sec_mode.hz;
+        target[si].color_depth = sec_mode.depth;
+        target[si].scaling = sec_mode.scaling;
+        target[si].requested_mode = Some(sec_mode.clone());
+        // For side-by-side displays align top edges so the shared seam has no vertical offset.
+        target[si].oy = target[mi].oy;
+        if main.ox < sec.ox {
+            target[si].ox = target[mi].ox + target[mi].frame_w() as i32;
+        } else {
+            target[si].ox = target[mi].ox - target[si].frame_w() as i32;
+        }
+        let modes_unchanged = mode_matches(&main, main_mode, main.degree)
+            && mode_matches(&sec, sec_mode, sec.degree);
+        let applied = if modes_unchanged {
+            apply_screen_origins_only(&target)
+        } else {
+            apply_screen_layout(&target)
+        };
+        if applied.is_ok() {
+            std::thread::sleep(std::time::Duration::from_millis(900));
+            let actual = parse_screens();
+            let got_main = actual.iter().find(|s| s.id == main.id);
+            let got_sec = actual.iter().find(|s| s.id == sec.id);
+            if let (Some(gm), Some(gs)) = (got_main, got_sec) {
+                if mode_matches(gm, main_mode, main.degree)
+                    && mode_matches(gs, sec_mode, sec.degree)
+                    && mode_height(main_mode) == mode_height(sec_mode)
+                    && gm.oy == gs.oy
+                    && (gm.ox + gm.frame_w() as i32 == gs.ox || gs.ox + gs.frame_w() as i32 == gm.ox)
+                {
+                    return Ok(format!(
+                        "已对齐 macOS 两屏逻辑高度：{}px。主屏 {}x{}@{}，副屏 {}x{}@{}；顶边已对齐。{}。物理面板尺寸可能不同，请实际检查边缘。",
+                        height,
+                        gm.frame_w(),
+                        gm.frame_h(),
+                        hz_label(gm.hz),
+                        gs.frame_w(),
+                        gs.frame_h(),
+                        hz_label(gs.hz),
+                        if modes_unchanged {
+                            "保留当前显示模式，仅调整屏幕位置"
+                        } else {
+                            "已应用共同高度显示模式"
+                        }
+                    ));
+                }
+            }
+            failures.push(format!("{}px 模式应用后回读与目标不符", height));
+        } else {
+            failures.push(format!("{}px 模式应用失败：{}", height, applied.unwrap_err()));
+        }
+        let rollback = if modes_unchanged {
+            apply_screen_origins_only(&original)
+        } else {
+            apply_screen_layout(&original)
+        };
+        if let Err(e) = rollback {
+            return Err(format!("对齐尝试失败，且自动回滚原布局也失败：{}。请在 macOS 显示器设置中恢复；备份保存在 ScreenGuard 应用支持目录。", e));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        let rolled_back = parse_screens();
+        let rollback_ok = original.iter().all(|wanted| {
+            rolled_back.iter().any(|actual| {
+                actual.id == wanted.id
+                    && actual.enabled == wanted.enabled
+                    && (!wanted.enabled || (
+                        actual.w == wanted.w
+                            && actual.h == wanted.h
+                            && actual.hz == wanted.hz
+                            && actual.color_depth == wanted.color_depth
+                            && actual.scaling == wanted.scaling
+                            && actual.ox == wanted.ox
+                            && actual.oy == wanted.oy
+                            && actual.degree == wanted.degree
+                            && actual.main == wanted.main
+                    ))
+            })
+        });
+        if !rollback_ok {
+            return Err("对齐失败后已发送回滚命令，但回读未能确认原始布局恢复；请在 macOS 显示器设置中检查，备份仍保留".into());
+        }
+    }
+    clear_layout_backup()?;
+    Err(format!("尝试共同高度失败：{}。已恢复原布局。", failures.join("；")))
+}
+
+// ===== Accessibility/System Events：列出与控制任意应用窗口 =====
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SavedWindow {
+    token: i64,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    title: String,
+    // None means a backup written by an older release. For those backups,
+    // preserve the historical behavior and restore a pending layout snapshot.
+    #[serde(default)]
+    alignment_applied: Option<bool>,
+}
+
+fn should_restore_aligned_layout(
+    alignment_applied: Option<bool>,
+    layout_backup_exists: bool,
+) -> bool {
+    match alignment_applied {
+        Some(applied) => applied && layout_backup_exists,
+        None => layout_backup_exists,
+    }
+}
+
+fn listed_window_titles() -> &'static std::sync::Mutex<std::collections::HashMap<i64, String>> {
+    static TITLES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i64, String>>> = std::sync::OnceLock::new();
+    TITLES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn window_backup_path() -> Result<std::path::PathBuf, String> {
+    Ok(app_support_dir()?.join("window-span-backup.json"))
+}
+
+fn accessibility_error(raw: &str) -> String {
+    let low = raw.to_ascii_lowercase();
+    if low.contains("-25211") || low.contains("-1743") || low.contains("assistive access")
+        || low.contains("not authorized") || low.contains("accessibility")
+    {
+        format!("macOS 尚未授予窗口控制权限。请到「系统设置 → 隐私与安全性 → 辅助功能」允许 ScreenGuard；若系统询问自动化控制，也请允许它控制 System Events。系统返回：{}", raw.trim())
+    } else {
+        raw.trim().to_string()
+    }
+}
+
+fn run_system_events(script: &str) -> Result<String, String> {
+    let out = run_cmd("osascript", &["-e", script]).map_err(|e| accessibility_error(&e))?;
+    let out = out.trim().to_string();
+    if let Some(err) = out.strip_prefix("ERR|") {
+        return Err(accessibility_error(err));
+    }
+    Ok(out)
+}
+
+fn window_list_raw() -> Result<String, String> {
+    let script = format!(r#"
+tell application "System Events"
+  set outText to ""
+  set permissionError to ""
+  repeat with p in application processes
+    try
+      if (background only of p) is false then
+        set appName to name of p as text
+        set appPid to unix id of p as integer
+        if appPid is not {} and appName is not "Screenguard" and appName is not "ScreenGuard" and appName is not "screenguard" then
+          repeat with wi from 1 to (count of windows of p)
+            try
+              set wnd to window wi of p
+              set {{px, py}} to position of wnd
+              set {{ww, wh}} to size of wnd
+              set titleText to ""
+              try
+                set titleText to name of wnd as text
+              end try
+              set AppleScript's text item delimiters to "|"
+              set titleText to (text items of (appName & " — " & titleText)) as text
+              set AppleScript's text item delimiters to " "
+              set titleText to titleText as text
+              set AppleScript's text item delimiters to ""
+              set token to appPid * 65536 + wi
+              set outText to outText & "W|" & token & "|" & ww & "x" & wh & "|" & titleText & linefeed
+            on error errMsg number errNum
+              if errNum is -25211 or errNum is -1743 then set permissionError to (errNum as text) & " " & errMsg
+            end try
+          end repeat
+        end if
+      end if
+    on error errMsg number errNum
+      if errNum is -25211 or errNum is -1743 then set permissionError to (errNum as text) & " " & errMsg
+    end try
+  end repeat
+  if permissionError is not "" then return "ERR|" & permissionError
+  return outText
+end tell
+"#, std::process::id());
+    run_system_events(&script)
+}
+
+fn decode_window_token(token: i64) -> Result<(i64, i64), String> {
+    if token <= 0 { return Err("无效的窗口编号".into()); }
+    let pid = token / 65536;
+    let index = token % 65536;
+    if pid <= 0 || index <= 0 { return Err("窗口编号已过期，请刷新窗口列表".into()); }
+    Ok((pid, index))
+}
+
+fn read_window(token: i64) -> Result<SavedWindow, String> {
+    let (pid, index) = decode_window_token(token)?;
+    let script = format!(r#"
+tell application "System Events"
+  try
+    set p to first application process whose unix id is {}
+    set wnd to window {} of p
+    set appName to name of p as text
+    set {{px, py}} to position of wnd
+    set {{ww, wh}} to size of wnd
+    set titleText to ""
+    try
+      set titleText to name of wnd as text
+    end try
+    set titleText to appName & " — " & titleText
+    return "OK|" & px & "|" & py & "|" & ww & "|" & wh & "|" & titleText
+  on error errMsg number errNum
+    return "ERR|" & errNum & " " & errMsg
+  end try
+end tell
+"#, pid, index);
+    let raw = run_system_events(&script)?;
+    let p: Vec<&str> = raw.splitn(7, '|').collect();
+    if p.len() < 6 || p[0] != "OK" {
+        return Err(format!("窗口已关闭或 macOS 限制调整：{}", raw));
+    }
+    Ok(SavedWindow {
+        token,
+        x: p[1].parse().map_err(|_| "读取窗口横坐标失败")?,
+        y: p[2].parse().map_err(|_| "读取窗口纵坐标失败")?,
+        w: p[3].parse().map_err(|_| "读取窗口宽度失败")?,
+        h: p[4].parse().map_err(|_| "读取窗口高度失败")?,
+        title: p[5].to_string(),
+        alignment_applied: Some(false),
+    })
+}
+
+fn set_window_rect(token: i64, x: i32, y: i32, w: i32, h: i32) -> Result<SavedWindow, String> {
+    let (pid, index) = decode_window_token(token)?;
+    if w <= 0 || h <= 0 { return Err("目标窗口尺寸无效".into()); }
+    let script = format!(r#"
+tell application "System Events"
+  try
+    set p to first application process whose unix id is {}
+    set wnd to window {} of p
+    set appName to name of p as text
+    set size of wnd to {{{}, {}}}
+    set position of wnd to {{{}, {}}}
+    delay 0.25
+    set {{px, py}} to position of wnd
+    set {{ww, wh}} to size of wnd
+    set titleText to ""
+    try
+      set titleText to name of wnd as text
+    end try
+    set titleText to appName & " — " & titleText
+    return "OK|" & px & "|" & py & "|" & ww & "|" & wh & "|" & titleText
+  on error errMsg number errNum
+    return "ERR|" & errNum & " " & errMsg
+  end try
+end tell
+"#, pid, index, w, h, x, y);
+    let raw = run_system_events(&script)?;
+    let p: Vec<&str> = raw.splitn(7, '|').collect();
+    if p.len() < 6 || p[0] != "OK" {
+        return Err(format!("窗口拒绝调整大小：{}", raw));
+    }
+    Ok(SavedWindow {
+        token,
+        x: p[1].parse().map_err(|_| "读取窗口横坐标失败")?,
+        y: p[2].parse().map_err(|_| "读取窗口纵坐标失败")?,
+        w: p[3].parse().map_err(|_| "读取窗口宽度失败")?,
+        h: p[4].parse().map_err(|_| "读取窗口高度失败")?,
+        title: p[5].to_string(),
+        alignment_applied: Some(false),
+    })
+}
+
+fn save_window_backup(window: &SavedWindow) -> Result<(), String> {
+    let path = window_backup_path()?;
+    if path.exists() {
+        let existing = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<SavedWindow>(&b).ok());
+        if existing.as_ref().map(|w| w.token) == Some(window.token) { return Ok(()); }
+    }
+    save_json_atomic(&path, window)
+}
+
+fn mark_window_alignment_applied(window: &SavedWindow) -> Result<(), String> {
+    let path = window_backup_path()?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("读取窗口还原信息失败：{}", e))?;
+    let mut saved: SavedWindow = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("窗口还原信息损坏：{}", e))?;
+    if saved.token != window.token || saved.title != window.title {
+        return Err("窗口还原记录已变化，未标记屏幕对齐状态".into());
+    }
+    saved.alignment_applied = Some(true);
+    save_json_atomic(&path, &saved)
+}
+
+fn union_or_primary(mode: u32) -> Result<(i32, i32, i32, i32), String> {
+    let screens = parse_screens();
+    if screens.iter().filter(|s| s.enabled).count() < 2 {
+        return Err("双屏铺满需要至少两块已启用显示器".into());
+    }
+    if mode == 1 {
+        if screens.iter().any(|s| s.enabled && s.layout_mode().is_none()) {
+            return Err("无法识别当前显示模式的桌面尺寸；请重新安装 Screenguard 后重试，未调整窗口".into());
+        }
+        let active: Vec<&Screen> = screens.iter().filter(|s| s.enabled).collect();
+        let main = active.iter().copied().find(|s| s.main).ok_or("未找到主屏")?;
+        let min_x = active.iter().map(|s| s.ox).min().ok_or("无法计算桌面左边界")?;
+        let max_x = active.iter().map(|s| s.ox + s.frame_w() as i32).max().ok_or("无法计算桌面右边界")?;
+        // Match Windows mode=1: span the full horizontal desktop, using the main
+        // display's height and top edge. This still covers both screens' widths.
+        return Ok((min_x, main.oy, max_x, main.oy + main.frame_h() as i32));
+    }
+    union_bounds(&screens).ok_or_else(|| "无法计算屏幕布局边界".into())
+}
+
+pub fn set_screen_inches(_manuf: &str, _inches: f64) -> Result<(), String> {
+    Err("macOS 版对齐依据两屏共同逻辑高度，不使用 Windows 的厂商代码尺寸录入".into())
+}
+
+fn restore_window_rect_after_failed_span(token: i64, original: &SavedWindow) -> String {
+    match set_window_rect(token, original.x, original.y, original.w, original.h) {
+        Ok(actual)
+            if actual.title == original.title
+                && (actual.x - original.x).abs() <= 8
+                && (actual.y - original.y).abs() <= 8
+                && (actual.w - original.w).abs() <= 8
+                && (actual.h - original.h).abs() <= 8 =>
+        {
+            "窗口已自动恢复到铺满前的矩形".into()
+        }
+        Ok(actual) => format!(
+            "自动回滚未完全恢复：原矩形 ({},{}) {}x{}，回读 ({},{}) {}x{}；窗口还原备份仍保留",
+            original.x, original.y, original.w, original.h,
+            actual.x, actual.y, actual.w, actual.h
+        ),
+        Err(e) => format!("自动回滚窗口失败：{}；窗口还原备份仍保留", e),
+    }
+}
+
+fn span_to_rect(token: i64, mode: u32, expected_title: Option<&str>) -> Result<String, String> {
+    let (x0, y0, x1, y1) = union_or_primary(mode)?;
+    let original = read_window(token)?;
+    if expected_title.is_some_and(|title| title != original.title) {
+        return Err("窗口列表在操作期间已变化，未调整该编号当前指向的窗口；请刷新列表后重试".into());
+    }
+    let actual = match set_window_rect(token, x0, y0, x1 - x0, y1 - y0) {
+        Ok(actual) => actual,
+        Err(e) => {
+            let rollback = restore_window_rect_after_failed_span(token, &original);
+            return Err(format!("{}；{}", e, rollback));
+        }
+    };
+    let dx = (actual.x - x0).abs();
+    let dy = (actual.y - y0).abs();
+    let dw = (actual.w - (x1 - x0)).abs();
+    let dh = (actual.h - (y1 - y0)).abs();
+    if expected_title.is_some_and(|title| title != actual.title)
+        || dx > 8 || dy > 8 || dw > 8 || dh > 8
+    {
+        let reason = format!(
+            "macOS/应用未接受跨屏窗口尺寸或窗口身份发生变化。目标边界 ({},{}) {}x{}，实际 ({},{}) {}x{}。请确认辅助功能授权；应用最小尺寸或 macOS 原生全屏 Space 也可能限制跨屏铺满。",
+            x0, y0, x1-x0, y1-y0, actual.x, actual.y, actual.w, actual.h
+        );
+        let rollback = restore_window_rect_after_failed_span(token, &original);
+        return Err(format!("{}；{}", reason, rollback));
+    }
+    Ok(format!(
+        "{}（AX窗口边界回读：({}, {}) {}x{}；目标：({}, {}) {}x{}）",
+        actual.title, actual.x, actual.y, actual.w, actual.h,
+        x0, y0, x1 - x0, y1 - y0
+    ))
+}
+
+pub fn list_windows() -> Result<String, String> {
+    let raw = window_list_raw()?;
+    let rows: Vec<&str> = raw.lines().filter(|l| l.starts_with("W|")).collect();
+    let mut titles = listed_window_titles().lock().map_err(|_| "窗口列表状态不可用")?;
+    titles.clear();
+    for row in &rows {
+        let fields: Vec<&str> = row.splitn(4, '|').collect();
+        if fields.len() == 4 {
+            if let Ok(token) = fields[1].parse::<i64>() {
+                titles.insert(token, fields[3].to_string());
+            }
+        }
+    }
+    Ok(rows.join("\n"))
+}
+
+pub fn span_window(token: i64, mode: u32) -> Result<String, String> {
+    let expected_title = listed_window_titles().lock()
+        .map_err(|_| "窗口列表状态不可用")?
+        .get(&token)
+        .cloned()
+        .ok_or("窗口编号已过期，请刷新窗口列表后重试")?;
+    let before = read_window(token)?;
+    if before.title != expected_title {
+        return Err("窗口列表已变化，未调整其他窗口；请刷新窗口列表后重试".into());
+    }
+    // Capture the user's pre-alignment frame before changing display modes. The
+    // later span operation must not replace this with a post-alignment rectangle.
+    save_window_backup(&before)?;
+    let aligned = mode == 2;
+    if aligned {
+        align_apply()?;
+        if let Err(error) = mark_window_alignment_applied(&before) {
+            let rollback = align_restore_modes()
+                .map(|s| format!("显示布局已回滚：{}", s))
+                .unwrap_or_else(|re| format!("显示布局回滚失败：{}", re));
+            return Err(format!("保存窗口对齐状态失败：{}；{}", error, rollback));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(900));
+    }
+    let result = span_to_rect(token, if mode == 1 { 1 } else { 0 }, Some(&expected_title));
+    match (aligned, result) {
+        (true, Err(e)) => {
+            let rollback = align_restore_modes()
+                .map(|s| format!("显示布局已回滚：{}", s))
+                .unwrap_or_else(|re| format!("显示布局回滚失败：{}", re));
+            Err(format!("{}；{}", e, rollback))
+        }
+        (_, other) => other,
+    }
+}
+
+pub fn span_foreground(mode: u32) -> Result<String, String> {
+    // Do not guess when clicking the control made ScreenGuard the frontmost app. The explicit
+    // list_windows/span_window picker is reliable in that case and avoids resizing an unrelated app.
+    let script = format!(r#"
+tell application "System Events"
+  try
+    set p to first application process whose frontmost is true
+    if (unix id of p as integer) is not {} and (name of p as text) is not "Screenguard" and (name of p as text) is not "ScreenGuard" and (name of p as text) is not "screenguard" then
+      set pidValue to unix id of p as integer
+      if (count of windows of p) > 0 then return "T|" & (pidValue * 65536 + 1)
+    end if
+    return "SELF"
+  on error errMsg number errNum
+    return "ERR|" & errNum & " " & errMsg
+  end try
+end tell
+"#, std::process::id());
+    let active = run_system_events(&script)?;
+    if active == "SELF" {
+        return Err("ScreenGuard 当前在前台，无法可靠判断你原先选中的窗口。请在「窗口选择」中刷新列表、选中目标窗口后铺满。".into());
+    }
+    let chosen = active.strip_prefix("T|")
+        .ok_or_else(|| format!("无法定位前台应用窗口：{}", active))?
+        .parse::<i64>().map_err(|_| "无法读取前台窗口编号")?;
+    let before = read_window(chosen)?;
+    save_window_backup(&before)?;
+    let aligned = mode == 2;
+    if aligned {
+        align_apply()?;
+        if let Err(error) = mark_window_alignment_applied(&before) {
+            let rollback = align_restore_modes()
+                .map(|s| format!("显示布局已回滚：{}", s))
+                .unwrap_or_else(|re| format!("显示布局回滚失败：{}", re));
+            return Err(format!("保存窗口对齐状态失败：{}；{}", error, rollback));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(900));
+    }
+    let result = span_to_rect(chosen, if mode == 1 { 1 } else { 0 }, Some(&before.title));
+    match (aligned, result) {
+        (true, Err(e)) => {
+            let rollback = align_restore_modes()
+                .map(|s| format!("显示布局已回滚：{}", s))
+                .unwrap_or_else(|re| format!("显示布局回滚失败：{}", re));
+            Err(format!("{}；{}", e, rollback))
+        }
+        (_, other) => other,
+    }
+}
+
+pub fn restore_foreground() -> Result<(), String> {
+    let path = window_backup_path()?;
+    if !path.exists() { return Ok(()); }
+    let bytes = std::fs::read(&path).map_err(|e| format!("读取窗口还原信息失败：{}", e))?;
+    let saved: SavedWindow = serde_json::from_slice(&bytes).map_err(|e| format!("窗口还原信息损坏：{}", e))?;
+    // Only undo display-mode changes when this span operation applied alignment.
+    // Older backups omit the field; for those, retain the previous layout-backup behavior.
+    let layout_backup_exists = layout_backup_path()?.exists();
+    if should_restore_aligned_layout(saved.alignment_applied, layout_backup_exists) {
+        align_restore_modes()?;
+    }
+    let current = read_window(saved.token)?;
+    if current.title != saved.title {
+        return Err("原窗口编号已指向其他窗口，未恢复错误窗口；请重新打开原应用并刷新窗口列表".into());
+    }
+    let actual = set_window_rect(saved.token, saved.x, saved.y, saved.w, saved.h)?;
+    if (actual.x - saved.x).abs() > 8 || (actual.y - saved.y).abs() > 8
+        || (actual.w - saved.w).abs() > 8 || (actual.h - saved.h).abs() > 8
+    {
+        return Err(format!("窗口未能完全还原：原位置 ({},{}) {}x{}，当前 ({},{}) {}x{}；还原信息已保留", saved.x, saved.y, saved.w, saved.h, actual.x, actual.y, actual.w, actual.h));
+    }
+    std::fs::remove_file(path).map_err(|e| format!("窗口已还原，但清除状态失败：{}", e))
+}

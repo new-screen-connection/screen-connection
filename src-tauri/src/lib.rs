@@ -1,0 +1,1759 @@
+mod platform;
+#[cfg(any(target_os = "windows", test))]
+mod icc_profile;
+
+use platform::DisplayInfo;
+
+// ============================================================================
+// 关于「为什么这些命令都是 async + spawn_blocking」
+// ----------------------------------------------------------------------------
+// Tauri 的**同步**命令是跑在**主线程**上的。而本应用几乎每个平台调用都要起一个
+// PowerShell / adb 子进程：一次 DDC 读写约 0.5 秒，蓝牙电池查询更久。同步写法的后果
+// 就是——拖一下亮度滑块，界面卡半秒；点一下按钮，界面卡半秒；联动每 2.5 秒轮询一次，
+// 界面每隔 2.5 秒顿一下。
+//
+// 统一改成 async + tauri::async_runtime::spawn_blocking 之后，阻塞工作落到专用线程池，
+// 主线程（UI）不再被占用。**新增平台命令时请沿用这个模式**，除非它真的只是瞬时的内存操作。
+// 例外：窗口/托盘相关的命令（open_main / quit_app / hide_panel）必须留在主线程，保持同步。
+// ============================================================================
+
+/// 返回当前平台名
+#[tauri::command]
+fn get_platform() -> &'static str {
+    platform::platform_name()
+}
+
+/// 返回 App 版本号（与 Cargo.toml / tauri.conf.json 一致）
+#[tauri::command]
+fn get_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+#[tauri::command]
+fn open_external_page(page: String) -> Result<(), String> {
+    platform::open_external_page(&page)
+}
+
+/// 开机自启是否已启用
+#[tauri::command]
+async fn get_autostart() -> bool {
+    tauri::async_runtime::spawn_blocking(platform::autostart_enabled)
+        .await
+        .unwrap_or(false)
+}
+
+/// 设置开机自启
+#[tauri::command]
+async fn set_autostart(enabled: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || platform::set_autostart(enabled))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+#[tauri::command]
+async fn get_displays() -> Vec<DisplayInfo> {
+    tauri::async_runtime::spawn_blocking(platform::get_displays)
+        .await
+        .unwrap_or_default()
+}
+
+/// 获取单屏可用分辨率与刷新率（macOS displayplacer）。
+#[tauri::command]
+async fn get_display_modes(display_id: String) -> Result<Vec<platform::DisplayMode>, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::get_display_modes(&display_id))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 切换单屏分辨率/刷新率，并回读验证；不匹配时恢复原显示配置。
+#[tauri::command]
+async fn set_display_mode(display_id: String, mode: u32) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::set_display_mode(&display_id, mode))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 执行 Screenguard 原生实现的 macOS 显示操作。
+#[tauri::command]
+async fn display_action(
+    action: String,
+    display_id: String,
+    target_id: Option<String>,
+    value: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        platform::display_action(&action, &display_id, target_id.as_deref(), value.as_deref())
+    })
+    .await
+    .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+#[tauri::command]
+async fn set_brightness(display_id: String, value: u32) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || platform::set_brightness(&display_id, value))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+#[tauri::command]
+async fn set_volume(display_id: String, value: u32) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || platform::set_volume(&display_id, value))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 系统默认输出设备信息（名称 / 音量 / 静音 / 是否可调 / 形态因子）
+#[tauri::command]
+async fn get_system_audio() -> Result<platform::SystemAudio, String> {
+    tauri::async_runtime::spawn_blocking(platform::get_system_audio)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 设置系统默认输出设备音量 0-100（托盘滑块同源；笔记本喇叭/耳机/HDMI 音频都走这里）
+#[tauri::command]
+async fn set_system_volume(value: u32) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || platform::set_system_volume_sel(value))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 系统静音开关
+#[tauri::command]
+async fn set_system_mute(on: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || platform::set_system_mute_sel(on))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 电池设备列表（带电池的连接设备：笔记本内电池 / USB·无线键鼠 / 蓝牙）
+#[tauri::command]
+async fn get_batteries() -> Result<Vec<platform::BatteryInfo>, String> {
+    tauri::async_runtime::spawn_blocking(platform::get_batteries)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+#[tauri::command]
+async fn apply_color_space(space: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || platform::apply_color_space(&space))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+#[tauri::command]
+async fn match_mac() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(platform::match_mac)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+#[tauri::command]
+async fn match_ppi() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(platform::match_ppi)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+#[tauri::command]
+async fn rotate_secondary() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(platform::rotate_secondary)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 恢复副屏为竖屏
+#[tauri::command]
+async fn restore_secondary() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(platform::restore_secondary)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+// ---------- 屏幕电源控制（方案A：纯本地） ----------
+
+/// 系统级关闭所有屏幕（一次黑全部屏，含不支持 DDC 的显示器）
+#[tauri::command]
+async fn screen_off() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(platform::screen_off)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 唤醒屏幕（合成输入事件，解除待机）
+#[tauri::command]
+async fn screen_wake() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(platform::screen_wake)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 单台显示器电源模式（DDC 0xD6）：1=开 2=待机 4=软关
+#[tauri::command]
+async fn set_display_power(display_id: String, mode: u32) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || platform::set_display_power(&display_id, mode))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 读单台显示器电源模式（1=开 2=待机 4=软关 5=硬关）
+#[tauri::command]
+async fn get_display_power(display_id: String) -> Result<u32, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::get_display_power(&display_id))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 显示器在线快照（联动检测轮询用，轻量）
+#[tauri::command]
+async fn display_snapshot() -> Vec<String> {
+    tauri::async_runtime::spawn_blocking(platform::display_snapshot)
+        .await
+        .unwrap_or_default()
+}
+
+/// Per-display sleep state reported by macOS Quartz, exposed for power-link diagnostics.
+#[tauri::command]
+async fn get_display_sleep_states() -> Vec<platform::DisplaySleepState> {
+    tauri::async_runtime::spawn_blocking(platform::display_sleep_states)
+        .await
+        .unwrap_or_default()
+}
+
+// ---------- 显示器健康：KVM/EDID 异常检测与一键修复（无需管理员权限） ----------
+
+/// Whether this build includes the Windows event-log based display-health feature.
+#[tauri::command]
+fn health_supported() -> bool {
+    cfg!(target_os = "windows")
+}
+
+/// 读取最近的显示链路异常事件（KVM 切换、显示器突然离线、EDID 协商失败等）
+#[tauri::command]
+async fn health_events(minutes: Option<u32>) -> String {
+    let m = minutes.unwrap_or(1440);
+    tauri::async_runtime::spawn_blocking(move || platform::health_events(m))
+        .await
+        .unwrap_or_default()
+}
+
+/// 每台在用屏幕的当前模式（分辨率/刷新率/方向）
+#[tauri::command]
+async fn mode_detail() -> String {
+    tauri::async_runtime::spawn_blocking(platform::mode_detail)
+        .await
+        .unwrap_or_default()
+}
+
+/// 一键修复显示异常：level 1 = 强制重新协商（轻）；level 2 = 含链路重握手（深）
+#[tauri::command]
+async fn repair_display(level: Option<u32>) -> Result<String, String> {
+    let l = level.unwrap_or(1);
+    tauri::async_runtime::spawn_blocking(move || platform::repair_display(l))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+// ---------- 软件层总亮度 / HDR 同步 / 窗口铺满 / 全局快捷键 ----------
+
+/// 各屏当前总亮度（gamma 反解）：行 G|dev|pct
+#[tauri::command]
+async fn gamma_get() -> String {
+    tauri::async_runtime::spawn_blocking(platform::gamma_get)
+        .await
+        .unwrap_or_default()
+}
+
+/// 设置所有屏的总亮度（40~160，100 = 原始；三通道同曲线，不改色相）
+#[tauri::command]
+async fn gamma_set(pct: u32) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::gamma_set(pct))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 各屏 HDR 状态：行 H|dev|支持|已启用
+#[tauri::command]
+async fn hdr_states() -> String {
+    tauri::async_runtime::spawn_blocking(platform::hdr_states)
+        .await
+        .unwrap_or_default()
+}
+
+/// 把所有支持 HDR 的屏统一开/关
+#[tauri::command]
+async fn hdr_set(on: bool) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::hdr_set(on))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 双屏铺满：把当前前台窗口铺满所有屏（不限播放器）
+#[tauri::command]
+async fn span_foreground(mode: Option<u32>) -> Result<String, String> {
+    // 默认 mode=1「以主屏为基准」：本机两块屏分辨率不同，用包围盒会把主屏底部裁掉
+    let m = mode.unwrap_or(1);
+    tauri::async_runtime::spawn_blocking(move || platform::span_foreground(m))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 还原上一次被铺满的窗口
+#[tauri::command]
+async fn restore_foreground() -> Result<(), String> {
+    let window_restore = tauri::async_runtime::spawn_blocking(platform::restore_foreground)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?;
+
+    // macOS stores whether this specific window-span operation changed display modes
+    // in its recovery record and restores them conditionally inside restore_foreground.
+    // An unconditional second restore here could consume an unrelated pending alignment backup.
+    #[cfg(target_os = "macos")]
+    return window_restore;
+
+    // Windows' foreground restore only restores the app window; screen alignment is a
+    // separate operation and must be rolled back alongside it.
+    #[cfg(target_os = "windows")]
+    {
+        let display_restore = tauri::async_runtime::spawn_blocking(platform::align_restore_modes)
+            .await
+            .map_err(|e| format!("后台任务失败：{}", e))?;
+        match (window_restore, display_restore) {
+            (Ok(()), Ok(_)) => Ok(()),
+            (Err(window), Err(display)) => Err(format!("窗口还原失败：{}；显示器还原失败：{}", window, display)),
+            (Err(window), Ok(_)) => Err(window),
+            (Ok(()), Err(display)) => Err(display),
+        }
+    }
+}
+
+/// 注册全局快捷键（Ctrl+Alt+L：全部屏幕待机/唤醒 切换）
+#[tauri::command]
+fn hotkey_start() -> Result<String, String> {
+    platform::hotkey_start()
+}
+
+/// 当前生效的全局快捷键（空 = 未注册）
+#[tauri::command]
+fn hotkey_label() -> String {
+    platform::hotkey_label()
+}
+
+/// 跨屏缩放对齐：真正写入逐屏缩放档（先备份）
+#[tauri::command]
+async fn match_dpi_apply() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(platform::match_dpi_apply)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+#[tauri::command]
+async fn match_dpi_restore() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(platform::match_dpi_restore)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+// ---------- v0.3.3：窗口选择 / 音频端点选择 / 一键恢复默认 ----------
+
+/// 可以被铺满的窗口列表："hwnd|宽x高|标题"（不含本程序自己的窗口）
+#[tauri::command]
+async fn list_windows() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(platform::list_windows)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 铺满指定窗口（按 hwnd，用户从列表里挑）
+#[tauri::command]
+async fn span_window(hwnd: i64, mode: Option<u32>) -> Result<String, String> {
+    let m = mode.unwrap_or(1);
+    tauri::async_runtime::spawn_blocking(move || platform::span_window(hwnd, m))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 所有活动的音频输出端点（含是否可调音量），供「系统控制」里选设备
+#[tauri::command]
+async fn audio_endpoints() -> Result<Vec<platform::AudioEndpoint>, String> {
+    tauri::async_runtime::spawn_blocking(platform::audio_endpoints)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 选定要控制的输出端点（空串 = 跟随系统默认）
+#[tauri::command]
+async fn set_audio_device(id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || platform::set_audio_device(&id))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 一键恢复默认：把所有「软件层面」的改动还原成基线快照
+#[tauri::command]
+async fn restore_defaults() -> Result<String, String> {
+    let r = tauri::async_runtime::spawn_blocking(platform::restore_defaults)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?;
+    // 分辨率也回到原始（用户要求：一键恢复默认要能恢复所有软件层改动）
+    let _ = tauri::async_runtime::spawn_blocking(platform::align_restore_modes).await;
+    r
+}
+
+/// 应用状态（是否退出还原 / 选定的音频端点 / 基线摘要）
+#[tauri::command]
+fn app_state_json() -> String {
+    platform::app_state_json()
+}
+
+#[tauri::command]
+async fn export_user_settings_json() -> String {
+    tauri::async_runtime::spawn_blocking(platform::user_settings_json)
+        .await
+        .unwrap_or_else(|_| "{}".into())
+}
+
+#[tauri::command]
+async fn import_user_settings_json(settings_json: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::import_user_settings_json(&settings_json))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 设置「退出软件时自动还原」
+#[tauri::command]
+fn set_revert_on_exit(on: bool) -> Result<(), String> {
+    platform::set_revert_on_exit(on)
+}
+
+/// 一键检测：扫描所有与屏幕相关的状态，逐项判定 + 建议，并写入日志
+#[tauri::command]
+async fn diag_scan() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(platform::diag_scan)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 一键修复：把检测出的、能安全自动处理的问题修掉并自动复查
+#[tauri::command]
+async fn diag_fix() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(platform::diag_fix)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 在资源管理器里打开日志目录
+#[tauri::command]
+fn open_log_dir() -> Result<(), String> {
+    platform::open_log_dir()
+}
+
+/// 日志目录路径（界面显示）
+#[tauri::command]
+fn diag_log_path() -> String {
+    platform::diag_log_path()
+}
+
+/// 双屏对齐体检：算 PPI 误差、丢画面比例，并推荐"高度能对上"的分辨率组合（只读）
+#[tauri::command]
+async fn align_report() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(platform::align_report)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 记录某块屏的物理尺寸（对角线英寸），供 EDID 未上报时计算 PPI
+#[tauri::command]
+fn set_screen_inches(manuf: String, inches: f64) -> Result<(), String> {
+    platform::set_screen_inches(&manuf, inches)
+}
+
+/// 应用「双屏对齐」：自动挑可行的模式组合并切换（应用前自动记录原始分辨率）
+#[tauri::command]
+async fn align_apply() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(platform::align_apply)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 还原两块屏的原始分辨率（4K）
+#[tauri::command]
+async fn align_restore() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(platform::align_restore_modes)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 小米显示器（REDMI G Pro 27U）当前音量：走它自己的 MiTV 接口（DDC 不通）
+#[tauri::command]
+async fn mitv_volume_get() -> Result<u32, String> {
+    tauri::async_runtime::spawn_blocking(platform::mitv_volume_get)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 把小米显示器音量调到指定值（按键步进逼近，返回实际读回值）
+#[tauri::command]
+async fn mitv_volume_set(target: u32) -> Result<u32, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::mitv_volume_set(target))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 小米显示器音量接口是否可用
+#[tauri::command]
+async fn mitv_available() -> bool {
+    tauri::async_runtime::spawn_blocking(platform::mitv_available)
+        .await
+        .unwrap_or(false)
+}
+
+// ---------- 方案B：ADB 联网精细控制（可选增强） ----------
+
+/// ADB 能力探测（是否找到 adb / 已连接设备）
+#[tauri::command]
+async fn adb_status() -> platform::AdbStatus {
+    tauri::async_runtime::spawn_blocking(platform::adb_status)
+        .await
+        .unwrap_or_else(|_| platform::AdbStatus {
+            available: false,
+            path: String::new(),
+            devices: Vec::new(),
+            tip: "后台任务失败，请重试".to_string(),
+        })
+}
+
+/// 连接显示器的 ADB（addr 形如 192.168.31.216:5555）
+#[tauri::command]
+async fn adb_connect(addr: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::adb_connect(&addr))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 电源键：待机/唤醒显示器（KEYCODE_POWER）
+#[tauri::command]
+async fn adb_power(serial: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::adb_power(&serial))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 音量加减
+#[tauri::command]
+async fn adb_volume(serial: String, up: bool) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::adb_volume(&serial, up))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 通用 adb shell（进阶用法）
+#[tauri::command]
+async fn adb_shell(serial: String, cmd: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::adb_shell(&serial, &cmd))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 一键下载 Android Platform Tools
+#[tauri::command]
+async fn adb_download() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(platform::adb_download)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 显示并聚焦主窗口（命令、托盘菜单共用）
+fn show_main_window(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
+/// 菜单栏面板：打开主窗口（窗口操作，留在主线程）
+#[tauri::command]
+fn open_main(app: tauri::AppHandle) -> Result<(), String> {
+    show_main_window(&app);
+    Ok(())
+}
+
+/// 菜单栏面板：退出（窗口操作，留在主线程）
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    revert_before_exit();
+    app.exit(0);
+}
+
+/// 退出前把「软件层面」的改动还原成基线（用户要求：退出软件后自动恢复原样）。
+/// 可在状态文件里用 revert_on_exit=false 关掉。
+fn revert_before_exit() {
+    let js: serde_json::Value =
+        serde_json::from_str(&platform::app_state_json()).unwrap_or(serde_json::Value::Null);
+    let on = js
+        .get("revert_on_exit")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if on {
+        let _ = platform::restore_defaults();
+        // 退出软件 → 两块屏分辨率也回到原始 4K
+        let _ = platform::align_restore_modes();
+    }
+}
+
+/// 菜单栏面板：隐藏浮窗（不退出应用；面板的 ✕ 按钮与 Esc 键调用）
+#[tauri::command]
+fn hide_panel(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("panel") {
+        w.hide().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Shared power-link preference for the main and menu-bar WebViews.
+/// WKWebView localStorage is not a reliable cross-window source of truth.
+#[tauri::command]
+fn get_power_link_preference(app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri::Manager;
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("无法读取应用数据目录：{}", e))?
+        .join("power-link-enabled");
+    match std::fs::read_to_string(path) {
+        Ok(value) => Ok(value.trim() == "1"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("读取电源联动偏好失败：{}", error)),
+    }
+}
+
+/// Persist the shared power-link preference in the app data directory.
+#[tauri::command]
+fn set_power_link_preference(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri::Manager;
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("无法读取应用数据目录：{}", e))?;
+    std::fs::create_dir_all(&path).map_err(|e| format!("创建应用数据目录失败：{}", e))?;
+    std::fs::write(
+        path.join("power-link-enabled"),
+        if enabled { "1" } else { "0" },
+    )
+    .map_err(|e| format!("保存电源联动偏好失败：{}", e))?;
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.eval(&format!("window.applyPowerLinkUiState({})", enabled));
+    }
+    Ok(())
+}
+
+/// 从主窗口打开菜单栏控制面板，供主窗口里的电源联动开关显示运行状态。
+#[tauri::command]
+fn open_control_panel(app: tauri::AppHandle, power_link_enabled: bool) -> Result<(), String> {
+    use tauri::Manager;
+    let w = app
+        .get_webview_window("panel")
+        .ok_or_else(|| "控制面板窗口不可用".to_string())?;
+    if let Ok(Some(mon)) = w.primary_monitor() {
+        let pos = mon.position();
+        let size = mon.size();
+        let scale = mon.scale_factor();
+        let width = w
+            .outer_size()
+            .map(|s| s.width as i32)
+            .unwrap_or((382.0 * scale) as i32);
+        let gap = (10.0 * scale) as i32;
+        w.set_position(tauri::PhysicalPosition::new(
+            pos.x + size.width as i32 - width - gap,
+            pos.y + gap,
+        ))
+        .map_err(|e| format!("定位控制面板失败：{}", e))?;
+    }
+    w.show().map_err(|e| format!("打开控制面板失败：{}", e))?;
+    w.set_focus()
+        .map_err(|e| format!("聚焦控制面板失败：{}", e))?;
+    w.eval(&format!(
+        "window.applyPowerLinkPreference({})",
+        power_link_enabled
+    ))
+    .map_err(|e| format!("同步菜单栏电源联动状态失败：{}", e))?;
+    Ok(())
+}
+
+// ================= 显示器健康：自动修复 + 右下角气泡提醒 =================
+// 设计：后台线程每 45 秒查一次「设备突然离线」（事件 ID 1010）日志；
+// 发现新的显示器掉线 → 弹右下角小窗提醒；若开了自动修复且屏幕没自己回来，
+// 就强制重新协商一次显示配置。两个开关都存在 %APPDATA%\Screenguard\health.json。
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct HealthConfig {
+    #[serde(default)]
+    pub auto_repair: bool,
+    #[serde(default = "hc_true")]
+    pub notify: bool,
+}
+fn hc_true() -> bool {
+    true
+}
+
+fn health_cfg_path() -> std::path::PathBuf {
+    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
+    std::path::Path::new(&base)
+        .join("Screenguard")
+        .join("health.json")
+}
+
+pub(crate) fn health_cfg() -> HealthConfig {
+    std::fs::read_to_string(health_cfg_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<HealthConfig>(&s).ok())
+        .unwrap_or(HealthConfig {
+            auto_repair: false,
+            notify: true,
+        })
+}
+
+fn save_health_cfg(c: &HealthConfig) {
+    let p = health_cfg_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(c) {
+        let _ = std::fs::write(p, s);
+    }
+}
+
+#[tauri::command]
+fn health_get_config() -> HealthConfig {
+    health_cfg()
+}
+
+#[tauri::command]
+fn health_set_config(auto_repair: bool, notify: bool) -> Result<(), String> {
+    save_health_cfg(&HealthConfig {
+        auto_repair,
+        notify,
+    });
+    Ok(())
+}
+
+// ---- 气泡内容（notify 窗口创建后自己来取，或由 emit 推送）----
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+pub struct NotifyPayload {
+    pub icon: String,
+    pub title: String,
+    pub body: String,
+}
+
+fn notify_payload() -> &'static std::sync::Mutex<NotifyPayload> {
+    static P: std::sync::OnceLock<std::sync::Mutex<NotifyPayload>> = std::sync::OnceLock::new();
+    P.get_or_init(|| std::sync::Mutex::new(NotifyPayload::default()))
+}
+
+#[tauri::command]
+fn get_notify_payload() -> NotifyPayload {
+    notify_payload()
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn close_notify(app: tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("notify") {
+        let _ = w.hide();
+    }
+}
+
+/// 自检用：手动弹一条提醒（验证气泡通知是否正常）
+#[tauri::command]
+fn notify_test(app: tauri::AppHandle) {
+    show_notify(
+        &app,
+        "💡",
+        "提醒功能正常",
+        "这是测试气泡：以后显示器链路掉线时，这里会第一时间告诉你。",
+    );
+}
+
+/// 弹一条右下角气泡（不抢焦点，12 秒后自动消失）
+fn show_notify(app: &tauri::AppHandle, icon: &str, title: &str, body: &str) {
+    use tauri::{Emitter, Manager};
+    let p = NotifyPayload {
+        icon: icon.to_string(),
+        title: title.to_string(),
+        body: body.to_string(),
+    };
+    if let Ok(mut g) = notify_payload().lock() {
+        *g = p.clone();
+    }
+    if let Some(w) = app.get_webview_window("notify") {
+        // 紧贴主屏工作区右下角。
+        // 关键：必须带上显示器自己的**原点**（position）—— 多屏布局里主屏原点常不是 (0,0)，
+        // 旧代码只拿 size() 硬算「屏宽-窗宽」，结果算到别的屏/别处去（实测气泡跑到左上角）。
+        // 用 Tauri 的显示器信息而不是 PowerShell 的 SPI_GETWORKAREA：
+        // PowerShell 进程不是 DPI 感知的，取回的坐标会被虚拟化，反而对不上。
+        let scale = w.scale_factor().unwrap_or(1.0);
+        let place = |w: &tauri::WebviewWindow| {
+            if let Ok(Some(mon)) = w.primary_monitor() {
+                let pos = mon.position();
+                let size = mon.size();
+                let ww = (360.0 * scale) as i32;
+                let wh = (104.0 * scale) as i32;
+                let pad = (10.0 * scale) as i32;
+                let taskbar = (48.0 * scale) as i32; // 主屏任务栏
+                let x = pos.x + size.width as i32 - ww - pad;
+                let y = pos.y + size.height as i32 - wh - pad - taskbar;
+                let _ = w.set_position(tauri::PhysicalPosition::new(x, y));
+            } else if let Ok((l, t, r, b)) = platform::primary_work_area() {
+                let ww = (360.0 * scale) as i32;
+                let wh = (104.0 * scale) as i32;
+                let pad = (10.0 * scale) as i32;
+                let _ = w.set_position(tauri::PhysicalPosition::new(
+                    (r - ww - pad).max(l),
+                    (b - wh - pad).max(t),
+                ));
+            }
+        };
+        place(&w);
+        let _ = w.emit("notify", p.clone());
+        let _ = w.show();
+        // 窗口首次创建时页面还没加载完（收不到上面那次 emit），
+        // 稍后再补发一次，保证气泡里一定有内容；位置也再确认一次。
+        std::thread::sleep(std::time::Duration::from_millis(260));
+        place(&w);
+        let _ = w.emit("notify", p);
+    }
+}
+
+/// 后台监控：链路掉线 → 提醒（+ 可选自动修复）
+#[cfg(target_os = "windows")]
+fn spawn_health_watch(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        use std::collections::HashSet;
+        use std::time::{Duration, Instant};
+
+        let count_displays = || -> usize {
+            platform::mode_detail()
+                .lines()
+                .filter(|l| l.starts_with("M|"))
+                .count()
+        };
+
+        // 基线：当前几台屏在用（用于判断掉线后有没有自己回来）
+        let mut baseline = count_displays();
+        if baseline == 0 {
+            std::thread::sleep(Duration::from_secs(20));
+            baseline = count_displays();
+        }
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut first = true; // 首次只登记已有事件，避免开机就报历史
+        let mut last_fix = Instant::now() - Duration::from_secs(600);
+
+        loop {
+            std::thread::sleep(Duration::from_secs(45));
+            let cfg = health_cfg();
+            let raw = platform::health_events(6); // 近 6 分钟
+            let mut fresh: Vec<String> = Vec::new();
+            for line in raw.lines() {
+                let p: Vec<&str> = line.split('|').collect();
+                if p.len() < 6 || p[0] != "E" || p[4] != "1010" {
+                    continue; // 只看「设备突然离线」
+                }
+                let key = format!("{}|{}", p[1], p[5]);
+                if seen.insert(key) && !first {
+                    fresh.push(p[5].to_string());
+                }
+            }
+            if first {
+                first = false;
+                continue;
+            }
+            if fresh.is_empty() {
+                continue;
+            }
+            let disp = fresh.iter().filter(|m| m.contains("DISPLAY")).count();
+            if disp == 0 {
+                continue; // 非显示设备的事件（USB 存储等）不打扰
+            }
+
+            if cfg.notify {
+                show_notify(
+                    &app,
+                    "⚠️",
+                    "显示器链路掉线",
+                    &format!(
+                        "{} 台显示器从系统里消失（同批共 {} 个设备事件）。这类抖动多由 KVM／线材／供电引起。",
+                        disp,
+                        fresh.len()
+                    ),
+                );
+            }
+
+            // 我们主动让屏幕待机时**绝不**自动修复：待机会产生「显示器掉线」事件，
+            // 而深度修复内部含 screen_off()，会把刚被鼠标唤醒的屏又关回去（用户实测）。
+            if cfg.auto_repair
+                && !platform::standby_state()
+                && !platform::recently_changed(120)
+                && last_fix.elapsed() > Duration::from_secs(150)
+            {
+                std::thread::sleep(Duration::from_secs(6)); // 给系统 6 秒自己恢复的机会
+                let now = count_displays();
+                if now < baseline {
+                    let ok = platform::repair_display(1).is_ok();
+                    last_fix = Instant::now();
+                    if cfg.notify {
+                        show_notify(
+                            &app,
+                            if ok { "🩺" } else { "❗" },
+                            if ok {
+                                "已自动修复显示配置"
+                            } else {
+                                "自动修复未成功"
+                            },
+                            if ok {
+                                "检测到显示器没有自行恢复，已强制重新协商显示配置。若画面仍异常，可在面板点「深度修复」。"
+                            } else {
+                                "自动重新协商失败，建议在面板手动点「深度修复」，或检查 KVM／线材连接。"
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// macOS 电源联动使用原生后台轮询，不依赖隐藏菜单栏 WebView 的 JavaScript 定时器。
+/// macOS 优先用 DDC VCP 0xD6 检测单屏电源变化，无法读到时回退到连接/断开事件。
+#[cfg(any(target_os = "macos", test))]
+fn macos_power_transition(
+    previous_online: &[String],
+    current_online: &[String],
+    previous_power: &std::collections::HashMap<String, u32>,
+    current_power: &std::collections::HashMap<String, u32>,
+) -> Option<(String, &'static str)> {
+    let mut ddc_changes = Vec::new();
+    for (id, previous_mode) in previous_power {
+        let Some(current_mode) = current_power.get(id) else {
+            continue;
+        };
+        // MCCS VCP 0xD6: 2=standby, 3=suspend, 4=soft off, 5=hard off.
+        // Every reported non-on power state is an off transition for screen-linking.
+        let direction = if *previous_mode == 1 && matches!(*current_mode, 2 | 3 | 4 | 5) {
+            Some("off")
+        } else if matches!(*previous_mode, 2 | 3 | 4 | 5) && *current_mode == 1 {
+            Some("on")
+        } else {
+            None
+        };
+        if let Some(direction) = direction {
+            ddc_changes.push((id.clone(), direction));
+        }
+    }
+
+    match ddc_changes.len() {
+        1 => return ddc_changes.pop(),
+        count if count > 1 => return None,
+        _ => {}
+    }
+
+    let removed = previous_online
+        .iter()
+        .any(|id| !current_online.contains(id));
+    let added = current_online
+        .iter()
+        .any(|id| !previous_online.contains(id));
+    match (removed, added) {
+        (true, false) => Some((String::new(), "off")),
+        (false, true) => Some((String::new(), "on")),
+        _ => None,
+    }
+}
+
+/// Use macOS Quartz sleep state as a second per-display sensor when VCP 0xD6 is unreadable.
+#[cfg(any(target_os = "macos", test))]
+fn macos_display_sleep_transition(
+    previous: &std::collections::HashMap<String, bool>,
+    current: &std::collections::HashMap<String, bool>,
+) -> Option<(String, &'static str)> {
+    let mut changes = Vec::new();
+    for (id, was_asleep) in previous {
+        let Some(is_asleep) = current.get(id) else {
+            continue;
+        };
+        if was_asleep != is_asleep {
+            changes.push((id.clone(), if *is_asleep { "off" } else { "on" }));
+        }
+    }
+    if changes.len() == 1 {
+        changes.pop()
+    } else {
+        None
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn combine_macos_power_transitions(
+    ddc: Option<(String, &'static str)>,
+    system_sleep: Option<(String, &'static str)>,
+) -> Option<(String, &'static str)> {
+    match (ddc, system_sleep) {
+        (Some(ddc), Some(system_sleep)) if ddc == system_sleep => Some(ddc),
+        (Some(_), Some(_)) => None,
+        (Some(transition), None) | (None, Some(transition)) => Some(transition),
+        (None, None) => None,
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_should_fallback_to_system_power(source_id: &str, ddc_failures: usize) -> bool {
+    source_id.is_empty() || ddc_failures > 0
+}
+
+#[cfg(test)]
+mod macos_power_transition_tests {
+    use super::{
+        combine_macos_power_transitions, macos_display_sleep_transition,
+        macos_power_transition, macos_should_fallback_to_system_power,
+    };
+    use std::collections::HashMap;
+
+    fn readings(values: &[(&str, u32)]) -> HashMap<String, u32> {
+        values
+            .iter()
+            .map(|(id, mode)| ((*id).to_string(), *mode))
+            .collect()
+    }
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    #[test]
+    fn detects_single_ddc_off_and_wake_transitions_for_all_off_modes() {
+        let online = ids(&["main", "secondary"]);
+        let before = readings(&[("main", 1), ("secondary", 1)]);
+        for mode in [2, 3, 4, 5] {
+            let off = readings(&[("main", mode), ("secondary", 1)]);
+            assert_eq!(
+                macos_power_transition(&online, &online, &before, &off),
+                Some(("main".into(), "off")),
+                "mode {mode} should trigger off"
+            );
+            assert_eq!(
+                macos_power_transition(&online, &online, &off, &before),
+                Some(("main".into(), "on")),
+                "mode {mode} should trigger wake"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_unreadable_and_ambiguous_ddc_changes() {
+        let online = ids(&["main", "secondary"]);
+        let before = readings(&[("main", 1), ("secondary", 1)]);
+        let unreadable = readings(&[("main", 1)]);
+        let conflicting_before = readings(&[("main", 1), ("secondary", 4)]);
+        let conflicting = readings(&[("main", 4), ("secondary", 1)]);
+        let two_changes = readings(&[("main", 4), ("secondary", 2)]);
+
+        assert_eq!(
+            macos_power_transition(&online, &online, &before, &unreadable),
+            None
+        );
+        assert_eq!(
+            macos_power_transition(&online, &online, &conflicting_before, &conflicting),
+            None
+        );
+        assert_eq!(
+            macos_power_transition(&online, &online, &before, &two_changes),
+            None
+        );
+    }
+
+    #[test]
+    fn uses_only_unambiguous_display_disconnect_or_reconnect_events() {
+        let power = HashMap::new();
+        let before = ids(&["main", "secondary"]);
+        assert_eq!(
+            macos_power_transition(&before, &ids(&["main"]), &power, &power),
+            Some((String::new(), "off"))
+        );
+        assert_eq!(
+            macos_power_transition(&ids(&["main"]), &before, &power, &power),
+            Some((String::new(), "on"))
+        );
+        assert_eq!(
+            macos_power_transition(&before, &ids(&["secondary", "new"]), &power, &power),
+            None
+        );
+    }
+
+    #[test]
+    fn falls_back_to_system_power_when_source_disappears_or_ddc_control_fails() {
+        assert!(macos_should_fallback_to_system_power("", 0));
+        assert!(macos_should_fallback_to_system_power("main", 1));
+        assert!(!macos_should_fallback_to_system_power("main", 0));
+    }
+
+    #[test]
+    fn detects_single_coregraphics_display_sleep_and_wake() {
+        let awake = readings_bool(&[("main", false), ("secondary", false)]);
+        let main_asleep = readings_bool(&[("main", true), ("secondary", false)]);
+        assert_eq!(
+            macos_display_sleep_transition(&awake, &main_asleep),
+            Some(("main".into(), "off"))
+        );
+        assert_eq!(
+            macos_display_sleep_transition(&main_asleep, &awake),
+            Some(("main".into(), "on"))
+        );
+    }
+
+    #[test]
+    fn ignores_ambiguous_or_new_coregraphics_sleep_states() {
+        let awake = readings_bool(&[("main", false), ("secondary", false)]);
+        let both_asleep = readings_bool(&[("main", true), ("secondary", true)]);
+        let new_display = readings_bool(&[("main", false), ("new", true)]);
+        assert_eq!(macos_display_sleep_transition(&awake, &both_asleep), None);
+        assert_eq!(macos_display_sleep_transition(&awake, &new_display), None);
+    }
+
+    #[test]
+    fn rejects_conflicting_ddc_and_coregraphics_transitions() {
+        assert_eq!(
+            combine_macos_power_transitions(
+                Some(("main".into(), "off")),
+                Some(("secondary".into(), "on")),
+            ),
+            None
+        );
+        assert_eq!(
+            combine_macos_power_transitions(
+                Some(("main".into(), "off")),
+                Some(("main".into(), "off")),
+            ),
+            Some(("main".into(), "off"))
+        );
+    }
+
+    fn readings_bool(values: &[(&str, bool)]) -> std::collections::HashMap<String, bool> {
+        values
+            .iter()
+            .map(|(id, asleep)| ((*id).to_string(), *asleep))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod display_sleep_state_serialization_tests {
+    use crate::platform::DisplaySleepState;
+
+    #[test]
+    fn serializes_sleep_state_fields_for_the_webview() {
+        let encoded = serde_json::to_value(vec![DisplaySleepState {
+            id: "external-1".to_string(),
+            asleep: true,
+        }])
+        .unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!([{ "id": "external-1", "asleep": true }])
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_macos_power_link_watch(app: tauri::AppHandle) {
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use tauri::{Emitter, Manager};
+
+    std::thread::spawn(move || {
+        let mut was_enabled = false;
+        let mut previous_online: Vec<String> = Vec::new();
+        let mut previous_power: HashMap<String, u32> = HashMap::new();
+        let mut previous_sleep: HashMap<String, bool> = HashMap::new();
+        let mut pending: Option<(String, u8)> = None;
+
+        loop {
+            std::thread::sleep(Duration::from_millis(1200));
+
+            let enabled = app
+                .path()
+                .app_data_dir()
+                .ok()
+                .and_then(|path| std::fs::read_to_string(path.join("power-link-enabled")).ok())
+                .is_some_and(|value| value.trim() == "1");
+
+            if !enabled {
+                was_enabled = false;
+                previous_online.clear();
+                previous_power.clear();
+                previous_sleep.clear();
+                pending = None;
+                continue;
+            }
+
+            let mut current = platform::display_snapshot();
+            current.sort();
+            if !was_enabled {
+                was_enabled = true;
+                previous_online = current.clone();
+                previous_power.clear();
+                previous_sleep = platform::display_sleep_states()
+                    .into_iter()
+                    .map(|state| (state.id, state.asleep))
+                    .collect();
+                for id in &current {
+                    if let Ok(mode) = platform::get_display_power(id) {
+                        previous_power.insert(id.clone(), mode);
+                    }
+                }
+                pending = None;
+                let readable = previous_power.len();
+                let status = if current.is_empty() {
+                    "macOS 电源联动已开启，但当前没有在线显示器；连接显示器后会自动开始检测。"
+                        .to_string()
+                } else if readable == current.len() {
+                    format!(
+                        "macOS 后台联动已启动；{}/{} 台显示器可读取 DDC 电源状态。请保持 Screenguard 运行。",
+                        readable,
+                        current.len(),
+                    )
+                } else {
+                    format!(
+                        "macOS 后台联动已启动；{}/{} 台显示器可读取 DDC 电源状态，另监测 macOS Quartz 单屏睡眠状态。请检查显示器 OSD 的 DDC/CI 设置和连接链路。若显示器物理断电后仍在线、DDC 不可读且 macOS 仍报告唤醒，则系统没有可用信号识别这次物理关屏。",
+                        readable,
+                        current.len(),
+                    )
+                };
+                let _ = app.emit("power-link-status", status);
+                continue;
+            }
+
+            let mut readings = HashMap::new();
+            for id in &current {
+                let Ok(mode) = platform::get_display_power(id) else {
+                    continue;
+                };
+                readings.insert(id.clone(), mode);
+            }
+            let sleep_readings: HashMap<String, bool> = platform::display_sleep_states()
+                .into_iter()
+                .map(|state| (state.id, state.asleep))
+                .collect();
+
+            // 多屏同时出现相反/并发电源变化时不猜测来源，避免把其它屏幕也反向切换。
+            // 旧显示器关机后从在线列表消失时，helper 会回退到稳定的断开/重连事件。
+            let ddc_transition =
+                macos_power_transition(&previous_online, &current, &previous_power, &readings);
+            let sleep_transition =
+                macos_display_sleep_transition(&previous_sleep, &sleep_readings);
+            let transition = combine_macos_power_transitions(ddc_transition, sleep_transition);
+
+            let Some((source_id, direction)) = transition else {
+                previous_online = current.clone();
+                previous_sleep = sleep_readings;
+                for (id, mode) in readings {
+                    previous_power.insert(id, mode);
+                }
+                previous_power.retain(|id, _| current.contains(id));
+                pending = None;
+                continue;
+            };
+
+            let signature = format!("{}:{}:{}", direction, source_id, current.join(","));
+            match pending.as_mut() {
+                Some((seen, count)) if *seen == signature => *count = count.saturating_add(1),
+                _ => pending = Some((signature.clone(), 1)),
+            }
+            let stable = pending
+                .as_ref()
+                .is_some_and(|(seen, count)| *seen == signature && *count >= 2);
+            if !stable {
+                continue;
+            }
+
+            pending = None;
+            previous_online = current.clone();
+            previous_sleep = sleep_readings;
+            for (id, mode) in readings {
+                previous_power.insert(id, mode);
+            }
+            previous_power.retain(|id, _| current.contains(id));
+            let desired_mode = if direction == "off" { 2 } else { 1 };
+            let mut applied = 0usize;
+            let mut errors = Vec::new();
+            for id in &current {
+                if id == &source_id {
+                    continue;
+                }
+                match platform::set_display_power(id, desired_mode) {
+                    Ok(()) => {
+                        if platform::get_display_power(id).ok() == Some(desired_mode) {
+                            previous_power.insert(id.clone(), desired_mode);
+                            applied += 1;
+                        } else {
+                            errors.push(format!("{}：电源模式回读未确认", id));
+                        }
+                    }
+                    Err(error) => errors.push(format!("{}：{}", id, error)),
+                }
+            }
+
+            // If the source vanished or per-display DDC control/read-back failed,
+            // use the OS-wide fallback. This covers displays whose power state is readable
+            // but whose peer rejects DDC writes; the system request affects all connected displays.
+            let fallback_requested =
+                macos_should_fallback_to_system_power(&source_id, errors.len());
+            let fallback = if fallback_requested {
+                if direction == "off" {
+                    platform::screen_off()
+                } else {
+                    platform::screen_wake()
+                }
+            } else {
+                Ok(())
+            };
+            let message = if let Err(error) = fallback {
+                format!("macOS 电源联动失败：{}", error)
+            } else if fallback_requested && !errors.is_empty() {
+                format!(
+                    "逐屏 DDC 控制未全部确认（{}）；已发送 macOS 系统级{}请求，作用于全部当前显示器，请观察屏幕状态。",
+                    errors.join("；"),
+                    if direction == "off" { "待机" } else { "唤醒" }
+                )
+            } else if fallback_requested {
+                format!(
+                    "检测到显示器{}，已发送 macOS 系统级{}请求。",
+                    if direction == "off" {
+                        "断开"
+                    } else {
+                        "重新连接"
+                    },
+                    if direction == "off" {
+                        "待机"
+                    } else {
+                        "唤醒"
+                    }
+                )
+            } else if errors.is_empty() && applied > 0 {
+                format!(
+                    "检测到一台显示器{}，已通过 DDC 同步并回读确认{}台其他显示器。",
+                    if direction == "off" {
+                        "进入待机"
+                    } else {
+                        "已唤醒"
+                    },
+                    applied
+                )
+            } else {
+                format!("macOS 电源联动未完成：{}", errors.join("；"))
+            };
+            eprintln!("[screenguard] {}", message);
+            let _ = app.emit("power-link-status", message);
+        }
+    });
+}
+
+/// Windows 电源联动在 Rust 后台线程采样，避免菜单栏 WebView 隐藏后定时器被节流。
+#[cfg(target_os = "windows")]
+fn spawn_windows_power_link_watch(app: tauri::AppHandle) {
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+    use tauri::{Emitter, Manager};
+
+    std::thread::spawn(move || {
+        let mut was_enabled = false;
+        let mut previous_online: Vec<String> = Vec::new();
+        let mut previous_power: HashMap<String, bool> = HashMap::new();
+        let mut pending: Option<(String, u8)> = None;
+        let mut expected: HashMap<String, (bool, Instant)> = HashMap::new();
+
+        loop {
+            std::thread::sleep(Duration::from_millis(2500));
+
+            let enabled = app
+                .path()
+                .app_data_dir()
+                .ok()
+                .and_then(|path| std::fs::read_to_string(path.join("power-link-enabled")).ok())
+                .is_some_and(|value| value.trim() == "1");
+            if !enabled {
+                was_enabled = false;
+                previous_online.clear();
+                previous_power.clear();
+                pending = None;
+                expected.clear();
+                continue;
+            }
+
+            let mut online = platform::display_snapshot();
+            online.sort();
+            online.dedup();
+            if online.is_empty() {
+                continue;
+            }
+
+            let mut power = HashMap::new();
+            for id in &online {
+                let state = platform::get_display_power(id)
+                    .ok()
+                    .and_then(|mode| match mode {
+                        1 => Some(true),
+                        2 | 3 | 4 | 5 => Some(false),
+                        _ => None,
+                    });
+                if let Some(state) = state {
+                    power.insert(id.clone(), state);
+                } else if let Some(known) = previous_power.get(id) {
+                    // DDC 查询失败只表示未知；保留已知状态，不把通信故障推断成关屏。
+                    power.insert(id.clone(), *known);
+                }
+            }
+
+            if !was_enabled {
+                was_enabled = true;
+                previous_online = online;
+                previous_power = power;
+                pending = None;
+                expected.clear();
+                let _ = app.emit(
+                    "power-link-status",
+                    "Windows 原生后台联动已启动；检测 VCP 0xD6 与显示器连接状态。",
+                );
+                continue;
+            }
+
+            let mut changes: Vec<(String, bool)> = Vec::new();
+            for (id, state) in &power {
+                if let Some(old) = previous_power.get(id) {
+                    if old != state {
+                        changes.push((id.clone(), *state));
+                    }
+                }
+            }
+            for id in previous_online.iter().filter(|id| !online.contains(id)) {
+                if !changes.iter().any(|(changed_id, _)| changed_id == id) {
+                    changes.push((id.clone(), false));
+                }
+            }
+            for id in online.iter().filter(|id| !previous_online.contains(id)) {
+                if !changes.iter().any(|(changed_id, _)| changed_id == id) {
+                    changes.push((id.clone(), true));
+                }
+            }
+            changes.sort_by(|a, b| a.0.cmp(&b.0));
+
+            if changes.is_empty() {
+                previous_online = online;
+                previous_power = power;
+                pending = None;
+                expected.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(20));
+                continue;
+            }
+
+            let signature = changes
+                .iter()
+                .map(|(id, on)| format!("{}:{}", id, if *on { "on" } else { "off" }))
+                .collect::<Vec<_>>()
+                .join("|");
+            match pending.as_mut() {
+                Some((seen, count)) if *seen == signature => *count = count.saturating_add(1),
+                _ => pending = Some((signature.clone(), 1)),
+            }
+            if !pending
+                .as_ref()
+                .is_some_and(|(seen, count)| *seen == signature && *count >= 2)
+            {
+                continue;
+            }
+
+            previous_online = online.clone();
+            previous_power = power;
+            pending = None;
+            expected.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(20));
+
+            let mut external = Vec::new();
+            for (id, on) in changes {
+                let is_expected = expected.get(&id).is_some_and(|(wanted, at)| {
+                    *wanted == on && at.elapsed() < Duration::from_secs(20)
+                });
+                if is_expected {
+                    expected.remove(&id);
+                } else {
+                    external.push((id, on));
+                }
+            }
+            if external.is_empty() {
+                continue;
+            }
+
+            let directions: HashSet<bool> = external.iter().map(|(_, on)| *on).collect();
+            if directions.len() != 1 {
+                let _ = app.emit(
+                    "power-link-status",
+                    "检测到多块屏同时切换到不同电源状态；为避免互相覆盖，本次未联动。",
+                );
+                continue;
+            }
+
+            let turn_on = *directions.iter().next().expect("one direction");
+            let sources: HashSet<&str> = external.iter().map(|(id, _)| id.as_str()).collect();
+            let targets: Vec<String> = online
+                .iter()
+                .filter(|id| !sources.contains(id.as_str()))
+                .cloned()
+                .collect();
+            if targets.is_empty() {
+                let _ = app.emit(
+                    "power-link-status",
+                    "已检测到显示器状态变化；没有其它在线显示器可联动。",
+                );
+                continue;
+            }
+
+            let mode = if turn_on { 1 } else { 4 };
+            let mut succeeded = 0usize;
+            let mut first_error = None;
+            for id in targets {
+                expected.insert(id.clone(), (turn_on, Instant::now()));
+                match platform::set_display_power(&id, mode) {
+                    Ok(()) => succeeded += 1,
+                    Err(error) => {
+                        expected.remove(&id);
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                }
+            }
+
+            let message = if let Some(error) = first_error {
+                format!(
+                    "Windows 屏幕电源联动完成 {} 台，部分失败：{}",
+                    succeeded, error
+                )
+            } else {
+                format!(
+                    "检测到一块屏{}，已发送 DDC 联动命令至其余 {} 台屏。",
+                    if turn_on { "打开" } else { "关闭" },
+                    succeeded
+                )
+            };
+            eprintln!("[screenguard] {}", message);
+            let _ = app.emit("power-link-status", message);
+        }
+    });
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .setup(|app| {
+            use tauri::menu::{Menu, MenuItem};
+            use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+            use tauri::Manager;
+
+            // 单实例自检：若已有更早启动的实例在跑，本实例直接退出，防双托盘
+            // （macOS 用于避免 launchd bootstrap 双开；Windows 用于避免双击图标开出多个托盘）
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            if platform::another_instance_running() {
+                std::process::exit(0);
+            }
+
+            // 右键菜单
+            let open_main = MenuItem::with_id(app, "open_main", "打开主窗口", true, None::<&str>)?;
+            // 「不依赖界面」的还原入口：铺满之后窗口可能盖住界面上的按钮（实测踩过）
+            let unspan = MenuItem::with_id(app, "unspan", "还原铺满的窗口", true, None::<&str>)?;
+            let defaults = MenuItem::with_id(app, "defaults", "恢复默认状态", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "退出（自动还原）", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open_main, &unspan, &defaults, &quit])?;
+
+            // 显示/隐藏面板浮窗（右上角、菜单栏下方）
+            let toggle_panel = |app_handle: &tauri::AppHandle| {
+                if let Some(pw) = app_handle.get_webview_window("panel") {
+                    if pw.is_visible().unwrap_or(false) {
+                        let _ = pw.hide();
+                    } else {
+                        if let Ok(Some(mon)) = pw.primary_monitor() {
+                            let scale = mon.scale_factor();
+                            let pos = mon.position();
+                            let size = mon.size();
+                            // 关键：必须加上显示器自己的原点（position）。旧代码只用 size()，
+                            // 多屏布局下主屏原点不是 (0,0) 时，右边缘就会溢到隔壁屏上（用户实测）。
+                            // 上/右各留 10px 间隙，贴着主屏右上角内侧，但不贴死、不越界。
+                            // 用窗口真实宽度（而不是硬编码），保证右边一定不越界。
+                            let ow = pw
+                                .outer_size()
+                                .map(|s| s.width as i32)
+                                .unwrap_or((382.0 * scale) as i32);
+                            let gap = (10.0 * scale) as i32;
+                            let x = pos.x + size.width as i32 - ow - gap;
+                            let y = pos.y + gap;
+                            let _ = pw.set_position(tauri::PhysicalPosition::new(x, y));
+                        }
+                        let _ = pw.show();
+                        let _ = pw.set_focus();
+                    }
+                }
+            };
+
+            TrayIconBuilder::with_id("main")
+                .icon(app.default_window_icon().expect("no icon").clone())
+                .tooltip("屏幕守护")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(move |app_handle, event| match event.id.as_ref() {
+                    "open_main" => show_main_window(app_handle),
+                    "unspan" => {
+                        let _ = platform::restore_foreground();
+                    }
+                    "defaults" => {
+                        let _ = platform::restore_defaults();
+                    }
+                    "quit" => {
+                        // 退出前把软件层面的改动还原（用户要求：退出后恢复原样）
+                        revert_before_exit();
+                        app_handle.exit(0)
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(move |tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        toggle_panel(tray.app_handle());
+                    }
+                })
+                .build(app)?;
+
+            // Windows Event Log based health monitor (disconnect alerts + optional repair).
+            #[cfg(target_os = "windows")]
+            spawn_health_watch(app.handle().clone());
+
+            // macOS 电源联动由原生后台线程执行，面板隐藏或关闭时仍持续监测。
+            #[cfg(target_os = "macos")]
+            spawn_macos_power_link_watch(app.handle().clone());
+
+            // Windows DDC 0xD6 联动也必须从原生后台线程启动，不能依赖 WebView 定时器。
+            #[cfg(target_os = "windows")]
+            spawn_windows_power_link_watch(app.handle().clone());
+
+            // v0.3.3：启动后采集一次「基线快照」（供「一键恢复默认」和「退出自动还原」）
+            // 延后几秒，等显示/音频栈就绪再读，避免采到空值
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(7));
+                let _ = platform::capture_baseline();
+                // Windows 一键检测依赖 Windows 事件日志；macOS 上该卡片隐藏且不后台调用。
+                #[cfg(target_os = "windows")]
+                let _ = platform::diag_scan();
+            });
+
+            // 全局快捷键：Ctrl+Alt+L 切换「全部屏幕待机 / 唤醒」（失败只记日志，不影响启动）
+            if let Err(e) = platform::hotkey_start() {
+                eprintln!("[screenguard] 全局快捷键未注册：{}", e);
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            // 主窗口点 X = 隐藏到托盘（程序常驻，托盘左键呼出面板）
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_platform,
+            get_version,
+            open_external_page,
+            get_autostart,
+            set_autostart,
+            get_displays,
+            get_display_modes,
+            set_display_mode,
+            display_action,
+            set_brightness,
+            set_volume,
+            get_system_audio,
+            set_system_volume,
+            set_system_mute,
+            get_batteries,
+            apply_color_space,
+            match_mac,
+            match_ppi,
+            rotate_secondary,
+            restore_secondary,
+            screen_off,
+            screen_wake,
+            set_display_power,
+            get_display_power,
+            display_snapshot,
+            get_display_sleep_states,
+            health_events,
+            health_supported,
+            mode_detail,
+            repair_display,
+            health_get_config,
+            health_set_config,
+            get_notify_payload,
+            close_notify,
+            notify_test,
+            gamma_get,
+            gamma_set,
+            hdr_states,
+            hdr_set,
+            span_foreground,
+            restore_foreground,
+            hotkey_start,
+            hotkey_label,
+            match_dpi_apply,
+            match_dpi_restore,
+            list_windows,
+            span_window,
+            audio_endpoints,
+            set_audio_device,
+            restore_defaults,
+            app_state_json,
+            export_user_settings_json,
+            import_user_settings_json,
+            set_revert_on_exit,
+            mitv_volume_get,
+            mitv_volume_set,
+            mitv_available,
+            diag_scan,
+            diag_fix,
+            open_log_dir,
+            diag_log_path,
+            align_report,
+            set_screen_inches,
+            align_apply,
+            align_restore,
+            adb_status,
+            adb_connect,
+            adb_power,
+            adb_volume,
+            adb_shell,
+            adb_download,
+            open_main,
+            quit_app,
+            hide_panel,
+            open_control_panel,
+            get_power_link_preference,
+            set_power_link_preference
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
