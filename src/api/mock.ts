@@ -134,8 +134,18 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
     case 'get_autostart':
       return state.autostart as T;
     case 'set_autostart':
-      state.autostart = Boolean(args?.on);
+      state.autostart = Boolean(args?.enabled);
       return undefined as T;
+    case 'get_display_power':
+      return 1 as T;
+    case 'set_display_power':
+      return undefined as T;
+    case 'hdr_set':
+      return '已把全部屏幕 HDR 切换' as T;
+    case 'set_system_mute':
+      return undefined as T;
+    case 'adb_status':
+      return { available: false, path: '', devices: [] as string[], tip: 'ADB 未安装，下载后可增强联网屏控制' } as T;
     case 'app_state_json':
       return JSON.stringify({ revert_on_exit: state.revertOnExit }) as T;
     case 'set_revert_on_exit':

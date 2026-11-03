@@ -1,0 +1,368 @@
+/* 托盘快捷面板样式：紧凑、深色优先、无 emoji，复用全局设计令牌 */
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+}
+
+html,
+body,
+#panel {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font);
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* 窗口本身 transparent，圆角画在这里 */
+.panel-shell {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+/* ── 头部 ─────────────────────────── */
+.p-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--bg-sidebar);
+  flex: none;
+}
+
+.p-icon {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  flex: none;
+}
+
+.p-title {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  flex: 1;
+  min-width: 0;
+}
+
+.p-title strong {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.p-ver {
+  font-size: 11px;
+  color: var(--faint);
+  font-family: var(--mono);
+}
+
+.p-head-btns {
+  display: flex;
+  gap: 6px;
+}
+
+/* ── 按钮体系 ─────────────────────── */
+.p-btn {
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  border-radius: var(--radius-sm);
+  padding: 5px 12px;
+  font-size: 12.5px;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.p-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.p-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.p-btn.sm {
+  padding: 3px 9px;
+  font-size: 11.5px;
+}
+
+.p-btn.active,
+.p-cell.on {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.p-btn.ghost {
+  background: transparent;
+}
+
+/* ── 滚动区 ───────────────────────── */
+.p-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 12px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.p-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+
+.p-scroll::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+
+.p-sec-label {
+  font-size: 11px;
+  color: var(--faint);
+  letter-spacing: 0.08em;
+  margin-bottom: 7px;
+}
+
+/* 快捷宫格 */
+.p-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+
+.p-cell {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  border-radius: var(--radius-sm);
+  padding: 9px 4px;
+  font-size: 12px;
+  font-family: var(--font);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.12s, background 0.12s;
+}
+
+.p-cell:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.p-cell:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* 滑块行 */
+.p-slider-row,
+.p-power-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.p-slider-name {
+  width: 86px;
+  flex: none;
+  font-size: 12.5px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.p-slider-val {
+  width: 26px;
+  flex: none;
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
+.p-range {
+  flex: 1;
+  min-width: 0;
+  appearance: none;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+  outline: none;
+}
+
+.p-range::-webkit-slider-thumb {
+  appearance: none;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg);
+  box-shadow: 0 0 0 1px var(--border);
+  cursor: pointer;
+}
+
+/* 电源行 */
+.p-power-state {
+  flex: 1;
+  font-size: 11.5px;
+  color: var(--ok);
+  font-family: var(--mono);
+}
+
+.p-power-state.off {
+  color: var(--faint);
+}
+
+/* 开关行 */
+.p-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.p-toggle-name {
+  font-size: 12.5px;
+}
+
+.p-toggle-desc {
+  font-size: 11px;
+  color: var(--faint);
+  margin-top: 2px;
+}
+
+.p-switch {
+  width: 34px;
+  height: 19px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  position: relative;
+  cursor: pointer;
+  flex: none;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.p-switch .knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--faint);
+  transition: transform 0.15s, background 0.15s;
+}
+
+.p-switch.on {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+
+.p-switch.on .knob {
+  transform: translateX(15px);
+  background: var(--accent);
+}
+
+/* ── 底栏 ─────────────────────────── */
+.p-foot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border-soft);
+  background: var(--bg-sidebar);
+}
+
+.p-foot-link {
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: 12px;
+  font-family: var(--font);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 0;
+}
+
+.p-foot-link:hover {
+  color: var(--text);
+}
+
+.p-foot-link.danger:hover {
+  color: var(--err);
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--faint);
+  display: inline-block;
+}
+
+.dot.on {
+  background: var(--ok);
+}
+
+/* ── 状态浮层 ─────────────────────── */
+.p-toast {
+  position: fixed;
+  left: 12px;
+  right: 12px;
+  bottom: 42px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--ok);
+  border-radius: var(--radius-sm);
+  padding: 8px 11px;
+  font-size: 12px;
+  color: var(--text);
+  z-index: 10;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+
+.p-toast.err {
+  border-left-color: var(--err);
+}
+
+.toast-enter-active,
+.toast-leave-active {
+  transition: opacity 0.18s, transform 0.18s;
+}
+
+.toast-enter-from,
+.toast-leave-to {
+  opacity: 0;
+  transform: translateY(6px);
+}
+
+/* 浅色主题下的细节适配 */
+@media (prefers-color-scheme: light) {
+  .panel-shell {
+    border-color: var(--border);
+  }
+
+  .p-toast {
+    box-shadow: 0 6px 20px rgba(30, 45, 90, 0.12);
+  }
+}

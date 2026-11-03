@@ -70,7 +70,7 @@ const toggleRevert = (on: boolean): void => {
 };
 
 const toggleAutostart = (on: boolean): void => {
-  void act(() => invoke('set_autostart', { on }), on ? '已开启开机自启' : '已关闭开机自启');
+  void act(() => invoke('set_autostart', { enabled: on }), on ? '已开启开机自启' : '已关闭开机自启');
 };
 
 const openPrivacy = (): void => {
