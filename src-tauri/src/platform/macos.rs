@@ -1024,9 +1024,175 @@ fn read_ddc_brightness(cgid: u32) -> Option<u32> {
 // 文档要求的 5 条 macOS 检查项全部实现；aspect/resolution 推导与 Windows 共用同一套辅助函数。
 
 use super::{
-    aspect_mismatch, looks_generic_profile, DisplayHealth, HealthCheck, HealthReport,
-    HealthSummary, Severity,
+    aspect_mismatch, bandwidth_ladder, looks_generic_profile, required_bandwidth_gbps,
+    DisplayHealth, HealthCheck, HealthReport, HealthSummary, HopKind, HopStatus, Severity,
+    Topology, TopologyHop,
 };
+
+// ---------- 链路拓扑（P0-2，macOS 侧） ----------
+
+/// system_profiler SPDisplaysDataType 的拓扑事实：显卡名 + 各屏连接类型
+struct SpFacts {
+    gpus: Vec<String>,
+    conn_types: Vec<String>,
+}
+
+fn sp_display_facts() -> SpFacts {
+    let mut gpus = Vec::new();
+    let mut conn_types = Vec::new();
+    if let Ok(raw) = run_cmd("system_profiler", &["SPDisplaysDataType"]) {
+        for line in raw.lines() {
+            let t = line.trim();
+            if let Some(v) = t.strip_prefix("Chipset Model:") {
+                let n = v.trim();
+                if !n.is_empty() && !gpus.iter().any(|g| g == n) {
+                    gpus.push(n.to_string());
+                }
+            } else if let Some(v) = t.strip_prefix("Connection Type:") {
+                conn_types.push(v.trim().to_string());
+            }
+        }
+    }
+    SpFacts { gpus, conn_types }
+}
+
+/// macOS 链路拓扑：拿不到的一律 unknown + note，绝不猜。
+/// - builtin: 内建屏；conn: 可归属的外接连接类型（多外接屏无法区分时 None）
+fn build_topology_mac(s: &Screen, builtin: bool, conn: Option<&str>, facts: &SpFacts) -> Topology {
+    let mut hops: Vec<TopologyHop> = Vec::new();
+
+    // ① GPU：system_profiler Chipset Model
+    if facts.gpus.len() == 1 {
+        hops.push(TopologyHop {
+            kind: HopKind::Gpu,
+            label: facts.gpus[0].clone(),
+            detail: Some("来自 system_profiler SPDisplaysDataType".into()),
+            status: HopStatus::Ok,
+        });
+    } else if facts.gpus.is_empty() {
+        hops.push(TopologyHop {
+            kind: HopKind::Gpu,
+            label: "显卡".into(),
+            detail: Some("system_profiler 未返回显卡信息（系统未提供）".into()),
+            status: HopStatus::Unknown,
+        });
+    } else {
+        let list = facts.gpus.join("；");
+        hops.push(TopologyHop {
+            kind: HopKind::Gpu,
+            label: format!("显卡 ×{}", facts.gpus.len()),
+            detail: Some(format!(
+                "本机有多块显卡，未逐屏归属：{}",
+                list
+            )),
+            status: HopStatus::Unknown,
+        });
+    }
+
+    // ② 接口：system_profiler 的 Connection Type（多外接屏时无法区分归属）
+    let conn_label = if builtin {
+        Some("内建面板".to_string())
+    } else {
+        conn.map(|c| c.to_string())
+    };
+    hops.push(TopologyHop {
+        kind: HopKind::Port,
+        label: conn_label.clone().unwrap_or_else(|| "接口".into()),
+        detail: Some(if conn_label.is_some() {
+            "连接类型来自 system_profiler（Connection Type 字段）".to_string()
+        } else {
+            "多台外接屏时系统不逐屏报告连接类型，无法归属到这一块".to_string()
+        }),
+        status: if conn_label.is_some() { HopStatus::Ok } else { HopStatus::Unknown },
+    });
+
+    // ③ 线缆：规格不可读；按「当前模式所需带宽 vs 协议上限」反推（与 Windows 同一套算式）
+    let low_conn = conn.unwrap_or("").to_lowercase();
+    let hdmi = low_conn.contains("hdmi");
+    let dp = low_conn.contains("displayport") || low_conn.contains("thunderbolt");
+    let cable = if s.w > 0 && s.h > 0 {
+        let hz = s.hz.unwrap_or(60);
+        let req = required_bandwidth_gbps(s.w, s.h, hz);
+        let calc = format!("算式：{}×{}×{}×24bit×1.08 ≈ {:.1} Gbps", s.w, s.h, hz, req);
+        let (status, head) = if req <= 8.16 {
+            (HopStatus::Ok, String::new())
+        } else {
+            let suspect = (hdmi && req > 14.4) || (dp && req > 25.92) || req > 77.4;
+            if suspect {
+                (
+                    HopStatus::Suspect,
+                    "所需带宽已超出该接口常见版本的上限：若出现黑屏、闪屏或最高刷新率档缺失，优先怀疑线缆/扩展坞带宽不足。".to_string(),
+                )
+            } else {
+                (
+                    HopStatus::Unknown,
+                    "带宽档位较高，老版本线材可能承载不了；若刷新率上不去优先查线材。".to_string(),
+                )
+            }
+        };
+        TopologyHop {
+            kind: HopKind::Cable,
+            label: "线缆".into(),
+            detail: Some(if req <= 8.16 {
+                format!(
+                    "当前 {}x{}@{} 所需带宽约 {:.1} Gbps，低于最保守的 HDMI 1.4 上限（8.16 Gbps），常见线缆都能满足。线材规格本身系统不可读。{}",
+                    s.w, s.h, hz, req, calc
+                )
+            } else {
+                format!(
+                    "当前 {}x{}@{} 所需带宽{}。{}{}",
+                    s.w,
+                    s.h,
+                    hz,
+                    bandwidth_ladder(req),
+                    head,
+                    calc
+                )
+            }),
+            status,
+        }
+    } else {
+        TopologyHop {
+            kind: HopKind::Cable,
+            label: "线缆".into(),
+            detail: Some("读不到当前分辨率，无法估算所需带宽；线材规格本身系统不可读".into()),
+            status: HopStatus::Unknown,
+        }
+    };
+    hops.push(cable);
+
+    // ④ 扩展坞/转接：macOS 无标准 API
+    if builtin {
+        hops.push(TopologyHop {
+            kind: HopKind::Hub,
+            label: "扩展坞/转接".into(),
+            detail: Some("内建面板直连主板，不经过外接转接链路".into()),
+            status: HopStatus::Ok,
+        });
+    } else {
+        hops.push(TopologyHop {
+            kind: HopKind::Hub,
+            label: "扩展坞/转接".into(),
+            detail: Some(
+                "系统未提供中转设备（扩展坞/转接头）信息，无法判断是否经过转接；若这块屏 DDC 不可达，优先怀疑扩展坞挡了 DDC 通道".to_string(),
+            ),
+            status: HopStatus::Unknown,
+        });
+    }
+
+    // ⑤ 显示器：EDID 厂商字段 system_profiler 不暴露，诚实标 unknown
+    hops.push(TopologyHop {
+        kind: HopKind::Display,
+        label: role_name(s.main),
+        detail: Some("macOS 未提供 EDID 厂商/产品码字段，型号信息以系统名称为准".into()),
+        status: HopStatus::Unknown,
+    });
+
+    Topology {
+        hops,
+        note: None,
+    }
+}
 
 pub fn health_report_impl() -> Result<HealthReport, String> {
     let screens = parse_screens();
@@ -1039,6 +1205,13 @@ pub fn health_report_impl() -> Result<HealthReport, String> {
     let ts = run_cmd("date", &["+%Y-%m-%d %H:%M:%S"])
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
+
+    // 拓扑事实（P0-2）：显卡与连接类型；外接屏唯一时才能把连接类型归属到屏
+    let facts = sp_display_facts();
+    let n_external = screens
+        .iter()
+        .filter(|s| s.enabled && unsafe { CGDisplayIsBuiltin(s.ctx.unwrap_or(0)) } == 0)
+        .count();
 
     let mut displays: Vec<DisplayHealth> = Vec::new();
     for s in &screens {
@@ -1064,6 +1237,7 @@ pub fn health_report_impl() -> Result<HealthReport, String> {
                     evidence: vec![format!("displayplacer：persistent id {} 报告 disabled", s.id)],
                     fix_ids: vec!["rescan_displays".into(), "force_redetect".into()],
                 }],
+                topology: None,
             });
             continue;
         }
@@ -1176,6 +1350,18 @@ pub fn health_report_impl() -> Result<HealthReport, String> {
             _ => {}
         }
 
+        // 链路拓扑（P0-2）：外接屏唯一时才能把 Connection Type 归属到这块屏
+        let conn = if !builtin && n_external == 1 {
+            facts
+                .conn_types
+                .iter()
+                .find(|c| !c.to_lowercase().contains("internal"))
+                .map(|c| c.as_str())
+        } else {
+            None
+        };
+        let topology = Some(build_topology_mac(s, builtin, conn, &facts));
+
         displays.push(DisplayHealth {
             display_id: s.id.clone(),
             name: role_name(s.main),
@@ -1189,6 +1375,7 @@ pub fn health_report_impl() -> Result<HealthReport, String> {
             hdr: None, // macOS 暂无 HDR 状态读取通道
             connected: true,
             checks,
+            topology,
         });
     }
 

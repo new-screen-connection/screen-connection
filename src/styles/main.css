@@ -841,6 +841,99 @@ input[type='range']:disabled {
   color: var(--ok);
 }
 
+/* ---------- 体检页：显示链路拓扑（P0-2） ---------- */
+
+.topo {
+  margin-top: 12px;
+}
+
+.topo-chain {
+  display: flex;
+  align-items: stretch;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.topo-arrow {
+  align-self: center;
+  font-size: 12px;
+  color: var(--faint);
+  padding: 0 1px;
+}
+
+.topo-hop {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.35;
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.topo-hop:hover {
+  border-color: var(--accent);
+}
+
+.topo-hop .topo-kind {
+  font-size: 10px;
+  color: var(--faint);
+}
+
+.topo-hop .topo-label {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+/* suspect：警告色实底边框；unknown：虚线边框（系统未提供，不猜） */
+.topo-hop.suspect {
+  border-color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+}
+
+.topo-hop.suspect .topo-label,
+.topo-hop.suspect .topo-kind {
+  color: var(--warn);
+}
+
+.topo-hop.unknown {
+  border-style: dashed;
+}
+
+.topo-hop.open {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.topo-detail {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-left: 2px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  font-size: 12px;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.topo-note {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--warn);
+}
+
 .health-checks {
   display: flex;
   flex-direction: column;

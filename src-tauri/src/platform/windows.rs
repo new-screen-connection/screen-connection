@@ -309,6 +309,43 @@ public class SGCore {
     } finally { Marshal.FreeHGlobal(pa); Marshal.FreeHGlobal(ma); }
   }
 
+  /// 显示链路拓扑事实（P0-2）：每条活动路径一行。
+  /// 行: T|<GDI dev>|<outputTechnology>|<edidManufactureId>|<edidProductCodeId>|<connectorInstance>|<monitorDevicePath>
+  /// 全部来自 DisplayConfig 权威来源；输出技术枚举值见 Rust 侧 map_output_tech。
+  public static string TopologyInfo() {
+    uint nPaths, nModes;
+    if (GetDisplayConfigBufferSizes(2 /*QDC_ONLY_ACTIVE_PATHS*/, out nPaths, out nModes) != 0 || nPaths == 0) return "";
+    IntPtr pa = Marshal.AllocHGlobal((int)(nPaths * 72));
+    IntPtr ma = Marshal.AllocHGlobal((int)(nModes * 64));
+    try {
+      uint p = nPaths, m = nModes;
+      if (QueryDisplayConfigRaw(2, ref p, pa, ref m, ma, IntPtr.Zero) != 0) return "";
+      var sb = new StringBuilder();
+      var seen = new System.Collections.Generic.HashSet<string>();
+      for (int i = 0; i < p; i++) {
+        int off = i * 72;
+        var src = new SGDC_SRC_NAME();
+        src.header.type = 1; src.header.size = (uint)Marshal.SizeOf(typeof(SGDC_SRC_NAME));
+        src.header.adapterId.LowPart = (uint)Marshal.ReadInt32(pa, off);
+        src.header.adapterId.HighPart = Marshal.ReadInt32(pa, off + 4);
+        src.header.id = (uint)Marshal.ReadInt32(pa, off + 8);
+        if (DisplayConfigGetDeviceInfo(ref src) != 0) continue;
+        var dst = new SGDC_DST_NAME();
+        dst.header.type = 2; dst.header.size = (uint)Marshal.SizeOf(typeof(SGDC_DST_NAME));
+        dst.header.adapterId.LowPart = (uint)Marshal.ReadInt32(pa, off + 20);
+        dst.header.adapterId.HighPart = Marshal.ReadInt32(pa, off + 24);
+        dst.header.id = (uint)Marshal.ReadInt32(pa, off + 28);
+        if (DisplayConfigGetDeviceInfo(ref dst) != 0) continue;
+        string dev = src.viewGdiDeviceName;
+        if (string.IsNullOrEmpty(dev) || !seen.Add(dev.ToUpperInvariant())) continue;
+        sb.Append("T|").Append(dev).Append("|").Append(dst.outputTechnology)
+          .Append("|").Append(dst.edidManufactureId).Append("|").Append(dst.edidProductCodeId)
+          .Append("|").Append(dst.connectorInstance).Append("|").Append(dst.monitorDevicePath).Append("\n");
+      }
+      return sb.ToString();
+    } finally { Marshal.FreeHGlobal(pa); Marshal.FreeHGlobal(ma); }
+  }
+
   // ===== 软件层总亮度（gamma ramp）：不依赖 DDC/CI，对任何显示器都生效 =====
   // 设计要点：三通道写同一条曲线 → 只改明暗、不动色相（颜色安全）；
   // 范围锁 40~160，避免把屏幕调到看不见；gamma ramp 不写注册表、重启即失效（天然可回滚）。
@@ -1468,7 +1505,8 @@ public class SGAudio {
       if (best.Count == 0) return "ERR:没有枚举到任何支持模式";
       int nw = 0, nh = 0;
       foreach (var kv in best) {
-        int ix = kv.Key.IndexOf('x');
+        // 注意：不用 IndexOf 字符字面量——CORE_CS 禁单引号（check_repo 守护规则）
+        int ix = kv.Key.IndexOf("x", System.StringComparison.Ordinal);
         int w = int.Parse(kv.Key.Substring(0, ix));
         int h = int.Parse(kv.Key.Substring(ix + 1));
         if ((long)w * h > (long)nw * nh) { nw = w; nh = h; }
@@ -2924,9 +2962,221 @@ pub fn mode_detail() -> String {
 // 不重写枚举逻辑，不新增独立 PowerShell 链路。
 
 use super::{
-    aspect_mismatch, gcd, looks_generic_profile, DisplayHealth, HealthCheck, HealthReport,
-    Severity,
+    aspect_mismatch, bandwidth_ladder, gcd, looks_generic_profile, required_bandwidth_gbps,
+    DisplayHealth, HealthCheck, HealthReport, HopKind, HopStatus, Severity, Topology, TopologyHop,
 };
+
+/// DisplayConfig outputTechnology 枚举值 → 人话（未知值返回 None，不猜）
+fn map_output_tech(t: u32) -> Option<&'static str> {
+    Some(match t {
+        1 => "VGA（D-Sub）",
+        2 => "S 端子",
+        3 => "复合视频",
+        4 => "色差分量",
+        5 => "DVI",
+        6 => "HDMI",
+        7 => "内建面板（eDP/LVDS）",
+        8 => "D-JPN",
+        9 => "SDI",
+        10 => "DisplayPort",
+        11 => "DisplayPort（内嵌）",
+        12 => "间接输出（UDDI）",
+        13 => "SDTV",
+        14 => "无线投屏（Miracast）",
+        15 => "有线间接输出",
+        _ => return None,
+    })
+}
+
+/// 是否间接/中转类输出（可能经扩展坞、转接头或无线）
+fn is_indirect_tech(t: u32) -> bool {
+    matches!(t, 12 | 14 | 15)
+}
+
+/// EDID 16 位厂商码 → 3 字母（5bit×3，A=1..26）。字节序无权威口径，两种都试；
+/// 解不出（含全零）返回 None，绝不硬凑。
+fn edid_manuf_letters(raw: u32) -> Option<String> {
+    fn dec(v: u32) -> Option<String> {
+        let ls = [((v >> 10) & 0x1f) as u8, ((v >> 5) & 0x1f) as u8, (v & 0x1f) as u8];
+        if ls.iter().all(|&b| (1..=26).contains(&b)) {
+            Some(ls.iter().map(|&b| (b - 1 + b'A') as char).collect())
+        } else {
+            None
+        }
+    }
+    dec(raw).or_else(|| dec(raw.swap_bytes()))
+}
+
+/// 组装单屏链路拓扑（P0-2）。数据拿不到的一律 unknown + 说明，绝不猜。
+/// - topo_row: DisplayConfig T 行 (outputTechnology, edidManufactureId, edidProductCodeId, monitorDevicePath)
+/// - gpus: Win32_VideoController 的 (名称, 驱动版本) 列表
+fn build_topology(
+    d: &DisplayInfo,
+    topo_row: Option<&(u32, u32, u32, String)>,
+    gpus: &[(String, String)],
+) -> Topology {
+    let mut hops: Vec<TopologyHop> = Vec::new();
+    let mut note: Option<String> = None;
+
+    // ① GPU：WMI Win32_VideoController
+    if gpus.len() == 1 {
+        hops.push(TopologyHop {
+            kind: HopKind::Gpu,
+            label: gpus[0].0.clone(),
+            detail: Some(format!("驱动版本 {}", gpus[0].1)),
+            status: HopStatus::Ok,
+        });
+    } else if gpus.is_empty() {
+        hops.push(TopologyHop {
+            kind: HopKind::Gpu,
+            label: "显卡".into(),
+            detail: Some("WMI 未返回显卡信息（系统未提供）".into()),
+            status: HopStatus::Unknown,
+        });
+    } else {
+        // 核显+独显：系统不逐屏报告「这块屏归哪块 GPU 推」，全部列出，不猜归属
+        let list = gpus
+            .iter()
+            .map(|(n, v)| format!("{}（驱动 {}）", n, v))
+            .collect::<Vec<_>>()
+            .join("；");
+        hops.push(TopologyHop {
+            kind: HopKind::Gpu,
+            label: format!("显卡 ×{}", gpus.len()),
+            detail: Some(format!("本机有多块显卡，系统不逐屏报告归属：{}", list)),
+            status: HopStatus::Unknown,
+        });
+    }
+
+    // ② 接口：DisplayConfig outputTechnology
+    let tech = topo_row.map(|r| r.0);
+    let tech_label = tech.and_then(map_output_tech);
+    let builtin = matches!(tech, Some(7) | Some(11));
+    hops.push(TopologyHop {
+        kind: HopKind::Port,
+        label: tech_label.unwrap_or("接口").to_string(),
+        detail: Some(if tech_label.is_some() {
+            "连接类型来自系统 DisplayConfig API（权威报告）".to_string()
+        } else {
+            "系统未提供连接类型（DisplayConfig 查询无结果），无法判断接口".to_string()
+        }),
+        status: if tech_label.is_some() { HopStatus::Ok } else { HopStatus::Unknown },
+    });
+
+    // ③ 线缆：规格不可读；按「当前模式所需带宽 vs 协议上限」反推
+    let (cw, ch) = {
+        let p: Vec<&str> = d.resolution.split('x').collect();
+        if p.len() == 2 {
+            (p[0].trim().parse().unwrap_or(0), p[1].trim().parse().unwrap_or(0))
+        } else {
+            (0, 0)
+        }
+    };
+    let cable = match (cw, ch, d.hz) {
+        (w, h, Some(hz)) if w > 0 && h > 0 => {
+            let req = required_bandwidth_gbps(w, h, hz);
+            let calc = format!("算式：{}×{}×{}×24bit×1.08 ≈ {:.1} Gbps", w, h, hz, req);
+            let (status, head) = if req <= 8.16 {
+                (HopStatus::Ok, String::new())
+            } else {
+                // suspect 只在「超出该连接类型族的现实上限」时判：HDMI 族以 HDMI 2.0（14.4）为界、
+                // DP 族以 DP 1.4（25.92）为界；中间档给不出结论，标 unknown 并给出档位阶梯
+                let hdmi = matches!(tech, Some(6));
+                let dp = matches!(tech, Some(10) | Some(11));
+                let suspect = (hdmi && req > 14.4) || (dp && req > 25.92) || req > 77.4;
+                if suspect {
+                    (
+                        HopStatus::Suspect,
+                        "所需带宽已超出该接口常见版本的上限：若出现黑屏、闪屏或最高刷新率档缺失，优先怀疑线缆/扩展坞带宽不足。".to_string(),
+                    )
+                } else {
+                    (
+                        HopStatus::Unknown,
+                        "带宽档位较高，老版本线材可能承载不了；若刷新率上不去优先查线材。".to_string(),
+                    )
+                }
+            };
+            TopologyHop {
+                kind: HopKind::Cable,
+                label: "线缆".into(),
+                detail: Some(if req <= 8.16 {
+                    format!(
+                        "当前 {}x{}@{} 所需带宽约 {:.1} Gbps，低于最保守的 HDMI 1.4 上限（8.16 Gbps），常见线缆都能满足。线材规格本身系统不可读。{}",
+                        w, h, hz, req, calc
+                    )
+                } else {
+                    format!(
+                        "当前 {}x{}@{} 所需带宽{}。{}{}",
+                        w,
+                        h,
+                        hz,
+                        bandwidth_ladder(req),
+                        head,
+                        calc
+                    )
+                }),
+                status,
+            }
+        }
+        _ => TopologyHop {
+            kind: HopKind::Cable,
+            label: "线缆".into(),
+            detail: Some(
+                "读不到当前分辨率或刷新率，无法估算所需带宽；线材规格本身系统不可读".to_string(),
+            ),
+            status: HopStatus::Unknown,
+        },
+    };
+    hops.push(cable);
+
+    // ④ 扩展坞/转接：Windows 无标准 API，只有间接证据
+    let dev_path = topo_row.map(|r| r.3.clone()).unwrap_or_default();
+    if builtin {
+        hops.push(TopologyHop {
+            kind: HopKind::Hub,
+            label: "扩展坞/转接".into(),
+            detail: Some("内建面板直连主板，不经过外接转接链路".into()),
+            status: HopStatus::Ok,
+        });
+    } else {
+        let detail = if dev_path.is_empty() {
+            "系统未提供中转设备（扩展坞/转接头）信息，无法判断是否经过转接。".to_string()
+        } else {
+            format!("系统未提供中转设备（扩展坞/转接头）信息。设备路径：{}", dev_path)
+        };
+        if tech.map(is_indirect_tech).unwrap_or(false) {
+            note = Some("输出为间接/无线类型（系统报告）；若信号经过扩展坞或转接头，DDC/CI 通道可能被阻断。".into());
+        } else if dev_path.to_uppercase().contains("USB") {
+            note = Some("设备路径含 USB 节点，信号可能经过扩展坞/转接头；DDC/CI 通道可能被阻断。".into());
+        }
+        hops.push(TopologyHop {
+            kind: HopKind::Hub,
+            label: "扩展坞/转接".into(),
+            detail: Some(detail),
+            status: HopStatus::Unknown,
+        });
+    }
+
+    // ⑤ 显示器：EDID 厂商码 + 产品码
+    let (manuf_raw, prod_raw) = topo_row.map(|r| (r.1, r.2)).unwrap_or((0, 0));
+    let display_hop = match edid_manuf_letters(manuf_raw) {
+        Some(l) => TopologyHop {
+            kind: HopKind::Display,
+            label: d.name.clone(),
+            detail: Some(format!("EDID 厂商代码 {} · 产品代码 {:#06X}", l, prod_raw)),
+            status: HopStatus::Ok,
+        },
+        None => TopologyHop {
+            kind: HopKind::Display,
+            label: d.name.clone(),
+            detail: Some("系统未提供可解码的 EDID 厂商字段，型号信息以面板名称为准".into()),
+            status: HopStatus::Unknown,
+        },
+    };
+    hops.push(display_hop);
+
+    Topology { hops, note }
+}
 
 /// 体检报告：结构化版本的一键检测。
 pub fn health_report_impl() -> Result<HealthReport, String> {
@@ -2943,11 +3193,14 @@ pub fn health_report_impl() -> Result<HealthReport, String> {
     let ds = get_displays();
 
     // 一次脚本拿齐：每块屏的支持模式统计 + 未在活动路径上的显示器（WMI Active=false）
+    // + 显卡清单（Win32_VideoController）+ 拓扑事实（DisplayConfig outputTechnology/EDID）
     let mut mode_stats: HashMap<String, (String, u32, Vec<(u32, u32, u32)>)> = HashMap::new();
     let mut inactive: Vec<(String, String)> = Vec::new();
+    let mut gpus: Vec<(String, String)> = Vec::new();
+    let mut topo_map: HashMap<String, (u32, u32, u32, String)> = HashMap::new();
     if let Ok(csp) = core_asm_ref() {
         let script = format!(
-            "[Console]::OutputEncoding = [Text.Encoding]::UTF8;\nAdd-Type -Path '{cs}';\n$lines = [SGCore]::ListDisplays() -split ([char]10);\nforeach ($l in $lines) {{ $p = $l -split '\\|'; if ($p[0] -eq 'D' -and $p.Count -ge 3) {{ Write-Output ('MS|' + $p[2] + '|' + [SGCore]::ModeStats($p[1])) }} }};\nGet-CimInstance -Namespace root/wmi -ClassName WmiMonitorID -ErrorAction SilentlyContinue | ForEach-Object {{\n  if (-not $_.Active) {{\n    $nm = (($_.UserFriendlyName | Where-Object {{ [int]$_ -ne 0 }} | ForEach-Object {{ [char][int]$_ }}) -join '');\n    Write-Output ('NA|' + $_.InstanceName + '|' + $nm)\n  }}\n}}",
+            "[Console]::OutputEncoding = [Text.Encoding]::UTF8;\nAdd-Type -Path '{cs}';\n$lines = [SGCore]::ListDisplays() -split ([char]10);\nforeach ($l in $lines) {{ $p = $l -split '\\|'; if ($p[0] -eq 'D' -and $p.Count -ge 3) {{ Write-Output ('MS|' + $p[2] + '|' + [SGCore]::ModeStats($p[1])) }} }};\nGet-CimInstance -Namespace root/wmi -ClassName WmiMonitorID -ErrorAction SilentlyContinue | ForEach-Object {{\n  if (-not $_.Active) {{\n    $nm = (($_.UserFriendlyName | Where-Object {{ [int]$_ -ne 0 }} | ForEach-Object {{ [char][int]$_ }}) -join '');\n    Write-Output ('NA|' + $_.InstanceName + '|' + $nm)\n  }}\n}};\nGet-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | ForEach-Object {{ Write-Output ('G|' + $_.Name + '|' + $_.DriverVersion) }};\n[SGCore]::TopologyInfo()",
             cs = csp
         );
         if let Ok(raw) = ps(&script) {
@@ -2983,6 +3236,22 @@ pub fn health_report_impl() -> Result<HealthReport, String> {
                     }
                     "NA" if p.len() >= 3 => {
                         inactive.push((p[1].to_string(), p[2].to_string()));
+                    }
+                    // G|显卡名|驱动版本
+                    "G" if p.len() >= 3 => {
+                        let name = p[1].trim().to_string();
+                        if !name.is_empty() {
+                            gpus.push((name, p[2].trim().to_string()));
+                        }
+                    }
+                    // T|dev|outputTechnology|edidManufactureId|edidProductCodeId|devicePath
+                    "T" if p.len() >= 6 => {
+                        let dev = p[1].trim().to_lowercase();
+                        let tech = p[2].trim().parse().unwrap_or(0);
+                        let manuf = p[3].trim().parse().unwrap_or(0);
+                        let prod = p[4].trim().parse().unwrap_or(0);
+                        let path = p[5..].join("|");
+                        topo_map.insert(dev, (tech, manuf, prod, path));
                     }
                     _ => {}
                 }
@@ -3143,6 +3412,17 @@ pub fn health_report_impl() -> Result<HealthReport, String> {
             });
         }
 
+        // 链路拓扑（P0-2）：uid → GDI 设备名（get_displays 已刷新 dev 缓存）；失败用 id 原样
+        let dev_name = {
+            let cache = dev_cache().lock().unwrap();
+            cache
+                .as_ref()
+                .and_then(|m| m.get(&d.id))
+                .cloned()
+                .unwrap_or_else(|| d.id.clone())
+        };
+        let topology = Some(build_topology(d, topo_map.get(&dev_name.to_lowercase()), &gpus));
+
         displays.push(DisplayHealth {
             display_id: d.id.clone(),
             name: d.name.clone(),
@@ -3156,6 +3436,7 @@ pub fn health_report_impl() -> Result<HealthReport, String> {
             hdr: hdr_on,
             connected: d.connected,
             checks,
+            topology,
         });
     }
 
@@ -3182,6 +3463,7 @@ pub fn health_report_impl() -> Result<HealthReport, String> {
                 evidence: vec![format!("WmiMonitorID.InstanceName = {}（Active = false）", inst)],
                 fix_ids: vec!["rescan_displays".into(), "force_redetect".into()],
             }],
+            topology: None,
         });
     }
 
@@ -5698,6 +5980,35 @@ mod health_tests {
                 d.current_resolution,
                 d.checks.len()
             );
+        }
+    }
+
+    /// 手动冒烟：cargo test topology_smoke -- --ignored
+    /// 验证链路拓扑（P0-2）：在用屏有 5 跳拓扑，接口/线缆不出现瞎猜的结论
+    #[test]
+    #[ignore]
+    fn topology_smoke() {
+        let r = health_report_impl().expect("health_report_impl 失败");
+        for d in &r.displays {
+            println!("== {} (connected={})", d.name, d.connected);
+            match &d.topology {
+                Some(t) => {
+                    assert_eq!(t.hops.len(), 5, "拓扑应为 5 跳：{}", t.hops.len());
+                    for h in &t.hops {
+                        println!(
+                            "  {:?} | {} | {:?} | {}",
+                            h.kind,
+                            h.label,
+                            h.status,
+                            h.detail.clone().unwrap_or_default()
+                        );
+                    }
+                    if let Some(n) = &t.note {
+                        println!("  note: {}", n);
+                    }
+                }
+                None => println!("  (无拓扑：未在活动路径上)"),
+            }
         }
     }
 }

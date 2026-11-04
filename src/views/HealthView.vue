@@ -3,13 +3,22 @@ import { onMounted, ref } from 'vue';
 import { invoke } from '../api/tauri';
 import { act, store } from '../store';
 import { CMD } from '../types';
-import type { DisplayHealth, HealthReport, Severity } from '../types';
+import type { DisplayHealth, HealthReport, HopKind, Severity } from '../types';
 import Card from '../components/Card.vue';
 import Icon from '../components/Icon.vue';
 
 const report = ref<HealthReport | null>(null);
 const loaded = ref(false);
 const expanded = ref<Set<string>>(new Set());
+
+/** 拓扑跳的固定中文名（label 是各跳的具体值，kind 才是位置名） */
+const HOP_NAMES: Record<HopKind, string> = {
+  gpu: '显卡',
+  port: '接口',
+  cable: '线缆',
+  hub: '扩展坞',
+  display: '显示器',
+};
 
 /** 严重度 → 排序权重：问题在前、提示在后 */
 const SEV_ORDER: Record<Severity, number> = { error: 0, warn: 1, info: 2, ok: 3 };
@@ -97,6 +106,28 @@ onMounted(() => {
         </span>
         <span class="tag" v-if="d.hdr != null">HDR {{ d.hdr ? '开' : '关' }}</span>
         <span class="tag" v-if="d.color_profile">色彩 {{ d.color_profile }}</span>
+      </div>
+
+      <div v-if="d.topology" class="topo">
+        <div class="topo-chain">
+          <template v-for="(h, i) in d.topology.hops" :key="d.display_id + ':' + h.kind">
+            <span v-if="i" class="topo-arrow">→</span>
+            <button
+              class="topo-hop"
+              :class="[h.status, { open: expanded.has('t:' + d.display_id + ':' + h.kind) }]"
+              @click="toggle('t:' + d.display_id + ':' + h.kind)"
+            >
+              <span class="topo-kind">{{ HOP_NAMES[h.kind] }}</span>
+              <span class="topo-label">{{ h.label }}</span>
+            </button>
+          </template>
+        </div>
+        <template v-for="h in d.topology.hops" :key="'d' + h.kind">
+          <div v-if="expanded.has('t:' + d.display_id + ':' + h.kind) && h.detail" class="topo-detail">
+            {{ h.detail }}
+          </div>
+        </template>
+        <p v-if="d.topology.note" class="topo-note">{{ d.topology.note }}</p>
       </div>
 
       <p v-if="!d.checks.length" class="health-allok">这块屏没有发现需要留意的地方。</p>

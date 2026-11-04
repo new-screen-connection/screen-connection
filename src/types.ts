@@ -89,6 +89,28 @@ export interface DisplayHealth {
   hdr: boolean | null;
   connected: boolean;
   checks: HealthCheck[];
+  /** 显示链路拓扑（GPU→接口→线缆→扩展坞→显示器）；未在活动路径上为 null */
+  topology: Topology | null;
+}
+
+/** 拓扑跳类别：gpu / port / cable / hub / display */
+export type HopKind = 'gpu' | 'port' | 'cable' | 'hub' | 'display';
+
+/** 拓扑跳状态：ok=确认无问题 / suspect=疑似问题 / unknown=系统未提供 */
+export type HopStatus = 'ok' | 'suspect' | 'unknown';
+
+/** 链路上的一跳 */
+export interface TopologyHop {
+  kind: HopKind;
+  label: string;
+  detail: string | null;
+  status: HopStatus;
+}
+
+/** 单屏链路拓扑 */
+export interface Topology {
+  hops: TopologyHop[];
+  note: string | null;
 }
 
 export interface HealthSummary {

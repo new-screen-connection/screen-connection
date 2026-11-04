@@ -2,7 +2,7 @@
  * 浏览器预览用的模拟后端。
  * 在 Tauri WebView 内不生效；`npm run dev` 直接在浏览器打开时可预览全部界面与交互。
  */
-import type { AudioEndpoint, BatteryInfo, DisplayInfo, HealthReport } from '../types';
+import type { AudioEndpoint, BatteryInfo, DisplayInfo, HealthReport, Topology } from '../types';
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -49,6 +49,72 @@ const windows = [
   'PotPlayer - movie.mkv',
 ];
 
+/** 拓扑假数据：主屏 4K@144 过 HDMI → 线缆带宽反推为 suspect（含算式）；副屏全链路健康 */
+const topoMain: Topology = {
+  hops: [
+    {
+      kind: 'gpu',
+      label: 'NVIDIA GeForce RTX 4070',
+      detail: '驱动版本 552.44',
+      status: 'ok',
+    },
+    {
+      kind: 'port',
+      label: 'HDMI',
+      detail: '连接类型来自系统 DisplayConfig API（权威报告）',
+      status: 'ok',
+    },
+    {
+      kind: 'cable',
+      label: '线缆',
+      detail:
+        '当前 3840x2160@144 所需带宽约 31.0 Gbps：HDMI 1.4、HDMI 2.0、DP 1.2、DP 1.4 承载不了，HDMI 2.1 及以上可以。所需带宽已超出该接口常见版本的上限：若出现黑屏、闪屏或最高刷新率档缺失，优先怀疑线缆/扩展坞带宽不足。算式：3840×2160×144×24bit×1.08 ≈ 31.0 Gbps',
+      status: 'suspect',
+    },
+    {
+      kind: 'hub',
+      label: '扩展坞/转接',
+      detail:
+        '系统未提供中转设备（扩展坞/转接头）信息。设备路径：\\\\?\\DISPLAY#MIA27B3#5&2b34f0d&0&UID4353#{e6f07b5f-ee97-4a90-b076-a03e01ec6953}',
+      status: 'unknown',
+    },
+    {
+      kind: 'display',
+      label: 'Mi Monitor 27',
+      detail: 'EDID 厂商代码 MIA · 产品代码 0x27B3',
+      status: 'ok',
+    },
+  ],
+  note: null,
+};
+
+const topoSecond: Topology = {
+  hops: [
+    { kind: 'gpu', label: 'Intel Iris Xe Graphics', detail: '驱动版本 31.0.101.5333', status: 'ok' },
+    { kind: 'port', label: 'DisplayPort', detail: '连接类型来自系统 DisplayConfig API（权威报告）', status: 'ok' },
+    {
+      kind: 'cable',
+      label: '线缆',
+      detail:
+        '当前 1920x1080@60 所需带宽约 3.2 Gbps，低于最保守的 HDMI 1.4 上限（8.16 Gbps），常见线缆都能满足。线材规格本身系统不可读。算式：1920×1080×60×24bit×1.08 ≈ 3.2 Gbps',
+      status: 'ok',
+    },
+    {
+      kind: 'hub',
+      label: '扩展坞/转接',
+      detail: '系统未提供中转设备（扩展坞/转接头）信息，无法判断是否经过转接。',
+      status: 'unknown',
+    },
+    {
+      kind: 'display',
+      label: '16 英寸便携副屏',
+      detail: 'EDID 厂商代码 HPC · 产品代码 0x1A2C',
+      status: 'ok',
+    },
+  ],
+  note: '设备路径含 USB 节点，信号可能经过扩展坞/转接头；DDC/CI 通道可能被阻断。',
+};
+
 /** 体检假数据：主屏一条提示，副屏一条可优化 + 一条建议，另有一台掉线残留的显示器 */
 const healthReport: HealthReport = {
   generated_at: '2026-11-04 16:20:00',
@@ -68,6 +134,7 @@ const healthReport: HealthReport = {
       color_profile: 'sRGB IEC61966-2.1',
       hdr: false,
       connected: true,
+      topology: topoMain,
       checks: [
         {
           id: 'color_profile_generic',
@@ -91,6 +158,7 @@ const healthReport: HealthReport = {
       color_profile: 'Display P3',
       hdr: null,
       connected: true,
+      topology: topoSecond,
       checks: [
         {
           id: 'refresh_below_max',
@@ -126,6 +194,7 @@ const healthReport: HealthReport = {
       color_profile: null,
       hdr: null,
       connected: false,
+      topology: null,
       checks: [
         {
           id: 'display_not_active',

@@ -187,6 +187,89 @@ pub struct DisplayHealth {
     pub hdr: Option<bool>,
     pub connected: bool,
     pub checks: Vec<HealthCheck>,
+    /// 显示链路拓扑（GPU→接口→线缆→扩展坞→显示器）；未在活动路径上的屏为 None
+    pub topology: Option<Topology>,
+}
+
+// ---------- 显示链路拓扑（P0-2，两平台共用数据契约） ----------
+
+/// 跳的类别。serde 用小写：gpu / port / cable / hub / display
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HopKind {
+    Gpu,
+    Port,
+    Cable,
+    Hub,
+    Display,
+}
+
+/// 跳的状态。ok = 确认无问题；suspect = 有算式/证据的疑似问题；unknown = 系统未提供，不猜
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HopStatus {
+    Ok,
+    Suspect,
+    Unknown,
+}
+
+/// 链路上的一跳
+#[derive(Serialize, Clone, Debug)]
+pub struct TopologyHop {
+    pub kind: HopKind,
+    pub label: String,
+    pub detail: Option<String>,
+    pub status: HopStatus,
+}
+
+/// 单屏链路拓扑：按顺序 GPU → 接口 → 线缆 → 扩展坞 → 显示器
+#[derive(Serialize, Clone, Debug)]
+pub struct Topology {
+    pub hops: Vec<TopologyHop>,
+    pub note: Option<String>,
+}
+
+/// 当前模式所需的未压缩视频数据速率（Gbps，8bpc RGB）。
+/// 像素时钟 ≈ W×H×Hz × 1.08（CVT-RB 消隐开销近似），每像素 24 bit。
+/// 例：3840×2160@60 → 12.9 Gbps；2560×1440@144 → 13.8 Gbps。
+pub(crate) fn required_bandwidth_gbps(w: u32, h: u32, hz: u32) -> f64 {
+    w as f64 * h as f64 * hz as f64 * 24.0 * 1.08 / 1e9
+}
+
+/// 常见接口协议的未压缩带宽上限（Gbps，含文档口径）：按从低到高排列
+pub(crate) const PROTO_CAPS: [(&str, f64); 6] = [
+    ("HDMI 1.4", 8.16),
+    ("HDMI 2.0", 14.4),
+    ("DP 1.2", 17.28),
+    ("DP 1.4", 25.92),
+    ("HDMI 2.1", 42.6),
+    ("DP 2.0", 77.4),
+];
+
+/// 带宽档位阶梯文本：所需带宽 X Gbps，哪些协议够 / 不够
+pub(crate) fn bandwidth_ladder(req: f64) -> String {
+    let mut below: Vec<&str> = Vec::new();
+    let mut above: Vec<&str> = Vec::new();
+    for (name, cap) in PROTO_CAPS.iter() {
+        if req > *cap {
+            below.push(name);
+        } else {
+            above.push(name);
+        }
+    }
+    if above.is_empty() {
+        format!(
+            "约 {:.1} Gbps，超出所有常见协议上限（DP 2.0 ≈ 77.4），需 DSC 压缩或专用链路",
+            req
+        )
+    } else {
+        format!(
+            "约 {:.1} Gbps：{} 承载不了，{} 及以上可以",
+            req,
+            below.join("、"),
+            above.first().unwrap_or(&"?")
+        )
+    }
 }
 
 /// 汇总：三种计数 + 一句人话结论
