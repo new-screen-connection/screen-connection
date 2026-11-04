@@ -185,6 +185,7 @@ export const CMD = {
   diagScan: 'diag_scan',
   diagFix: 'diag_fix',
   healthReport: 'health_report',
+  healthReportMarkdown: 'health_report_markdown',
   diagLogPath: 'diag_log_path',
   openLogDir: 'open_log_dir',
   appStateJson: 'app_state_json',

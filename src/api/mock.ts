@@ -288,6 +288,23 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       return 'DDC/CI 通道：正常\n电源联动服务：正常\nADB 桥接：未安装（可选）\n结论：2 项通过，1 项可增强' as T;
     case 'health_report':
       return JSON.parse(JSON.stringify(healthReport)) as T;
+    case 'health_report_markdown':
+      return (
+        '# 屏幕连接助手 · 显示体检报告\n\n' +
+        '| 项目 | 内容 |\n| --- | --- |\n' +
+        '| 生成时间 | 2026-11-04 17:40:00 |\n' +
+        '| 平台 | Windows 11 专业版 10.0.26100 |\n' +
+        '| 应用版本 | v0.3.0 |\n' +
+        '| 显示器数量 | 2（活动中 2） |\n' +
+        '| 结论 | 2 块屏已连接，其中 1 项可优化 |\n\n' +
+        '## 显示器 1：Mi Monitor\n\n' +
+        '| 项目 | 内容 |\n| --- | --- |\n' +
+        '| 状态 | 活动中 |\n| 当前模式 | 3840x2160 @60Hz |\n' +
+        '| 原生分辨率 | 3840x2160 |\n| DDC/CI | 可识别但读不到数据 |\n' +
+        '| 序列号 | 未输出（不含设备序列号） |\n\n' +
+        '### 发现的问题\n\n' +
+        '- **[建议] DDC/CI 通道读不到数据**\n  - 细节：亮度/音量控制依赖 DDC/CI。\n'
+      ) as T;
     case 'diag_log_path':
       return 'C:\\Users\\demo\\AppData\\Roaming\\ScreenConnection\\logs' as T;
     case 'export_user_settings_json':

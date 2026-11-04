@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue';
+import { onBeforeUnmount, onMounted, ref } from 'vue';
 import { invoke } from '../api/tauri';
 import { act, store } from '../store';
 import { CMD } from '../types';
@@ -10,6 +10,7 @@ import Icon from '../components/Icon.vue';
 const report = ref<HealthReport | null>(null);
 const loaded = ref(false);
 const expanded = ref<Set<string>>(new Set());
+const menuOpen = ref(false);
 
 /** 拓扑跳的固定中文名（label 是各跳的具体值，kind 才是位置名） */
 const HOP_NAMES: Record<HopKind, string> = {
@@ -55,7 +56,70 @@ function fmtMode(d: DisplayHealth): string {
 
 onMounted(() => {
   refresh();
+  document.addEventListener('click', closeMenuOnOutside);
 });
+onBeforeUnmount(() => {
+  document.removeEventListener('click', closeMenuOnOutside);
+});
+
+// ---------- 导出报告（P0-3）：默认不含设备序列号 ----------
+
+/** 点下拉外面时收起菜单 */
+function closeMenuOnOutside(e: MouseEvent): void {
+  if (!(e.target as HTMLElement).closest('.export-wrap')) menuOpen.value = false;
+}
+
+function fetchMarkdown(): Promise<string> {
+  return invoke<string>(CMD.healthReportMarkdown, { includeSerial: false });
+}
+
+/** 剪贴板写入：优先 async Clipboard API，被拒/不可用时回退 textarea + execCommand；
+ *  两条路都不通时抛出带操作指引的错误（不许静默失败）。 */
+async function copyText(text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return;
+  } catch {
+    // 继续走回退
+  }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try {
+    ok = document.execCommand('copy');
+  } catch {
+    ok = false;
+  }
+  ta.remove();
+  if (!ok) {
+    throw new Error('剪贴板不可用：请改用「另存为 .md」保存报告文件，再手动复制内容');
+  }
+}
+
+function copyReport(): void {
+  menuOpen.value = false;
+  void act(async () => {
+    const md = await fetchMarkdown();
+    await copyText(md);
+  }, '报告已复制，可直接粘贴到论坛或发给客服（不包含设备序列号）');
+}
+
+function saveReport(): void {
+  menuOpen.value = false;
+  void act(async () => {
+    const md = await fetchMarkdown();
+    const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `display-health-report-${new Date().toISOString().slice(0, 10)}.md`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }, '报告已保存（不包含设备序列号）');
+}
 </script>
 
 <template>
@@ -71,6 +135,20 @@ onMounted(() => {
         <button class="btn sm" :disabled="store.busy" @click="refresh">
           <Icon name="refresh" :size="13" />重新体检
         </button>
+        <div class="export-wrap">
+          <button class="btn sm" :disabled="store.busy || !loaded" @click="menuOpen = !menuOpen">
+            <Icon name="download" :size="13" />导出报告
+          </button>
+          <div v-if="menuOpen" class="export-menu">
+            <button class="export-item" @click="copyReport">
+              <Icon name="clipboard" :size="14" />复制到剪贴板
+            </button>
+            <button class="export-item" @click="saveReport">
+              <Icon name="backup" :size="14" />另存为 .md
+            </button>
+            <p class="export-tip">导出内容不包含设备序列号</p>
+          </div>
+        </div>
       </template>
 
       <div v-if="!loaded" class="health-empty">正在体检，请稍候…</div>

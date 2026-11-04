@@ -3178,6 +3178,23 @@ fn build_topology(
     Topology { hops, note }
 }
 
+/// 显示器序列号（P0-3）：返回 (友好名, 序列号)。只在用户明确选择「包含序列号」时调用。
+pub fn display_serials() -> Vec<(String, String)> {
+    let script = "[Console]::OutputEncoding = [Text.Encoding]::UTF8;\nGet-CimInstance -Namespace root/wmi -ClassName WmiMonitorID -ErrorAction SilentlyContinue | ForEach-Object {\n  $nm = (($_.UserFriendlyName | Where-Object { [int]$_ -ne 0 } | ForEach-Object { [char][int]$_ }) -join '');\n  $sn = (($_.SerialNumberID | Where-Object { [int]$_ -ne 0 } | ForEach-Object { [char][int]$_ }) -join '');\n  if ($sn) { Write-Output ('SN|' + $nm + '|' + $sn) }\n}";
+    ps(&script)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let p: Vec<&str> = l.split('|').collect();
+            if p.first() == Some(&"SN") && p.len() >= 3 && !p[2].trim().is_empty() {
+                Some((p[1].trim().to_string(), p[2].trim().to_string()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// 体检报告：结构化版本的一键检测。
 pub fn health_report_impl() -> Result<HealthReport, String> {
     let ts = ps("Get-Date -Format \"yyyy-MM-dd HH:mm:ss\"")
@@ -6010,5 +6027,24 @@ mod health_tests {
                 None => println!("  (无拓扑：未在活动路径上)"),
             }
         }
+    }
+
+    /// 手动冒烟：cargo test health_md_smoke -- --ignored
+    /// 真机验证 Markdown 导出（P0-3）：默认脱敏——无路径反斜杠残留、无序列号、无用户名
+    #[test]
+    #[ignore]
+    fn health_md_smoke() {
+        let md = crate::platform::health_report_markdown_impl(false).expect("导出失败");
+        assert!(
+            md.starts_with("# 屏幕连接助手 · 显示体检报告"),
+            "标题不符"
+        );
+        assert!(
+            !md.contains('\\'),
+            "默认导出不应残留任何反斜杠路径"
+        );
+        assert!(md.contains("未输出（不含设备序列号）"));
+        assert!(md.contains("由 屏幕连接助手 v"));
+        println!("{}", md);
     }
 }

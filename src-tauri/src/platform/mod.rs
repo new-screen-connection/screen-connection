@@ -329,6 +329,308 @@ fn active_is_sane(active: usize, _total: usize) -> bool {
     active > 0
 }
 
+// ---------- 体检报告 Markdown 导出（P0-3，两平台共用渲染与脱敏） ----------
+
+/// 默认脱敏：把一行里可能带隐私的片段替换成占位符。
+/// 判据刻意从宽——本报告的正常字段（型号名、分辨率、带宽算式等）都不含反斜杠，
+/// 因此任何出现反斜杠的词块都按路径处理：保留「设备路径：」这类中文前缀，路径本体隐藏。
+/// 覆盖：\\?\ 内核路径、MONITOR\USB\VID_ 设备实例路径、C:\Users\<用户名> 文件路径。
+pub(crate) fn sanitize_line(s: &str) -> String {
+    const PH: &str = "〈路径已隐藏〉";
+    let mut out = String::with_capacity(s.len());
+    for (i, tok) in s.split_whitespace().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        match tok.find('\\') {
+            None => out.push_str(tok),
+            Some(pos) => {
+                // 前缀（如「设备路径」）有上下文价值，保留；「C:」这类盘符没有，直接整块替换
+                let prefix = tok[..pos].trim_end_matches(|c| matches!(c, '：' | ':' | '=' | ' '));
+                let keep_prefix = !prefix.is_empty()
+                    && prefix.chars().count() > 2
+                    && !prefix.ends_with(':')
+                    && !prefix.ends_with('：');
+                if keep_prefix {
+                    out.push_str(prefix);
+                    out.push('：');
+                }
+                out.push_str(PH);
+            }
+        }
+    }
+    out
+}
+
+/// Markdown 表格单元格转义：竖线会切断列、换行会破坏行结构，必须处理。
+/// 先脱敏再转义，保证导出的表格在 GitHub/知乎/微信里列数一致。
+pub(crate) fn md_cell(s: &str) -> String {
+    sanitize_line(s)
+        .replace('|', "\\|")
+        .replace('\r', "")
+        .replace('\n', " ")
+}
+
+/// 显示器序列号（Windows 实现；其它平台暂无读取通道，返回空 = 如实标「未获取」）。
+/// 注意：只有在用户明确选择「包含序列号」时才会被调用，默认导出不读它。
+#[cfg(not(target_os = "windows"))]
+pub fn display_serials() -> Vec<(String, String)> {
+    Vec::new()
+}
+
+fn sev_cn(s: &Severity) -> &'static str {
+    match s {
+        Severity::Error => "问题",
+        Severity::Warn => "建议",
+        Severity::Info => "提示",
+        Severity::Ok => "正常",
+    }
+}
+
+fn sev_rank(s: &Severity) -> u8 {
+    match s {
+        Severity::Error => 0,
+        Severity::Warn => 1,
+        Severity::Info => 2,
+        Severity::Ok => 3,
+    }
+}
+
+/// 把体检报告渲染成 Markdown（P0-3）。结构固定：元信息表 → 每屏一节（基本表/链路/问题）→ 落款。
+/// `include_serial = false`（默认）时报告里不出现序列号，也根本不去读。
+pub fn render_health_markdown(
+    r: &HealthReport,
+    serials: &[(String, String)],
+    include_serial: bool,
+) -> String {
+    let platform_cn = match r.platform.as_str() {
+        "windows" => "Windows",
+        "macos" => "macOS",
+        other => other,
+    };
+    let mut m = String::from("# 屏幕连接助手 · 显示体检报告\n\n");
+    if include_serial {
+        m.push_str("> 注意：本报告包含设备序列号，请勿公开分享。\n\n");
+    }
+
+    // 元信息表（固定两列）
+    let active = r.displays.iter().filter(|d| d.connected).count();
+    // 系统版本串常自带「Microsoft Windows …」前缀，去重避免出现「Windows Microsoft Windows …」
+    let mut os_line = r.os_version.trim().to_string();
+    if os_line.to_lowercase().starts_with("microsoft ") {
+        os_line = os_line[10..].trim().to_string();
+    }
+    let lower = os_line.to_lowercase();
+    if !lower.is_empty() && !lower.starts_with("windows") && !lower.starts_with("macos") {
+        os_line = format!("{} {}", platform_cn, os_line);
+    }
+    if os_line.is_empty() {
+        os_line = platform_cn.to_string();
+    }
+    m.push_str("| 项目 | 内容 |\n| --- | --- |\n");
+    m.push_str(&format!("| 生成时间 | {} |\n", md_cell(&r.generated_at)));
+    m.push_str(&format!("| 平台 | {} |\n", md_cell(&os_line)));
+    m.push_str(&format!(
+        "| 应用版本 | v{} |\n",
+        md_cell(&r.app_version)
+    ));
+    m.push_str(&format!(
+        "| 显示器数量 | {}（活动中 {}） |\n",
+        r.displays.len(),
+        active
+    ));
+    m.push_str(&format!(
+        "| 结论 | {} |\n\n",
+        md_cell(&r.summary.headline)
+    ));
+
+    for (i, d) in r.displays.iter().enumerate() {
+        m.push_str(&format!(
+            "## 显示器 {}：{}\n\n",
+            i + 1,
+            md_cell(&d.name)
+        ));
+        let hz = d
+            .current_hz
+            .map(|v| format!(" @{}Hz", v))
+            .unwrap_or_default();
+        m.push_str("| 项目 | 内容 |\n| --- | --- |\n");
+        m.push_str(&format!(
+            "| 状态 | {} |\n",
+            if d.connected { "活动中" } else { "未在活动路径上" }
+        ));
+        m.push_str(&format!(
+            "| 当前模式 | {} |\n",
+            md_cell(&format!("{}{}", d.current_resolution, hz))
+        ));
+        m.push_str(&format!(
+            "| 原生分辨率 | {} |\n",
+            md_cell(d.native_resolution.as_deref().unwrap_or("系统未提供"))
+        ));
+        m.push_str(&format!(
+            "| DDC/CI | {} |\n",
+            if d.ddc_readable {
+                "可用"
+            } else if d.ddc_capable {
+                "可识别但读不到数据"
+            } else {
+                "不可达"
+            }
+        ));
+        m.push_str(&format!(
+            "| 色彩配置 | {} |\n",
+            md_cell(d.color_profile.as_deref().unwrap_or("系统未提供"))
+        ));
+        m.push_str(&format!(
+            "| HDR | {} |\n",
+            match d.hdr {
+                Some(true) => "开",
+                Some(false) => "关",
+                None => "系统未提供",
+            }
+        ));
+        if include_serial {
+            let sn = serials
+                .iter()
+                .find(|(n, _)| !n.is_empty() && (n.eq_ignore_ascii_case(&d.name)))
+                .map(|(_, s)| s.as_str())
+                .unwrap_or("未获取（系统未报告）");
+            m.push_str(&format!("| 序列号 | {} |\n", md_cell(sn)));
+        } else {
+            m.push_str("| 序列号 | 未输出（不含设备序列号） |\n");
+        }
+
+        if let Some(t) = &d.topology {
+            let chain: Vec<&str> = t.hops.iter().map(|h| h.label.as_str()).collect();
+            m.push_str(&format!("\n连接链路：{}\n", chain.join(" → ")));
+        }
+
+        if d.checks.is_empty() {
+            m.push_str("\n这块屏没有发现需要留意的地方。\n\n");
+        } else {
+            m.push_str("\n### 发现的问题\n\n");
+            let mut checks: Vec<&HealthCheck> = d.checks.iter().collect();
+            checks.sort_by(|a, b| {
+                sev_rank(&a.severity)
+                    .cmp(&sev_rank(&b.severity))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            for c in checks {
+                m.push_str(&format!(
+                    "- **[{}] {}**\n",
+                    sev_cn(&c.severity),
+                    c.title
+                ));
+                let detail = sanitize_line(&c.detail);
+                if !detail.is_empty() {
+                    m.push_str(&format!("  - 细节：{}\n", detail));
+                }
+                for ev in &c.evidence {
+                    let ev = sanitize_line(ev);
+                    if !ev.is_empty() {
+                        m.push_str(&format!("  - 证据：{}\n", ev));
+                    }
+                }
+            }
+            m.push('\n');
+        }
+    }
+
+    m.push_str("---\n\n");
+    m.push_str(&format!(
+        "由 屏幕连接助手 v{} 生成 · 下载与反馈：https://github.com/new-screen-connection/screen-connection\n",
+        r.app_version
+    ));
+    m
+}
+
+/// 导出用：取报告 → （可选）读序列号 → 渲染 Markdown。
+pub fn health_report_markdown_impl(include_serial: bool) -> Result<String, String> {
+    let report = health_report_impl()?;
+    let serials = if include_serial {
+        display_serials()
+    } else {
+        Vec::new()
+    };
+    Ok(render_health_markdown(&report, &serials, include_serial))
+}
+
+#[cfg(test)]
+mod markdown_tests {
+    use super::*;
+
+    fn sample_report() -> HealthReport {
+        HealthReport {
+            generated_at: "2026-11-04 17:40:00".into(),
+            platform: "windows".into(),
+            app_version: "0.3.0".into(),
+            os_version: "Windows 11 专业版 10.0.26100".into(),
+            displays: vec![DisplayHealth {
+                display_id: "dev-1".into(),
+                name: "Mi Monitor".into(),
+                native_resolution: Some("3840x2160".into()),
+                current_resolution: "3840x2160".into(),
+                max_hz: Some(60),
+                current_hz: Some(60),
+                ddc_capable: true,
+                ddc_readable: false,
+                color_profile: Some("sRGB IEC61966-2.1".into()),
+                hdr: Some(false),
+                connected: true,
+                topology: None,
+                checks: vec![HealthCheck {
+                    id: "ddc_unreachable".into(),
+                    severity: Severity::Warn,
+                    title: "DDC/CI 通道读不到数据".into(),
+                    detail: "亮度/音量控制依赖 DDC/CI，此通道不通时只能用手动按键。".into(),
+                    evidence: vec![
+                        "GetPhysicalMonitorsFromHMONITOR 返回句柄但 GetVCPFeature 失败".into(),
+                        "设备路径：\\\\?\\DISPLAY#JKA27B3#5&2f3a4b5c&0&UID4353#{e6f07b5f-ee97-4a90-b076-ae13dcbbaa7d}".into(),
+                        "配置文件 C:\\Users\\zhangsan\\AppData\\Local\\sc\\cache.json 读取失败".into(),
+                    ],
+                    fix_ids: vec!["reopen_ddc_channel".into()],
+                }],
+            }],
+            summary: HealthSummary {
+                errors: 0,
+                warnings: 1,
+                infos: 0,
+                headline: "1 块屏已连接，其中 1 项可优化".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn default_export_redacts_paths_and_omits_serial() {
+        let md = render_health_markdown(&sample_report(), &[], false);
+        assert!(md.contains("# 屏幕连接助手 · 显示体检报告"));
+        assert!(md.contains("显示器 1：Mi Monitor"));
+        // 隐私断言：用户名、内核路径不得出现；序列号行必须是「未输出」
+        assert!(!md.contains("zhangsan"), "用户名泄漏：{}", md);
+        assert!(!md.contains("DISPLAY#"), "设备路径泄漏：{}", md);
+        assert!(!md.contains("e6f07b5f"), "设备路径泄漏：{}", md);
+        assert!(!md.contains('\\'), "脱敏后不应残留反斜杠：{}", md);
+        assert!(md.contains("未输出（不含设备序列号）"));
+        assert!(md.contains("由 屏幕连接助手 v0.3.0 生成"));
+    }
+
+    #[test]
+    fn include_serial_appends_serial_and_warning() {
+        let serials = vec![("Mi Monitor".to_string(), "11731JKA00P7".to_string())];
+        let md = render_health_markdown(&sample_report(), &serials, true);
+        assert!(md.contains("包含设备序列号，请勿公开分享"));
+        assert!(md.contains("11731JKA00P7"));
+    }
+
+    #[test]
+    fn table_cells_escape_pipes() {
+        let line = sanitize_line("a | b");
+        assert_eq!(md_cell(&line), "a \\| b");
+        // 换行不能破坏表格行
+        assert_eq!(md_cell("x\ny"), "x y");
+    }
+}
+
 /// 最大公约数（宽高比约分用）
 pub(crate) fn gcd(mut a: u32, mut b: u32) -> u32 {
     while b != 0 {

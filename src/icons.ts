@@ -37,6 +37,7 @@ export const ICONS: Record<string, IconDef> = {
   power: { paths: ['M12 3v8 M6.5 6.5a8 8 0 1 0 11 0'] },
   wrench: { paths: ['M15.5 3a5.5 5.5 0 0 0-4.9 8L3.5 18.1a1.8 1.8 0 0 0 2.5 2.5l7.1-7.1A5.5 5.5 0 1 0 15.5 3Z'] },
   clipboard: { paths: ['M5 4.5h14v16H5z M9 4.5v-1h6v1 M8.5 9.5h7 M8.5 13h7 M8.5 16.5h4'] },
+  download: { paths: ['M12 4v11 M7.5 11.5 12 16l4.5-4.5 M4.5 19.5h15'] },
   search: { paths: ['M15 15l5 5'], circles: [{ cx: 10.5, cy: 10.5, r: 6 }] },
   refresh: { paths: ['M20 12a8 8 0 1 1-2.3-5.6 M20 3.5V8h-4.5'] },
   backup: { paths: ['M4 7.5 12 3l8 4.5v9L12 21l-8-4.5Z M4 7.5 12 12l8-4.5 M12 12v9'] },

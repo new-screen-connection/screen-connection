@@ -450,6 +450,16 @@ async fn health_report() -> Result<platform::HealthReport, String> {
         .map_err(|e| format!("后台任务失败：{}", e))?
 }
 
+/// 体检报告 Markdown 导出（P0-3）：默认脱敏——不读也不输出序列号，路径/用户名一律隐藏；
+/// include_serial=true 时才读取序列号，且报告顶部会附「请勿公开分享」提示
+#[tauri::command]
+async fn health_report_markdown(include_serial: Option<bool>) -> Result<String, String> {
+    let inc = include_serial.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || platform::health_report_markdown_impl(inc))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
 /// 在资源管理器里打开日志目录
 #[tauri::command]
 fn open_log_dir() -> Result<(), String> {
@@ -1715,6 +1725,7 @@ pub fn run() {
             mode_detail,
             repair_display,
             health_report,
+            health_report_markdown,
             health_get_config,
             health_set_config,
             get_notify_payload,
