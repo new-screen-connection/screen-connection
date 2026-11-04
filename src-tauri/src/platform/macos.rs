@@ -1017,6 +1017,197 @@ pub fn get_displays() -> Vec<DisplayInfo> {
 fn read_ddc_brightness(cgid: u32) -> Option<u32> {
     read_vcp_percent(cgid, 0x10)
 }
+
+// ================= 结构化体检报告（P0-1） =================
+// 复用现有通道：parse_screens（displayplacer 枚举与模式列表）、read_ddc_brightness（DDC 探测）、
+// read_color_profile（ColorSync 配置）、CGDisplayIsBuiltin（内建屏判定）。
+// 文档要求的 5 条 macOS 检查项全部实现；aspect/resolution 推导与 Windows 共用同一套辅助函数。
+
+use super::{
+    aspect_mismatch, looks_generic_profile, DisplayHealth, HealthCheck, HealthReport,
+    HealthSummary, Severity,
+};
+
+pub fn health_report_impl() -> Result<HealthReport, String> {
+    let screens = parse_screens();
+    if screens.is_empty() {
+        return Err("没有枚举到任何显示器".to_string());
+    }
+    let os_version = run_cmd("sw_vers", &["-productVersion"])
+        .map(|s| format!("macOS {}", s.trim()))
+        .unwrap_or_default();
+    let ts = run_cmd("date", &["+%Y-%m-%d %H:%M:%S"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    let mut displays: Vec<DisplayHealth> = Vec::new();
+    for s in &screens {
+        // ① display_not_active：displayplacer 报告 disabled = 不在活动路径上
+        if !s.enabled {
+            displays.push(DisplayHealth {
+                display_id: s.id.clone(),
+                name: format!("显示器（{}）", s.id),
+                native_resolution: None,
+                current_resolution: String::new(),
+                max_hz: None,
+                current_hz: None,
+                ddc_capable: false,
+                ddc_readable: false,
+                color_profile: None,
+                hdr: None,
+                connected: false,
+                checks: vec![HealthCheck {
+                    id: "display_not_active".into(),
+                    severity: Severity::Error,
+                    title: "显示器未在活动路径上".into(),
+                    detail: "系统认识这台显示器，但它当前不在活动显示路径上（常见于镜像残留或休眠未唤醒）。尝试重新插拔，或在系统显示设置里检测显示器。".into(),
+                    evidence: vec![format!("displayplacer：persistent id {} 报告 disabled", s.id)],
+                    fix_ids: vec!["rescan_displays".into(), "force_redetect".into()],
+                }],
+            });
+            continue;
+        }
+
+        let (b, _vol) = match s.ctx {
+            Some(c) => (read_ddc_brightness(c), None::<u32>),
+            None => (None, None),
+        };
+        let prof = s.ctx.and_then(read_color_profile);
+        let builtin = s.ctx.map(|c| unsafe { CGDisplayIsBuiltin(c) }).unwrap_or(0) != 0;
+
+        // 模式统计：优先取非缩放档（displayplacer 的 scaling 档不反映面板原生像素）
+        let mut modes: Vec<(u32, u32, u32)> = s
+            .modes
+            .iter()
+            .filter(|m| !m.scaling)
+            .map(|m| (m.w, m.h, m.hz.unwrap_or(s.hz.unwrap_or(60))))
+            .collect();
+        if modes.is_empty() {
+            modes = s
+                .modes
+                .iter()
+                .map(|m| (m.w, m.h, m.hz.unwrap_or(s.hz.unwrap_or(60))))
+                .collect();
+        }
+        let (native_res, max_hz_native, max_hz_cur) =
+            super::infer_from_modes(&modes, s.w, s.h);
+        let native_wh = native_res.as_deref().and_then(|r| {
+            r.split_once('x')
+                .map(|(w, h)| (w.trim().parse::<u32>().unwrap_or(0), h.trim().parse::<u32>().unwrap_or(0)))
+        });
+
+        let ddc_capable = b.is_some();
+        let ddc_readable = b.is_some();
+        let mut checks: Vec<HealthCheck> = Vec::new();
+
+        // ② 分辨率不是原生（含宽高比不一致）
+        if let Some((nw, nh)) = native_wh {
+            if s.w > 0 && s.h > 0 && (s.w != nw || s.h != nh) {
+                let stretch = aspect_mismatch((s.w, s.h), (nw, nh));
+                checks.push(HealthCheck {
+                    id: "resolution_not_native".into(),
+                    severity: Severity::Warn,
+                    title: if stretch {
+                        "当前分辨率与原生不一致（画面可能被拉伸）".into()
+                    } else {
+                        "当前分辨率不是面板原生分辨率".into()
+                    },
+                    detail: if stretch {
+                        "当前分辨率宽高比与面板原生不同，画面被拉伸或压缩；建议切回原生分辨率。".into()
+                    } else {
+                        "非原生分辨率会让画面经历一次缩放，文字发虚。建议在显示器设置里切回原生档位。".into()
+                    },
+                    evidence: vec![
+                        format!("当前 {}x{}@{}", s.w, s.h, s.hz.map(|v| v.to_string()).unwrap_or_else(|| "?".into())),
+                        format!("原生 {}x{}（displayplacer 模式列表面积最大者）", nw, nh),
+                    ],
+                    fix_ids: vec!["rescan_displays".into()],
+                });
+            }
+        }
+
+        // ③ 刷新率低于当前分辨率下支持的最高值
+        if let (Some(cur), Some(max)) = (s.hz, max_hz_cur) {
+            if max > cur {
+                checks.push(HealthCheck {
+                    id: "refresh_below_max".into(),
+                    severity: Severity::Info,
+                    title: "刷新率低于该分辨率下支持的最高值".into(),
+                    detail: "常见原因是线材带宽不足或系统里选了低档。确认线材支持后，在系统显示设置里把刷新率调到最高档。".into(),
+                    evidence: vec![
+                        format!("当前 {}x{} @ {}Hz", s.w, s.h, cur),
+                        format!("该分辨率下支持最高 {}Hz", max),
+                    ],
+                    fix_ids: vec![],
+                });
+            }
+        }
+
+        // ④ DDC/CI 不可达（内建屏无 DDC 属正常，跳过）
+        if !builtin && b.is_none() {
+            checks.push(HealthCheck {
+                id: "ddc_unreachable".into(),
+                severity: Severity::Warn,
+                title: "DDC/CI 通道不可达".into(),
+                detail: "这块外接屏读不到 DDC/CI，屏幕自身亮度/音量无法软调。常见于转接链路（扩展坞/转接头）不转发 DDC 通道。".into(),
+                evidence: vec!["VCP 0x10 读取失败".into()],
+                fix_ids: vec!["reopen_ddc_channel".into(), "ddc_power_cycle".into()],
+            });
+        }
+
+        // ⑤ 色彩配置缺失或通用配置
+        match &prof {
+            Some(p) if looks_generic_profile(p) => checks.push(HealthCheck {
+                id: "color_profile_generic".into(),
+                severity: Severity::Info,
+                title: "色彩配置为系统通用配置".into(),
+                detail: "当前使用通用 sRGB 配置，未针对这块屏校准。对色彩要求高时可用「画质 → 色彩同步」对齐到标准色域。".into(),
+                evidence: vec![format!("色彩配置：{}", p)],
+                fix_ids: vec![],
+            }),
+            None => checks.push(HealthCheck {
+                id: "color_profile_generic".into(),
+                severity: Severity::Info,
+                title: "未读取到色彩配置".into(),
+                detail: "ColorSync 没有为这块屏报告 ICC 配置，颜色管理可能不完整。".into(),
+                evidence: vec!["ICC 读取结果为空".into()],
+                fix_ids: vec![],
+            }),
+            _ => {}
+        }
+
+        displays.push(DisplayHealth {
+            display_id: s.id.clone(),
+            name: role_name(s.main),
+            native_resolution: native_res,
+            current_resolution: s.res_str(),
+            max_hz: max_hz_native,
+            current_hz: s.hz,
+            ddc_capable,
+            ddc_readable,
+            color_profile: prof,
+            hdr: None, // macOS 暂无 HDR 状态读取通道
+            connected: true,
+            checks,
+        });
+    }
+
+    let mut report = HealthReport {
+        generated_at: ts,
+        platform: "macos".into(),
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        os_version,
+        displays,
+        summary: HealthSummary {
+            errors: 0,
+            warnings: 0,
+            infos: 0,
+            headline: String::new(),
+        },
+    };
+    report.summarize();
+    Ok(report)
+}
 fn read_ddc_volume(cgid: u32) -> Option<u32> {
     read_vcp_percent(cgid, 0x62)
 }

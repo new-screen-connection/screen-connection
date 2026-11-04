@@ -145,6 +145,161 @@ pub struct BatteryInfo {
     pub full_mwh: u32,
 }
 
+// ---------- 结构化体检报告（P0-1，两平台共用数据契约） ----------
+
+/// 检查项严重程度。serde 用小写：ok / info / warn / error
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    /// 显式正常项（检查列表可能显式输出「无问题」条目）
+    #[allow(dead_code)]
+    Ok,
+    Info,
+    Warn,
+    Error,
+}
+
+/// 一条检查结果。id 用稳定短标识（如 "refresh_below_max"），前端按 id 配图标与文案。
+#[derive(Serialize, Clone, Debug)]
+pub struct HealthCheck {
+    pub id: String,
+    pub severity: Severity,
+    pub title: String,
+    pub detail: String,
+    /// 具体数值或命令输出，不许只给结论
+    pub evidence: Vec<String>,
+    /// 可接入的修复动作 id（P0-4 接线；当前前端只渲染占位按钮）
+    pub fix_ids: Vec<String>,
+}
+
+/// 单块屏的体检结果
+#[derive(Serialize, Clone, Debug)]
+pub struct DisplayHealth {
+    pub display_id: String,
+    pub name: String,
+    pub native_resolution: Option<String>,
+    pub current_resolution: String,
+    pub max_hz: Option<u32>,
+    pub current_hz: Option<u32>,
+    pub ddc_capable: bool,
+    pub ddc_readable: bool,
+    pub color_profile: Option<String>,
+    pub hdr: Option<bool>,
+    pub connected: bool,
+    pub checks: Vec<HealthCheck>,
+}
+
+/// 汇总：三种计数 + 一句人话结论
+#[derive(Serialize, Clone, Debug)]
+pub struct HealthSummary {
+    pub errors: u32,
+    pub warnings: u32,
+    pub infos: u32,
+    pub headline: String,
+}
+
+/// 完整体检报告
+#[derive(Serialize, Clone, Debug)]
+pub struct HealthReport {
+    pub generated_at: String,
+    pub platform: String,
+    pub app_version: String,
+    pub os_version: String,
+    pub displays: Vec<DisplayHealth>,
+    pub summary: HealthSummary,
+}
+
+impl HealthReport {
+    /// 按 checks 聚合 summary，headline 用一句人话描述
+    pub fn summarize(&mut self) {
+        let (mut e, mut w, mut i) = (0u32, 0u32, 0u32);
+        for d in &self.displays {
+            for c in &d.checks {
+                match c.severity {
+                    Severity::Error => e += 1,
+                    Severity::Warn => w += 1,
+                    Severity::Info => i += 1,
+                    Severity::Ok => {}
+                }
+            }
+        }
+        let n = self.displays.len();
+        let active = self.displays.iter().filter(|d| d.connected).count();
+        self.summary = HealthSummary {
+            errors: e,
+            warnings: w,
+            infos: i,
+            headline: if !active_is_sane(active, n) || e > 0 {
+                format!("{} 块屏已连接，其中 {} 项需要处理", active, e)
+            } else if w > 0 {
+                format!("{} 块屏已连接，其中 {} 项可优化", active, w)
+            } else if i > 0 {
+                format!("{} 块屏已连接，整体状态良好，{} 条提示", active, i)
+            } else {
+                format!("{} 块屏已连接，一切正常", active)
+            },
+        };
+    }
+}
+
+fn active_is_sane(active: usize, _total: usize) -> bool {
+    active > 0
+}
+
+/// 最大公约数（宽高比约分用）
+pub(crate) fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+/// 通用/未校准色彩配置名判定（两平台同名规则）
+pub(crate) fn looks_generic_profile(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("generic") || n.contains("通用") || n.contains("sRGB")
+}
+
+/// 由支持模式列表推导原生分辨率与当前分辨率下的最高刷新率。
+/// `modes`: (宽, 高, 刷新率)。原生 = 非缩放模式中面积最大者（退化取全部）。
+/// 返回 (原生分辨率, 原生下最高 Hz, 当前分辨率下最高 Hz)。
+pub(crate) fn infer_from_modes(
+    modes: &[(u32, u32, u32)],
+    cur_w: u32,
+    cur_h: u32,
+) -> (Option<String>, Option<u32>, Option<u32>) {
+    if modes.is_empty() {
+        return (None, None, None);
+    }
+    // 面积最大的模式视为原生分辨率（数字面板驱动总是把原生排进支持列表）
+    let native = modes.iter().copied().max_by_key(|(w, h, _)| w * h);
+    let native_res = native.map(|(w, h, _)| format!("{}x{}", w, h));
+    let max_hz_native = native.map(|(_, _, hz)| hz);
+    let max_hz_cur = modes
+        .iter()
+        .filter(|(w, h, _)| *w == cur_w && *h == cur_h)
+        .map(|(_, _, hz)| *hz)
+        .max();
+    (native_res, max_hz_native, max_hz_cur)
+}
+
+/// 宽高比是否一致（约分后比较，容忍 1 像素级差异）
+pub(crate) fn aspect_mismatch(cur: (u32, u32), native: (u32, u32)) -> bool {
+    if cur.0 == 0 || cur.1 == 0 || native.0 == 0 || native.1 == 0 {
+        return false;
+    }
+    let g1 = gcd(cur.0, cur.1);
+    let g2 = gcd(native.0, native.1);
+    (cur.0 / g1, cur.1 / g1) != (native.0 / g2, native.1 / g2)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn health_report_impl() -> Result<HealthReport, String> {
+    Err("当前平台暂不支持体检报告".to_string())
+}
+
 // ---------- 软件层总亮度 / HDR / 前台窗口铺满 / 全局快捷键（非 Windows 存根） ----------
 
 #[cfg(not(target_os = "windows"))]

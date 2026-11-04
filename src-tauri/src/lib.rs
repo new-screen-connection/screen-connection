@@ -442,6 +442,14 @@ async fn diag_fix() -> Result<String, String> {
         .map_err(|e| format!("后台任务失败：{}", e))?
 }
 
+/// 结构化体检报告（P0-1）：逐屏逐检查项返回，取代自由文本 diag_scan 的显示部分
+#[tauri::command]
+async fn health_report() -> Result<platform::HealthReport, String> {
+    tauri::async_runtime::spawn_blocking(platform::health_report_impl)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
 /// 在资源管理器里打开日志目录
 #[tauri::command]
 fn open_log_dir() -> Result<(), String> {
@@ -1706,6 +1714,7 @@ pub fn run() {
             health_supported,
             mode_detail,
             repair_display,
+            health_report,
             health_get_config,
             health_set_config,
             get_notify_payload,

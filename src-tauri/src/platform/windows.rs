@@ -1443,6 +1443,44 @@ public class SGAudio {
     finally { Marshal.FreeHGlobal(buf); }
   }
 
+  // ---- 结构化体检：枚举某块屏全部支持模式（含刷新率），推导原生分辨率 ----
+  // 每个分辨率取最高刷新率。输出：nativeWxH|原生下最高Hz|WxH@Hz,WxH@Hz,...
+  // 原生分辨率 = 面积最大的支持模式（数字面板驱动总把原生排进支持列表）
+  public static string ModeStats(string dev) {
+    const int SZ = 220;
+    IntPtr buf = Marshal.AllocHGlobal(SZ);
+    try {
+      var best = new System.Collections.Generic.Dictionary<string, int>();
+      for (int i = 0; i < 4000; i++) {
+        for (int b = 0; b < SZ; b++) Marshal.WriteByte(buf, b, 0);
+        Marshal.WriteInt16(buf, 68, (short)SZ);
+        if (!EnumDisplaySettingsW(dev, i, buf)) break;
+        int w = Marshal.ReadInt32(buf, 176);
+        int h = Marshal.ReadInt32(buf, 180);
+        int f = Marshal.ReadInt32(buf, 188);
+        if (w < 640 || h < 480 || f < 24) continue;
+        string k = w + "x" + h;
+        // 注意：SGCore 由 PowerShell 5.1 的 Add-Type 编译（C# 5），out 变量必须先声明，
+        // 不能写 `out int cur` 内联声明（会让整个程序集编译失败、get_displays 全空）
+        int cur;
+        if (!best.TryGetValue(k, out cur) || f > cur) best[k] = f;
+      }
+      if (best.Count == 0) return "ERR:没有枚举到任何支持模式";
+      int nw = 0, nh = 0;
+      foreach (var kv in best) {
+        int ix = kv.Key.IndexOf('x');
+        int w = int.Parse(kv.Key.Substring(0, ix));
+        int h = int.Parse(kv.Key.Substring(ix + 1));
+        if ((long)w * h > (long)nw * nh) { nw = w; nh = h; }
+      }
+      var parts = new System.Collections.Generic.List<string>();
+      foreach (var kv in best) parts.Add(kv.Key + "@" + kv.Value);
+      parts.Sort(StringComparer.Ordinal);
+      return nw + "x" + nh + "|" + best[nw + "x" + nh] + "|" + string.Join(",", parts);
+    } catch (Exception e) { return "ERR:" + Esc(e.Message); }
+    finally { Marshal.FreeHGlobal(buf); }
+  }
+
   public static string AudioList() {
     var sb = new StringBuilder();
     try {
@@ -2879,6 +2917,347 @@ pub fn mode_detail() -> String {
     ps(&script).unwrap_or_default()
 }
 
+// ================= 结构化体检报告（P0-1） =================
+// 数据来源全部复用现有通道：get_displays（枚举/DDC 探测/亮度/ICC）、
+// SGCore::ModeStats（新增 C# 方法，枚举支持模式推原生分辨率与最高刷新率）、
+// hdr_states（HDR 状态）、WmiMonitorID（枚举「系统认识但不在活动路径上」的显示器）。
+// 不重写枚举逻辑，不新增独立 PowerShell 链路。
+
+use super::{
+    aspect_mismatch, gcd, looks_generic_profile, DisplayHealth, HealthCheck, HealthReport,
+    Severity,
+};
+
+/// 体检报告：结构化版本的一键检测。
+pub fn health_report_impl() -> Result<HealthReport, String> {
+    let ts = ps("Get-Date -Format \"yyyy-MM-dd HH:mm:ss\"")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    // 注意：单独的 ps() 调用默认按系统 ANSI 解码，中文 Caption（如「专业版」）会乱码，先设 UTF-8
+    let os_version = ps(
+        "[Console]::OutputEncoding = [Text.Encoding]::UTF8; $o = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue; ($o.Caption + ' ' + $o.Version)",
+    )
+    .map(|s| s.trim().to_string())
+    .unwrap_or_default();
+
+    let ds = get_displays();
+
+    // 一次脚本拿齐：每块屏的支持模式统计 + 未在活动路径上的显示器（WMI Active=false）
+    let mut mode_stats: HashMap<String, (String, u32, Vec<(u32, u32, u32)>)> = HashMap::new();
+    let mut inactive: Vec<(String, String)> = Vec::new();
+    if let Ok(csp) = core_asm_ref() {
+        let script = format!(
+            "[Console]::OutputEncoding = [Text.Encoding]::UTF8;\nAdd-Type -Path '{cs}';\n$lines = [SGCore]::ListDisplays() -split ([char]10);\nforeach ($l in $lines) {{ $p = $l -split '\\|'; if ($p[0] -eq 'D' -and $p.Count -ge 3) {{ Write-Output ('MS|' + $p[2] + '|' + [SGCore]::ModeStats($p[1])) }} }};\nGet-CimInstance -Namespace root/wmi -ClassName WmiMonitorID -ErrorAction SilentlyContinue | ForEach-Object {{\n  if (-not $_.Active) {{\n    $nm = (($_.UserFriendlyName | Where-Object {{ [int]$_ -ne 0 }} | ForEach-Object {{ [char][int]$_ }}) -join '');\n    Write-Output ('NA|' + $_.InstanceName + '|' + $nm)\n  }}\n}}",
+            cs = csp
+        );
+        if let Ok(raw) = ps(&script) {
+            for line in raw.lines() {
+                let p: Vec<&str> = line.split('|').collect();
+                match p[0] {
+                    "MS" if p.len() >= 3 => {
+                        let uid = p[1].to_string();
+                        if p[2].starts_with("ERR:") || p[2].is_empty() {
+                            continue;
+                        }
+                        // p[2] = "3840x2160|144|3840x2160@144,2560x1440@144,..."
+                        let joined = p[2..].join("|");
+                        let segs: Vec<&str> = joined.splitn(3, '|').collect();
+                        if segs.len() < 3 {
+                            continue;
+                        }
+                        let native = segs[0].to_string();
+                        let max_hz = segs[1].trim().parse::<u32>().unwrap_or(0);
+                        let modes: Vec<(u32, u32, u32)> = segs[2]
+                            .split(',')
+                            .filter_map(|m| {
+                                let (wh, hz) = m.split_once('@')?;
+                                let (w, h) = wh.split_once('x')?;
+                                Some((
+                                    w.trim().parse().ok()?,
+                                    h.trim().parse().ok()?,
+                                    hz.trim().parse().ok()?,
+                                ))
+                            })
+                            .collect();
+                        mode_stats.insert(uid, (native, max_hz, modes));
+                    }
+                    "NA" if p.len() >= 3 => {
+                        inactive.push((p[1].to_string(), p[2].to_string()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // HDR 状态按名字关联（H|<名>|支持|开关）
+    let hdr_map: Vec<(String, bool, bool)> = hdr_states()
+        .lines()
+        .filter(|l| l.starts_with("H|"))
+        .filter_map(|l| {
+            let p: Vec<&str> = l.split('|').collect();
+            if p.len() >= 4 {
+                Some((p[1].to_string(), p[2] == "1", p[3] == "1"))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut displays: Vec<DisplayHealth> = Vec::new();
+    for d in &ds {
+        let (cur_w, cur_h) = {
+            let p: Vec<&str> = d.resolution.split('x').collect();
+            if p.len() == 2 {
+                (p[0].trim().parse().unwrap_or(0), p[1].trim().parse().unwrap_or(0))
+            } else {
+                (0, 0)
+            }
+        };
+        let (native_res, max_hz_native, _max_hz_cur, modes) =
+            match mode_stats.get(&d.id) {
+                Some((native, max_hz, modes)) => {
+                    let (_, _, mhc) = super::infer_from_modes(modes, cur_w, cur_h);
+                    (
+                        if native.is_empty() { None } else { Some(native.clone()) },
+                        if *max_hz > 0 { Some(*max_hz) } else { None },
+                        mhc,
+                        modes.clone(),
+                    )
+                }
+                None => (None, None, None, Vec::new()),
+            };
+        let _ = &modes;
+        let native_wh = native_res.as_deref().and_then(|s| {
+            s.split_once('x')
+                .map(|(w, h)| (w.trim().parse().unwrap_or(0), h.trim().parse().unwrap_or(0)))
+        });
+
+        let ddc_capable = d.ddc;
+        let ddc_readable = ddc_capable && d.brightness.is_some();
+        // HDR：HDR API 的名字与友好名可能不完全一致，做包含匹配
+        let hdr_on = hdr_map
+            .iter()
+            .find(|(n, _, _)| !n.is_empty() && (d.name.contains(n.as_str()) || n.contains(&d.name)))
+            .map(|(_, _, on)| *on);
+
+        let mut checks: Vec<HealthCheck> = Vec::new();
+
+        // ① 分辨率不是原生
+        if let Some((nw, nh)) = native_wh {
+            if cur_w > 0 && cur_h > 0 && (cur_w != nw || cur_h != nh) {
+                let stretch = aspect_mismatch((cur_w, cur_h), (nw, nh));
+                checks.push(HealthCheck {
+                    id: "resolution_not_native".into(),
+                    severity: Severity::Warn,
+                    title: if stretch { "当前分辨率与原生不一致（画面可能被拉伸）".into() } else { "当前分辨率不是面板原生分辨率".into() },
+                    detail: if stretch {
+                        "当前分辨率宽高比与面板原生宽高比不同，画面会被拉伸或压缩；建议切回原生分辨率。".into()
+                    } else {
+                        "非原生分辨率会让画面经历一次缩放，文字发虚。建议切回原生分辨率。".into()
+                    },
+                    evidence: vec![
+                        format!("当前 {}x{}@{}", cur_w, cur_h, d.hz.map(|v| v.to_string()).unwrap_or_else(|| "?".into())),
+                        format!("原生 {}x{}（按支持模式列表面积最大者推断）", nw, nh),
+                        format!("宽高比 {}:{} vs {}:{}", cur_w / gcd(cur_w, cur_h), cur_h / gcd(cur_w, cur_h), nw / gcd(nw, nh), nh / gcd(nh, nh)),
+                    ],
+                    fix_ids: vec!["rescan_displays".into()],
+                });
+            }
+        }
+
+        // ② 当前分辨率下刷新率低于支持的最高值
+        let max_hz_cur = modes
+            .iter()
+            .filter(|(w, h, _)| *w == cur_w && *h == cur_h)
+            .map(|(_, _, hz)| *hz)
+            .max();
+        if let (Some(cur), Some(max)) = (d.hz, max_hz_cur) {
+            if max > cur {
+                checks.push(HealthCheck {
+                    id: "refresh_below_max".into(),
+                    severity: Severity::Info,
+                    title: "刷新率低于该分辨率下支持的最高值".into(),
+                    detail: "常见原因是线材带宽不足（HDMI 1.4 / 非 DP 线）或系统里选了低档。确认线材支持后，在系统显示设置里把刷新率调到最高档。".into(),
+                    evidence: vec![
+                        format!("当前 {}x{} @ {}Hz", cur_w, cur_h, cur),
+                        format!("该分辨率下支持最高 {}Hz", max),
+                    ],
+                    fix_ids: vec![],
+                });
+            }
+        }
+
+        // ③ DDC/CI 不可达
+        if ddc_capable && !ddc_readable {
+            checks.push(HealthCheck {
+                id: "ddc_unreachable".into(),
+                severity: Severity::Warn,
+                title: "DDC/CI 通道探测成功但读不到数据".into(),
+                detail: "读 VCP 0x10（亮度）超时。常见于 KVM/扩展坞半转发状态：能建立通道但数据回不来。尝试重新插拔线缆，或用「显示器健康」里的修复动作。".into(),
+                evidence: vec!["DDCProbe = 1（探测成功）".into(), "DDCRead(0x10) = 超时/空".into()],
+                fix_ids: vec!["reopen_ddc_channel".into(), "ddc_power_cycle".into()],
+            });
+        } else if !ddc_capable && d.brightness.is_none() {
+            checks.push(HealthCheck {
+                id: "ddc_unreachable".into(),
+                severity: Severity::Warn,
+                title: "DDC/CI 通道不可达".into(),
+                detail: "该屏读不到 DDC/CI，屏幕自身亮度/音量无法软调（这是链路问题，不是软件故障）。亮度可用「总亮度（gamma）」软件层兜底。".into(),
+                evidence: vec!["DDCProbe = 0（探测失败）".into()],
+                fix_ids: vec!["reopen_ddc_channel".into(), "ddc_power_cycle".into()],
+            });
+        }
+        // 内屏（无 DDC 但 WMI 亮度可用）属正常，不产生检查项
+
+        // ④ 色彩配置缺失或通用配置
+        match &d.color_profile {
+            Some(p) if looks_generic_profile(p) => checks.push(HealthCheck {
+                id: "color_profile_generic".into(),
+                severity: Severity::Info,
+                title: "色彩配置为系统通用配置".into(),
+                detail: "当前使用通用 sRGB / PnP 配置，未针对这块屏校准。对色彩要求高时可用「画质 → 色彩同步」对齐到标准色域。".into(),
+                evidence: vec![format!("色彩配置：{}", p)],
+                fix_ids: vec![],
+            }),
+            None => checks.push(HealthCheck {
+                id: "color_profile_generic".into(),
+                severity: Severity::Info,
+                title: "未读取到色彩配置".into(),
+                detail: "系统没有为这块屏报告 ICC 配置文件，颜色管理可能不完整。".into(),
+                evidence: vec!["ICC 读取结果为空".into()],
+                fix_ids: vec![],
+            }),
+            _ => {}
+        }
+
+        // ⑤ HDR 开启但亮度不可调（已知冲突）
+        if hdr_on == Some(true) && d.brightness.is_none() {
+            checks.push(HealthCheck {
+                id: "hdr_brightness_conflict".into(),
+                severity: Severity::Info,
+                title: "HDR 开启且亮度不可调".into(),
+                detail: "HDR 模式下系统接管背光，亮度滑块经常无效或表现异常，这是已知冲突。要调亮度可先关 HDR，或使用软件层「总亮度」。".into(),
+                evidence: vec!["HDR = 开".into(), "亮度读取 = 不可用".into()],
+                fix_ids: vec![],
+            });
+        }
+
+        displays.push(DisplayHealth {
+            display_id: d.id.clone(),
+            name: d.name.clone(),
+            native_resolution: native_res,
+            current_resolution: d.resolution.clone(),
+            max_hz: max_hz_native,
+            current_hz: d.hz,
+            ddc_capable,
+            ddc_readable,
+            color_profile: d.color_profile.clone(),
+            hdr: hdr_on,
+            connected: d.connected,
+            checks,
+        });
+    }
+
+    // ⑥ 系统认识但不在活动路径上的显示器（WMI Active=false）→ 虚拟条目
+    for (inst, nm) in &inactive {
+        let name = if nm.trim().is_empty() { "(未命名显示器)".to_string() } else { nm.clone() };
+        displays.push(DisplayHealth {
+            display_id: inst.clone(),
+            name,
+            native_resolution: None,
+            current_resolution: String::new(),
+            max_hz: None,
+            current_hz: None,
+            ddc_capable: false,
+            ddc_readable: false,
+            color_profile: None,
+            hdr: None,
+            connected: false,
+            checks: vec![HealthCheck {
+                id: "display_not_active".into(),
+                severity: Severity::Error,
+                title: "显示器未在活动路径上".into(),
+                detail: "系统枚举到了这台显示器，但它不在当前活动显示路径上（常见于掉线后未恢复、KVM 切换残留）。尝试重新插拔，或点修复动作强制重新枚举。".into(),
+                evidence: vec![format!("WmiMonitorID.InstanceName = {}（Active = false）", inst)],
+                fix_ids: vec!["rescan_displays".into(), "force_redetect".into()],
+            }],
+        });
+    }
+
+    if ds.is_empty() && inactive.is_empty() {
+        return Err("一台显示器都没枚举到；请检查线材、供电与 KVM 切换".into());
+    }
+
+    let mut report = HealthReport {
+        generated_at: ts,
+        platform: "windows".into(),
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        os_version,
+        displays,
+        summary: super::HealthSummary {
+            errors: 0,
+            warnings: 0,
+            infos: 0,
+            headline: String::new(),
+        },
+    };
+    report.summarize();
+    Ok(report)
+}
+
+/// 把体检报告拼成 diag_scan 兼容的文本段（【1】显示器小节），避免两套逻辑各写一遍。
+/// 返回 (文本, 正常数, 警告数, 问题数)。
+pub(crate) fn format_display_section(r: &HealthReport) -> (String, u32, u32, u32) {
+    let mut o = String::new();
+    let (mut nok, mut nwarn, mut nbad) = (0u32, 0u32, 0u32);
+    for d in &r.displays {
+        if !d.connected {
+            nbad += 1;
+            o.push_str(&format!("[问题] {} · 未在活动路径上\n", d.name));
+            for c in &d.checks {
+                for ev in &c.evidence {
+                    o.push_str(&format!("  ↳ {}\n", ev));
+                }
+            }
+            continue;
+        }
+        o.push_str(&format!(
+            "  {} · {} · {}Hz · DDC/CI {} · 色彩 {}\n",
+            d.name,
+            d.current_resolution,
+            d.current_hz.map(|v| v.to_string()).unwrap_or_else(|| "?".into()),
+            if d.ddc_readable { "可用" } else if d.ddc_capable { "读不到数据" } else { "不可达" },
+            d.color_profile.clone().unwrap_or_else(|| "未读取到".into())
+        ));
+        for c in &d.checks {
+            match c.severity {
+                Severity::Error => {
+                    nbad += 1;
+                    o.push_str(&format!("[问题] {}\n", c.title));
+                }
+                Severity::Warn => {
+                    nwarn += 1;
+                    o.push_str(&format!("[警告] {}\n", c.title));
+                }
+                Severity::Info => {
+                    nwarn += 1;
+                    o.push_str(&format!("[警告] {}\n", c.title));
+                }
+                Severity::Ok => nok += 1,
+            }
+            o.push_str(&format!("  ↳ {}\n", c.detail));
+            for ev in &c.evidence {
+                o.push_str(&format!("    · {}\n", ev));
+            }
+        }
+        if d.checks.is_empty() {
+            nok += 1;
+        }
+    }
+    (o, nok, nwarn, nbad)
+}
+
 /// 一键修复显示异常（分级，从轻到重）：
 ///   level 1 —— 对每台屏强制重新协商（先降刷新率再切回原模式，不改变任何用户设置）；
 ///   level 2 —— 额外做一次系统级关屏+唤醒，强制整条链路重新握手，然后再协商一轮。
@@ -3964,6 +4343,7 @@ pub fn open_log_dir() -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)] // 体检文本段暂不区分横竖屏，保留备用于后续视图
 fn portrait_of(res: &str) -> String {
     let p: Vec<&str> = res.split('x').collect();
     if p.len() == 2 {
@@ -3973,6 +4353,7 @@ fn portrait_of(res: &str) -> String {
     }
     "方向未知".to_string()
 }
+// 体检文本段（format_display_section）改为携带完整分辨率后，此函数暂无调用方；保留备用于后续视图
 
 /// 一键检测：扫全部屏幕相关状态 → 逐项判定 + 建议 → 写日志 → 返回报告文本
 pub fn diag_scan() -> Result<String, String> {
@@ -3985,36 +4366,22 @@ pub fn diag_scan() -> Result<String, String> {
     o.push_str(&format!("时间：{}\n", ts));
     o.push_str("标记：[正常] 没问题 / [警告] 能用但要留意 / [问题] 需要处理\n");
 
-    // 【1】显示器
+    // 【1】显示器 —— 内部改为调用结构化体检（P0-1），检查逻辑只有一份
     o.push_str("\n【1】显示器\n");
-    let ds = get_displays();
-    if ds.is_empty() {
-        nbad += 1;
-        o.push_str("[问题] 一台显示器都没枚举到\n  ↳ 检查线材、供电、KVM 是否切到本机；然后点「显示器健康 → 一键修复」\n");
-    }
-    for d in &ds {
-        let name = if d.name.trim().is_empty() { "(未命名)" } else { d.name.as_str() };
-        o.push_str(&format!(
-            "[{}] {} · {} · {}Hz · {} · {} · {}\n",
-            if d.connected { "正常" } else { "警告" },
-            name,
-            d.resolution,
-            match d.hz { Some(v) => v.to_string(), None => "?".to_string() },
-            if d.main { "主屏" } else { "副屏" },
-            if d.ddc { "DDC/CI 可用" } else { "DDC/CI 不可用" },
-            portrait_of(&d.resolution)
-        ));
-        o.push_str(&format!(
-            "  · 亮度 {} · 音量 {} · 色彩配置 {}\n",
-            match d.brightness { Some(v) => format!("{}%", v), None => "读不到".to_string() },
-            match d.volume { Some(v) => format!("{}%", v), None => "读不到".to_string() },
-            d.color_profile.clone().unwrap_or_else(|| "未读取到".to_string())
-        ));
-        if d.ddc {
-            nok += 1;
-        } else {
-            nwarn += 1;
-            o.push_str("  ↳ 该屏读不到 DDC/CI（常见于 KVM/转接链路不转发）：屏幕自身亮度音量读不到是**链路**问题、非软件故障；亮度用「总亮度(gamma)」兜底，小米这类 Android 屏的音量用「小米音量」滑块\n");
+    match health_report_impl() {
+        Ok(r) => {
+            let (sec, ok, warn, bad) = format_display_section(&r);
+            nok += ok;
+            nwarn += warn;
+            nbad += bad;
+            o.push_str(&sec);
+        }
+        Err(e) => {
+            nbad += 1;
+            o.push_str(&format!(
+                "[问题] 显示器体检失败：{}\n  ↳ 检查线材、供电、KVM 是否切到本机；然后点「显示器健康 → 一键修复」\n",
+                e
+            ));
         }
     }
 
@@ -5292,5 +5659,45 @@ mod powershell_literal_tests {
             ps_literal(r"C:\Users\O'Brien\AppData\Local\Screenguard\icc-reference\Display.icc"),
             r"'C:\Users\O''Brien\AppData\Local\Screenguard\icc-reference\Display.icc'"
         );
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    /// 手动冒烟（需真实显示器环境）：cargo test diag_scan_smoke -- --ignored
+    /// 走一遍完整 diag_scan（内部已改为调用 health_report_impl），验证显示器小节来自结构化体检
+    #[test]
+    #[ignore]
+    fn diag_scan_smoke() {
+        let out = diag_scan().expect("diag_scan 失败");
+        assert!(out.contains("【1】显示器"), "缺少显示器小节");
+        assert!(out.contains("===== 结论 ====="), "缺少结论");
+        println!("{}", out);
+    }
+
+    /// 手动冒烟：cargo test health_report_smoke -- --ignored
+    /// 验证结构化体检命令本体：至少一块屏、summary 已聚合、每条检查带 evidence
+    #[test]
+    #[ignore]
+    fn health_report_smoke() {
+        let r = health_report_impl().expect("health_report_impl 失败");
+        assert!(!r.displays.is_empty(), "没有显示器条目");
+        assert!(!r.summary.headline.is_empty(), "summary 未聚合");
+        for d in &r.displays {
+            for c in &d.checks {
+                assert!(!c.evidence.is_empty(), "检查项 {} 缺少 evidence", c.id);
+            }
+        }
+        println!("headline: {}", r.summary.headline);
+        for d in &r.displays {
+            println!(
+                "- {} · {} · checks={}",
+                d.name,
+                d.current_resolution,
+                d.checks.len()
+            );
+        }
     }
 }

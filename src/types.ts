@@ -62,6 +62,52 @@ export interface DiagReport {
   text: string;
 }
 
+/** 体检检查项严重程度：ok / info / warn / error */
+export type Severity = 'ok' | 'info' | 'warn' | 'error';
+
+/** 一条检查结果（与 Rust HealthCheck 对应；id 稳定，如 refresh_below_max） */
+export interface HealthCheck {
+  id: string;
+  severity: Severity;
+  title: string;
+  detail: string;
+  evidence: string[];
+  fix_ids: string[];
+}
+
+/** 单块屏体检结果 */
+export interface DisplayHealth {
+  display_id: string;
+  name: string;
+  native_resolution: string | null;
+  current_resolution: string;
+  max_hz: number | null;
+  current_hz: number | null;
+  ddc_capable: boolean;
+  ddc_readable: boolean;
+  color_profile: string | null;
+  hdr: boolean | null;
+  connected: boolean;
+  checks: HealthCheck[];
+}
+
+export interface HealthSummary {
+  errors: number;
+  warnings: number;
+  infos: number;
+  headline: string;
+}
+
+/** 完整体检报告 */
+export interface HealthReport {
+  generated_at: string;
+  platform: string;
+  app_version: string;
+  os_version: string;
+  displays: DisplayHealth[];
+  summary: HealthSummary;
+}
+
 /** 所有前端会调用到的后端命令名，集中登记避免拼写漂移 */
 export const CMD = {
   getPlatform: 'get_platform',
@@ -116,6 +162,7 @@ export const CMD = {
   getBatteries: 'get_batteries',
   diagScan: 'diag_scan',
   diagFix: 'diag_fix',
+  healthReport: 'health_report',
   diagLogPath: 'diag_log_path',
   openLogDir: 'open_log_dir',
   appStateJson: 'app_state_json',

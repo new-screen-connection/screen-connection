@@ -773,3 +773,185 @@ input[type='range']:disabled {
     grid-template-columns: 1fr;
   }
 }
+
+/* ================= 体检（HealthView） ================= */
+
+.health-headline {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.health-counts {
+  display: inline-flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.health-chip {
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-family: var(--mono);
+}
+
+.health-chip.ok {
+  background: color-mix(in srgb, var(--ok) 16%, transparent);
+  color: var(--ok);
+}
+
+.health-chip.info {
+  background: var(--accent-dim);
+  color: var(--accent-strong);
+}
+
+.health-chip.warn {
+  background: color-mix(in srgb, var(--warn) 16%, transparent);
+  color: var(--warn);
+}
+
+.health-chip.err {
+  background: color-mix(in srgb, var(--err) 16%, transparent);
+  color: var(--err);
+}
+
+.health-line {
+  font-size: 13.5px;
+  color: var(--text);
+}
+
+.health-meta {
+  margin: 8px 0 0;
+  font-size: 11.5px;
+  color: var(--faint);
+  font-family: var(--mono);
+}
+
+.health-display-meta {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.health-allok {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ok);
+}
+
+.health-checks {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.health-check {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.health-check.open {
+  border-color: var(--border);
+}
+
+.health-check-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 9px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.health-check-head:hover {
+  background: var(--hover, color-mix(in srgb, var(--text) 5%, transparent));
+}
+
+.health-check-title {
+  flex: 1;
+  min-width: 0;
+}
+
+.health-check-sev {
+  font-size: 11px;
+  color: var(--faint);
+  flex-shrink: 0;
+}
+
+.sev-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.sev-dot.error {
+  background: var(--err);
+}
+
+.sev-dot.warn {
+  background: var(--warn);
+}
+
+.sev-dot.info {
+  background: var(--accent);
+}
+
+.sev-dot.ok {
+  background: var(--ok);
+}
+
+.health-caret {
+  flex-shrink: 0;
+  color: var(--faint);
+  transition: transform 0.15s;
+}
+
+.health-check.open .health-caret {
+  transform: rotate(-90deg);
+}
+
+.health-check-body {
+  padding: 2px 12px 12px 29px;
+  border-top: 1px dashed var(--border-soft);
+}
+
+.health-detail {
+  margin: 10px 0 8px;
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--muted);
+}
+
+.health-evidence {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 11.5px;
+  font-family: var(--mono);
+  color: var(--faint);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.health-fixes {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.health-empty {
+  padding: 28px 0;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--faint);
+}

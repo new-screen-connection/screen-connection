@@ -6,6 +6,7 @@ import { currentTheme, initTheme, toggleTheme, type ThemeMode } from './theme';
 import Icon from './components/Icon.vue';
 import appIcon from './assets/app-icon.png';
 import OverviewView from './views/OverviewView.vue';
+import HealthView from './views/HealthView.vue';
 import QualityView from './views/QualityView.vue';
 import LayoutView from './views/LayoutView.vue';
 import DevicesView from './views/DevicesView.vue';
@@ -16,6 +17,7 @@ const views = {
   quality: { label: '画质', icon: 'palette', comp: QualityView },
   layout: { label: '布局', icon: 'layout', comp: LayoutView },
   overview: { label: '总览', icon: 'monitor', comp: OverviewView },
+  health: { label: '体检', icon: 'gauge', comp: HealthView },
   devices: { label: '设备', icon: 'battery', comp: DevicesView },
   tools: { label: '工具', icon: 'wrench', comp: ToolsView },
   agent: { label: '助手', icon: 'chat', comp: AgentView },
