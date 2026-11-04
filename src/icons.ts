@@ -64,4 +64,6 @@ export const ICONS: Record<string, IconDef> = {
   volume: { paths: ['M4 9.5v5h3.5L12 19V5L7.5 9.5H4Z M15.5 9a4.2 4.2 0 0 1 0 6 M18 6.8a8 8 0 0 1 0 10.4'] },
   chat: { paths: ['M4 5.5h16v10.5H9.5L4 20V5.5Z M8 9.5h8 M8 12.5h5'] },
   send: { paths: ['M3.5 11.5 20.5 4l-4.5 16.5-5-6.5-7.5-2.5Z M11 14l9.5-10'] },
+  edit: { paths: ['M4 20h4L19.5 8.5a2.1 2.1 0 0 0-3-3L5 16.5V20Z M14.5 7.5l2 2'] },
+  trash: { paths: ['M4.5 6.5h15 M9.5 6V4.5h5V6 M6.5 6.5l1 14h9l1-14 M10 10.5v6.5 M14 10.5v6.5'] },
 };

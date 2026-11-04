@@ -3,6 +3,7 @@
  * 在 Tauri WebView 内不生效；`npm run dev` 直接在浏览器打开时可预览全部界面与交互。
  */
 import type { AudioEndpoint, BatteryInfo, DisplayInfo, HealthReport, Topology } from '../types';
+import type { ApplyReport, Profile } from '../types';
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -47,6 +48,41 @@ const windows = [
   'Microsoft Edge - 设计文档',
   'Visual Studio Code - App.vue',
   'PotPlayer - movie.mkv',
+];
+
+/** 场景档假数据：两个档位（浏览器预览用） */
+const mockProfiles: Profile[] = [
+  {
+    id: 'mock-p1',
+    name: '工作模式',
+    created_at: '2026-11-03 09:12:00',
+    updated_at: '2026-11-03 09:12:00',
+    targets: {
+      displays: [
+        { edid_key: 'JKA27B3', captured_id: 'mock-1', resolution: '3840x2160', hz: 60, rotation: 0, brightness: 65, volume: null, color_space: 'sRGB IEC61966-2.1' },
+        { edid_key: null, captured_id: 'mock-2', resolution: '1920x1080', hz: 60, rotation: 3, brightness: 90, volume: 20, color_space: null },
+      ],
+      main_display: 'mock-1',
+      audio_device_id: 'ep-0',
+      hdr: false,
+    },
+    auto: false,
+  },
+  {
+    id: 'mock-p2',
+    name: '观影模式',
+    created_at: '2026-11-03 21:40:00',
+    updated_at: '2026-11-03 21:40:00',
+    targets: {
+      displays: [
+        { edid_key: 'JKA27B3', captured_id: 'mock-1', resolution: '3840x2160', hz: 60, rotation: 0, brightness: 30, volume: null, color_space: 'Display P3' },
+      ],
+      main_display: 'mock-1',
+      audio_device_id: 'ep-1',
+      hdr: true,
+    },
+    auto: false,
+  },
 ];
 
 /** 拓扑假数据：主屏 4K@144 过 HDMI → 线缆带宽反推为 suspect（含算式）；副屏全链路健康 */
@@ -302,6 +338,79 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       };
       const m = MESSAGES[action] ?? { result: 'not_applicable' as const, message: `未知的修复动作 ${action}`, changed: [] };
       return { action, ...m } as T;
+    }
+    // ---------- 场景档（P0-5）：两个假档位，可点、可看结果 ----------
+    case 'profiles_list':
+      return JSON.parse(JSON.stringify(mockProfiles)) as T;
+    case 'profile_capture': {
+      const name = String(args?.name ?? '新档位');
+      const p: Profile = {
+        id: 'mock-' + Date.now(),
+        name,
+        created_at: '刚刚',
+        updated_at: '刚刚',
+        targets: {
+          displays: [
+            { edid_key: 'JKA27B3', captured_id: 'mock-1', resolution: '3840x2160', hz: 60, rotation: 0, brightness: 65, volume: null, color_space: 'sRGB IEC61966-2.1' },
+            { edid_key: null, captured_id: 'mock-2', resolution: '1920x1080', hz: 60, rotation: 0, brightness: 80, volume: 30, color_space: null },
+          ],
+          main_display: 'mock-1',
+          audio_device_id: 'ep-0',
+          hdr: false,
+        },
+        auto: false,
+      };
+      mockProfiles.push(JSON.parse(JSON.stringify(p)));
+      return p as T;
+    }
+    case 'profile_apply': {
+      const id = String(args?.id ?? '');
+      const p = mockProfiles.find((x) => x.id === id);
+      const report: ApplyReport = {
+        ok: true,
+        rolled_back: false,
+        steps: [
+          { target: p?.name ?? '场景档', field: '分辨率', want: '3840x2160@60', got: '3840x2160@60', ok: true, error: null },
+          { target: p?.name ?? '场景档', field: '亮度', want: '65%', got: '65%', ok: true, error: null },
+          { target: '全局', field: '音频设备', want: '扬声器 (Realtek Audio)', got: '扬声器 (Realtek Audio)', ok: true, error: null },
+        ],
+      };
+      return report as T;
+    }
+    case 'profile_update': {
+      const id = String(args?.id ?? '');
+      const p = mockProfiles.find((x) => x.id === id);
+      if (!p) throw new Error(`未找到场景档 ${id}`);
+      if (args?.name) p.name = String(args.name);
+      p.updated_at = '刚刚';
+      return JSON.parse(JSON.stringify(p)) as T;
+    }
+    case 'profile_delete': {
+      const id = String(args?.id ?? '');
+      const idx = mockProfiles.findIndex((x) => x.id === id);
+      if (idx < 0) throw new Error(`未找到场景档 ${id}`);
+      mockProfiles.splice(idx, 1);
+      return undefined as T;
+    }
+    case 'profile_reorder': {
+      const ids = (args?.ids as string[]) ?? [];
+      const ordered = ids
+        .map((id) => mockProfiles.find((x) => x.id === id))
+        .filter((x): x is Profile => Boolean(x));
+      mockProfiles.length = 0;
+      mockProfiles.push(...ordered);
+      return JSON.parse(JSON.stringify(mockProfiles)) as T;
+    }
+    case 'profile_export_json': {
+      const p = mockProfiles.find((x) => x.id === String(args?.id ?? ''));
+      if (!p) throw new Error('未找到场景档');
+      return JSON.stringify(p, null, 2) as T;
+    }
+    case 'profile_import_json': {
+      const p = JSON.parse(String(args?.json ?? '{}')) as Profile;
+      p.id = 'mock-' + Date.now();
+      mockProfiles.push(JSON.parse(JSON.stringify(p)));
+      return p as T;
     }
     case 'health_report_markdown':
       return (

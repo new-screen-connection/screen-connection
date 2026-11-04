@@ -168,6 +168,59 @@ export const INPUT_SOURCES: { value: string; label: string }[] = [
   { value: 'usbc', label: 'USB-C' },
 ];
 
+/** 场景档（P0-5）：一组显示相关配置的命名快照 */
+export interface Profile {
+  id: string;
+  name: string;
+  created_at: string;
+  updated_at: string;
+  targets: ProfileTargets;
+  match?: ProfileMatch | null;
+  auto: boolean;
+}
+
+export interface ProfileTargets {
+  displays: DisplayTarget[];
+  main_display: string | null;
+  audio_device_id: string | null;
+  hdr: boolean | null;
+}
+
+/** 单屏目标；所有字段可选，应用时存了什么应用什么 */
+export interface DisplayTarget {
+  edid_key: string | null;
+  captured_id: string | null;
+  resolution: string | null;
+  hz: number | null;
+  rotation: number | null;
+  brightness: number | null;
+  volume: number | null;
+  color_space: string | null;
+}
+
+export interface ProfileMatch {
+  require_all_displays: boolean;
+  docking: boolean | null;
+  on_ac: boolean | null;
+}
+
+/** 应用过程的一步（want/got 都是人话） */
+export interface ApplyStep {
+  target: string;
+  field: string;
+  want: string;
+  got: string;
+  ok: boolean;
+  error: string | null;
+}
+
+/** 应用结果：ok=false 且 rolled_back=true 表示已整体回滚 */
+export interface ApplyReport {
+  ok: boolean;
+  rolled_back: boolean;
+  steps: ApplyStep[];
+}
+
 /** 所有前端会调用到的后端命令名，集中登记避免拼写漂移 */
 export const CMD = {
   getPlatform: 'get_platform',
@@ -225,6 +278,14 @@ export const CMD = {
   healthReport: 'health_report',
   healthReportMarkdown: 'health_report_markdown',
   repairAction: 'repair_action',
+  profilesList: 'profiles_list',
+  profileCapture: 'profile_capture',
+  profileApply: 'profile_apply',
+  profileUpdate: 'profile_update',
+  profileDelete: 'profile_delete',
+  profileReorder: 'profile_reorder',
+  profileExportJson: 'profile_export_json',
+  profileImportJson: 'profile_import_json',
   diagLogPath: 'diag_log_path',
   openLogDir: 'open_log_dir',
   appStateJson: 'app_state_json',

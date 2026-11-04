@@ -96,8 +96,15 @@ const CARBON_MODIFIER_CONTROL: u32 = 1 << 12;
 const CARBON_MODIFIER_OPTION: u32 = 1 << 11;
 const CARBON_KEY_L: u32 = 0x25;
 const CARBON_KEY_R: u32 = 0x0f;
+// 数字键 1/2/3（kVK_ANSI_1..3）：Control+Option+1..3 应用前三个场景档（P0-5）
+const CARBON_KEY_1: u32 = 0x12;
+const CARBON_KEY_2: u32 = 0x13;
+const CARBON_KEY_3: u32 = 0x14;
 const CARBON_HOTKEY_TOGGLE_ID: u32 = 1;
 const CARBON_HOTKEY_RESTORE_ID: u32 = 2;
+const CARBON_HOTKEY_PROFILE1_ID: u32 = 3;
+const CARBON_HOTKEY_PROFILE2_ID: u32 = 4;
+const CARBON_HOTKEY_PROFILE3_ID: u32 = 5;
 
 fn hotkeys_registered() -> &'static AtomicBool {
     static REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -151,6 +158,12 @@ unsafe extern "C" fn carbon_hotkey_handler(
                 if let Err(error) = restore_foreground() {
                     eprintln!("[screenguard] macOS 快捷键窗口还原失败：{}", error);
                 }
+            });
+        }
+        CARBON_HOTKEY_PROFILE1_ID | CARBON_HOTKEY_PROFILE2_ID | CARBON_HOTKEY_PROFILE3_ID => {
+            let idx = (hotkey.id - CARBON_HOTKEY_PROFILE1_ID) as usize;
+            std::thread::spawn(move || {
+                crate::platform::profile_apply_by_index(idx);
             });
         }
         _ => {}
@@ -215,6 +228,30 @@ pub fn hotkey_start() -> Result<String, String> {
             UnregisterEventHotKey(toggle);
             RemoveEventHandler(handler);
             return Err(format!("注册 Control+Option+R 失败（快捷键可能被占用，Carbon 错误码 {}）", status));
+        }
+
+        // 场景档 1..3（注册失败只降级提示，不推翻前面已注册的键）
+        let mut first_profile_err: Option<String> = None;
+        for (key, id) in [
+            (CARBON_KEY_1, CARBON_HOTKEY_PROFILE1_ID),
+            (CARBON_KEY_2, CARBON_HOTKEY_PROFILE2_ID),
+            (CARBON_KEY_3, CARBON_HOTKEY_PROFILE3_ID),
+        ] {
+            let mut hk = std::ptr::null_mut();
+            let status = RegisterEventHotKey(
+                key,
+                modifiers,
+                CarbonEventHotKeyId { signature: CARBON_HOTKEY_SIGNATURE, id },
+                target,
+                0,
+                &mut hk,
+            );
+            if status != 0 && first_profile_err.is_none() {
+                first_profile_err = Some(format!("Control+Option+{} 注册失败（Carbon 错误码 {}）", id - CARBON_HOTKEY_PROFILE1_ID + 1, status));
+            }
+        }
+        if let Some(e) = first_profile_err {
+            eprintln!("[screenguard] macOS 场景档快捷键：{}", e);
         }
 
         hotkeys_registered().store(true, Ordering::Release);
@@ -1025,8 +1062,9 @@ fn read_ddc_brightness(cgid: u32) -> Option<u32> {
 
 use super::{
     aspect_mismatch, bandwidth_ladder, looks_generic_profile, required_bandwidth_gbps,
-    DisplayHealth, HealthCheck, HealthReport, HealthSummary, HopKind, HopStatus, RepairOutcome,
-    RepairResult, Severity, Topology, TopologyHop,
+    ApplyReport, ApplyStep, DisplayHealth, DisplayTarget, HealthCheck, HealthReport,
+    HealthSummary, HopKind, HopStatus, Profile, ProfileTargets, RepairOutcome, RepairResult,
+    Severity, Topology, TopologyHop,
 };
 
 // ---------- 链路拓扑（P0-2，macOS 侧） ----------
@@ -1446,6 +1484,395 @@ pub fn repair_action_impl(
         }
     }
     Ok(out)
+}
+
+// ---------- 场景档 Profile（P0-5，macOS 侧） ----------
+// 捕获：displayplacer 屏列表（分辨率/刷新率/旋转/主屏）+ DDC 亮度音量 + 音频选定项。
+//       macOS 暂无稳定的 EDID 厂商码通道，匹配一律走顺序兜底（报告里如实标注）。
+// 应用：主屏(set-main) → 逐屏模式/旋转 → 亮度音量 → 音频；每步回读核验；
+//       关键步骤（主屏/模式/旋转）失败 → 用 displayplacer 重放应用前快照整体回滚。
+
+/// displayplacer degree（0/90/180/270）→ DEVMODE 约定（0/1/2/3，与 Windows 目标字段同义）
+fn degree_to_ori(deg: u32) -> u32 {
+    match deg {
+        90 => 1,
+        180 => 2,
+        270 => 3,
+        _ => 0,
+    }
+}
+
+fn ori_to_degree(ori: u32) -> u32 {
+    match ori {
+        1 => 90,
+        2 => 180,
+        3 => 270,
+        _ => 0,
+    }
+}
+
+pub fn profile_capture_impl_platform() -> Result<ProfileTargets, String> {
+    let screens = parse_screens();
+    if screens.is_empty() {
+        return Err("没有枚举到显示器，无法捕获".to_string());
+    }
+    let infos = get_displays();
+    let mut displays: Vec<DisplayTarget> = Vec::new();
+    for s in screens.iter().filter(|s| s.enabled) {
+        let info = infos.iter().find(|d| d.id == s.id);
+        let (w, h) = s.layout_resolution();
+        displays.push(DisplayTarget {
+            edid_key: None,
+            captured_id: Some(s.id.clone()),
+            resolution: Some(format!("{}x{}", w, h)),
+            hz: s.hz,
+            rotation: Some(degree_to_ori(s.degree)),
+            brightness: info.and_then(|d| d.brightness),
+            volume: info.and_then(|d| d.volume),
+            color_space: None,
+        });
+    }
+    let main = screens.iter().find(|s| s.main).map(|s| s.id.clone());
+    let audio = audio_endpoints()
+        .ok()
+        .and_then(|eps| eps.iter().find(|e| e.selected).map(|e| e.id.clone()));
+    Ok(ProfileTargets {
+        displays,
+        main_display: main,
+        audio_device_id: audio,
+        hdr: None,
+    })
+}
+
+pub fn profile_apply_impl_platform(profile: &Profile) -> Result<ApplyReport, String> {
+    let mut steps: Vec<ApplyStep> = Vec::new();
+    let before = parse_screens();
+    if before.is_empty() {
+        return Err("没有枚举到显示器，无法应用".to_string());
+    }
+    // 回滚快照：应用前每块屏的完整布局 spec（含模式/原点/方向）
+    let snapshot: Vec<String> = before.iter().map(screen_spec).collect();
+    let enabled_ids: Vec<String> =
+        before.iter().filter(|s| s.enabled).map(|s| s.id.clone()).collect();
+    let mut critical_failed = false;
+
+    // ① 主屏（关键步骤）
+    if let Some(main_id) = &profile.targets.main_display {
+        let cur_main = before.iter().find(|s| s.main).map(|s| s.id.clone());
+        if cur_main.as_deref() != Some(main_id.as_str()) {
+            match display_action("set-main", main_id, None, None) {
+                Ok(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(900));
+                    let got = parse_screens()
+                        .iter()
+                        .find(|s| s.main)
+                        .map(|s| s.id.clone())
+                        .unwrap_or_default();
+                    if got == *main_id {
+                        steps.push(ApplyStep {
+                            target: "主屏".into(),
+                            field: "主屏".into(),
+                            want: main_id.clone(),
+                            got,
+                            ok: true,
+                            error: None,
+                        });
+                    } else {
+                        critical_failed = true;
+                        steps.push(ApplyStep {
+                            target: "主屏".into(),
+                            field: "主屏".into(),
+                            want: main_id.clone(),
+                            got,
+                            ok: false,
+                            error: Some("设置后回读主屏不一致".into()),
+                        });
+                    }
+                }
+                Err(e) => {
+                    critical_failed = true;
+                    steps.push(ApplyStep {
+                        target: "主屏".into(),
+                        field: "主屏".into(),
+                        want: main_id.clone(),
+                        got: "未变更".into(),
+                        ok: false,
+                        error: Some(e),
+                    });
+                }
+            }
+        }
+    }
+
+    // ② 逐屏：模式（关键）→ 旋转（关键）→ 亮度/音量（非关键）
+    for (i, t) in profile.targets.displays.iter().enumerate() {
+        // macOS 无 EDID 键：第 i 个目标 ↔ 第 i 块活动屏（顺序兜底）；超出时按捕获 id 找
+        let id = enabled_ids
+            .get(i)
+            .cloned()
+            .or_else(|| t.captured_id.clone());
+        let id = match id {
+            Some(v) => v,
+            None => {
+                critical_failed = true;
+                steps.push(ApplyStep {
+                    target: t.captured_id.clone().unwrap_or_else(|| "?".into()),
+                    field: "选屏".into(),
+                    want: "顺序下一个".into(),
+                    got: "没有可用的显示器".into(),
+                    ok: false,
+                    error: Some("这块屏当前不在线".into()),
+                });
+                continue;
+            }
+        };
+        let fallback_note = format!("（第 {} 块活动屏）", i + 1);
+
+        // 模式
+        if let Some(res) = &t.resolution {
+            let mut err = None;
+            let mut ok = false;
+            let mut got = "未读取".to_string();
+            let cur = parse_screens()
+                .into_iter()
+                .find(|s| s.id == id && s.enabled);
+            let cur_match = cur
+                .as_ref()
+                .and_then(|s| s.layout_mode())
+                .map(|m| (format!("{}x{}", m.w, m.h), m.hz))
+                == Some((res.clone(), t.hz));
+            if cur_match {
+                ok = true;
+                got = res.clone();
+            } else {
+                let idx = get_display_modes(&id).ok().and_then(|modes| {
+                    modes
+                        .iter()
+                        .find(|m| {
+                            m.resolution == *res
+                                && (t.hz.is_none() || Some(m.hz) == t.hz)
+                                && !m.scaled
+                        })
+                        .map(|m| m.mode)
+                });
+                match idx {
+                    Some(mode_idx) => match set_display_mode(&id, mode_idx) {
+                        Ok(_) => {
+                            std::thread::sleep(std::time::Duration::from_millis(900));
+                            match parse_screens()
+                                .into_iter()
+                                .find(|s| s.id == id && s.enabled)
+                                .and_then(|s| s.active_mode().map(|m| (m.w, m.h, m.hz)))
+                            {
+                                Some((w, h, hz)) => {
+                                    got = format!("{}x{}@{}", w, h, hz.unwrap_or(0));
+                                    let hz_ok = t.hz.is_none() || hz == t.hz;
+                                    ok = format!("{}x{}", w, h) == *res && hz_ok;
+                                    if !ok {
+                                        err = Some("回读与目标不一致".into());
+                                    }
+                                }
+                                None => err = Some("应用后读不到当前模式".into()),
+                            }
+                        }
+                        Err(e) => err = Some(e),
+                    },
+                    None => {
+                        err = Some(format!(
+                            "这块屏的模式列表里没有 {}{} 的非缩放模式",
+                            res,
+                            t.hz.map(|h| format!("@{}", h)).unwrap_or_default()
+                        ));
+                    }
+                }
+            }
+            if !ok {
+                critical_failed = true;
+            }
+            steps.push(ApplyStep {
+                target: format!("屏{}{}", i + 1, fallback_note),
+                field: "分辨率".into(),
+                want: t
+                    .hz
+                    .map(|h| format!("{}@{}", res, h))
+                    .unwrap_or_else(|| res.clone()),
+                got,
+                ok,
+                error: err,
+            });
+        }
+
+        // 旋转
+        if let Some(ori) = t.rotation {
+            let deg = ori_to_degree(ori);
+            let cur_deg = parse_screens()
+                .into_iter()
+                .find(|s| s.id == id && s.enabled)
+                .map(|s| s.degree);
+            if cur_deg != Some(deg) {
+                let mut err = None;
+                let mut ok = false;
+                let mut got = "未读取".to_string();
+                match run_displayplacer(&[&format!("id:{} degree:{}", id, deg)]) {
+                    Ok(_) => {
+                        std::thread::sleep(std::time::Duration::from_millis(900));
+                        match parse_screens()
+                            .into_iter()
+                            .find(|s| s.id == id && s.enabled)
+                            .map(|s| s.degree)
+                        {
+                            Some(d) => {
+                                got = format!("方向 {}", degree_to_ori(d));
+                                ok = d == deg;
+                                if !ok {
+                                    err = Some("回读方向与目标不一致".into());
+                                }
+                            }
+                            None => err = Some("应用后读不到当前方向".into()),
+                        }
+                    }
+                    Err(e) => err = Some(e),
+                }
+                if !ok {
+                    critical_failed = true;
+                }
+                steps.push(ApplyStep {
+                    target: format!("屏{}", i + 1),
+                    field: "旋转".into(),
+                    want: format!("方向 {}", ori),
+                    got,
+                    ok,
+                    error: err,
+                });
+            }
+        }
+
+        // 亮度（非关键）
+        if let Some(bri) = t.brightness {
+            let mut err = None;
+            let mut ok = false;
+            let mut got = "未读取".to_string();
+            match set_brightness(&id, bri) {
+                Ok(()) => {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    let cur = get_displays()
+                        .into_iter()
+                        .find(|d| d.id == id)
+                        .and_then(|d| d.brightness);
+                    match cur {
+                        Some(b) => {
+                            got = format!("{}%", b);
+                            ok = b == bri;
+                            if !ok {
+                                err = Some("回读与目标不一致".into());
+                            }
+                        }
+                        None => err = Some("应用后读不到亮度".into()),
+                    }
+                }
+                Err(e) => err = Some(e),
+            }
+            steps.push(ApplyStep {
+                target: format!("屏{}", i + 1),
+                field: "亮度".into(),
+                want: format!("{}%", bri),
+                got,
+                ok,
+                error: err,
+            });
+        }
+
+        // 音量（非关键）
+        if let Some(vol) = t.volume {
+            let mut err = None;
+            let mut ok = false;
+            let mut got = "未读取".to_string();
+            match set_volume(&id, vol) {
+                Ok(()) => {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    let cur = get_displays()
+                        .into_iter()
+                        .find(|d| d.id == id)
+                        .and_then(|d| d.volume);
+                    match cur {
+                        Some(v) => {
+                            got = format!("{}%", v);
+                            ok = v == vol;
+                            if !ok {
+                                err = Some("回读与目标不一致".into());
+                            }
+                        }
+                        None => err = Some("应用后读不到音量".into()),
+                    }
+                }
+                Err(e) => err = Some(e),
+            }
+            steps.push(ApplyStep {
+                target: format!("屏{}", i + 1),
+                field: "音量".into(),
+                want: format!("{}%", vol),
+                got,
+                ok,
+                error: err,
+            });
+        }
+    }
+
+    // ③ 音频设备（非关键）
+    if let Some(aid) = &profile.targets.audio_device_id {
+        let mut err = None;
+        let mut ok = false;
+        let mut got = "未读取".to_string();
+        match set_audio_device(aid) {
+            Ok(()) => {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                match audio_endpoints() {
+                    Ok(eps) => match eps.iter().find(|e| e.selected) {
+                        Some(e) => {
+                            got = e.name.clone();
+                            ok = e.id == *aid;
+                            if !ok {
+                                err = Some("回读的选定设备与目标不一致".into());
+                            }
+                        }
+                        None => err = Some("读不到当前选定的音频设备".into()),
+                    },
+                    Err(e) => err = Some(e),
+                }
+            }
+            Err(e) => err = Some(e),
+        }
+        steps.push(ApplyStep {
+            target: "全局".into(),
+            field: "音频设备".into(),
+            want: aid.clone(),
+            got,
+            ok,
+            error: err,
+        });
+    }
+
+    // 关键步骤失败 → displayplacer 重放应用前快照整体回滚
+    if critical_failed {
+        let args: Vec<&str> = snapshot.iter().map(String::as_str).collect();
+        let rollback_ok = run_displayplacer(&args).is_ok();
+        steps.push(ApplyStep {
+            target: "整体".into(),
+            field: "回滚".into(),
+            want: "应用前的布局与方向".into(),
+            got: if rollback_ok { "已回滚".into() } else { "部分未恢复".into() },
+            ok: rollback_ok,
+            error: if rollback_ok {
+                None
+            } else {
+                Some("未能完全恢复，请在系统显示设置里检查".into())
+            },
+        });
+        return Ok(ApplyReport { ok: false, rolled_back: true, steps });
+    }
+
+    let ok = steps.iter().all(|s| s.ok);
+    Ok(ApplyReport { ok, rolled_back: false, steps })
 }
 
 pub fn health_report_impl() -> Result<HealthReport, String> {
@@ -2138,7 +2565,7 @@ fn default_enabled() -> bool {
     true
 }
 
-fn app_support_dir() -> Result<std::path::PathBuf, String> {
+pub(crate) fn app_support_dir() -> Result<std::path::PathBuf, String> {
     let home = std::env::var("HOME").map_err(|_| "无法定位当前用户主目录".to_string())?;
     let dir = std::path::PathBuf::from(home)
         .join("Library")

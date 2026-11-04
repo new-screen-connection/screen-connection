@@ -1,5 +1,7 @@
 use serde::Serialize;
 use std::process::Command;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 /// 显示器的跨平台结构化描述
 #[derive(Serialize, Clone, Debug)]
@@ -583,6 +585,305 @@ pub struct RepairOutcome {
 /// 需要前端弹二次确认才允许执行的动作（会改分辨率/刷新率/输入源/暂时关屏）。
 /// 前后端共用同一份名单，避免两端各写一套判断。
 pub const REPAIR_NEEDS_CONFIRM: &[&str] = &["reapply_mode", "switch_input", "ddc_power_cycle"];
+
+// ---------- 场景档 Profile（P0-5，两平台共用契约与存储） ----------
+
+/// 一个场景档：一组显示相关配置的命名快照。match/auto 供 P1-1 自动触发，本轮只存字段。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct Profile {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub targets: ProfileTargets,
+    #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
+    pub match_: Option<ProfileMatch>,
+    #[serde(default)]
+    pub auto: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+pub struct ProfileTargets {
+    /// 逐屏目标：按 EDID 厂商码+产品码匹配，匹配不到则按顺序兜底（got 里会标注）
+    #[serde(default)]
+    pub displays: Vec<DisplayTarget>,
+    /// 主屏（macOS 能可靠切换；Windows 捕获时不记录此字段）
+    #[serde(default)]
+    pub main_display: Option<String>,
+    #[serde(default)]
+    pub audio_device_id: Option<String>,
+    #[serde(default)]
+    pub hdr: Option<bool>,
+}
+
+/// 单屏目标。所有字段可选——捕获时读得到什么存什么，应用时存了什么应用什么。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+pub struct DisplayTarget {
+    /// EDID 厂商码+产品码，形如 "JKA27B3"（拿不到为 None，走顺序兜底）
+    #[serde(default)]
+    pub edid_key: Option<String>,
+    /// 捕获时的 display_id（顺序兜底用 + 报告里好认）
+    #[serde(default)]
+    pub captured_id: Option<String>,
+    /// "3840x2160"
+    #[serde(default)]
+    pub resolution: Option<String>,
+    #[serde(default)]
+    pub hz: Option<u32>,
+    /// 0=横 1=顺时针90 2=180 3=逆时针90
+    #[serde(default)]
+    pub rotation: Option<u32>,
+    /// 0-100
+    #[serde(default)]
+    pub brightness: Option<u32>,
+    #[serde(default)]
+    pub volume: Option<u32>,
+    /// ICC 配置名（捕获时的 profile 名，应用时模糊匹配 icc_path）
+    #[serde(default)]
+    pub color_space: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+pub struct ProfileMatch {
+    #[serde(default = "default_true")]
+    pub require_all_displays: bool,
+    #[serde(default)]
+    pub docking: Option<bool>,
+    #[serde(default)]
+    pub on_ac: Option<bool>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 应用过程中的一步。want/got 都用人话（应用失败时用户要能看懂差在哪）。
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ApplyStep {
+    pub target: String,
+    pub field: String,
+    pub want: String,
+    pub got: String,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// 应用结果。ok=false 且 rolled_back=true 表示已整体回滚到应用前状态。
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ApplyReport {
+    pub ok: bool,
+    pub rolled_back: bool,
+    pub steps: Vec<ApplyStep>,
+}
+
+/// profiles.json 路径（与 state.json 同目录）
+#[cfg(target_os = "windows")]
+pub fn profiles_file() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("APPDATA").unwrap_or_default())
+        .join("Screenguard")
+        .join("profiles.json")
+}
+
+#[cfg(target_os = "macos")]
+pub fn profiles_file() -> std::path::PathBuf {
+    app_support_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp")).join("profiles.json")
+}
+
+/// 读档列表。文件损坏时不崩：把损坏文件改名 .bak 保留，返回空列表让应用继续可用。
+pub fn load_profiles() -> Vec<Profile> {
+    let path = profiles_file();
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    if raw.trim().is_empty() {
+        return Vec::new();
+    }
+    match serde_json::from_str::<Vec<Profile>>(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            let bak = path.with_extension("json.bak");
+            let _ = std::fs::rename(&path, &bak);
+            eprintln!("profiles.json 损坏（{}），已备份为 {} 并按空列表继续", e, bak.display());
+            Vec::new()
+        }
+    }
+}
+
+pub fn save_profiles(list: &[Profile]) -> Result<(), String> {
+    let path = profiles_file();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("无法创建配置目录：{}", e))?;
+    }
+    let json = serde_json::to_string_pretty(list).map_err(|e| format!("序列化失败：{}", e))?;
+    std::fs::write(&path, json).map_err(|e| format!("写入 profiles.json 失败：{}", e))
+}
+
+fn now_str() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        // Windows 没有 Unix date；PowerShell 取本地时间（capture/apply 非热路径，可接受）
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Get-Date -Format 'yyyy-MM-dd HH:mm:ss'"])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::process::Command::new("date")
+            .args(["+%Y-%m-%d %H:%M:%S"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    }
+}
+
+fn new_profile_id() -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("p{}", ts)
+}
+
+pub fn profiles_list_impl() -> Vec<Profile> {
+    load_profiles()
+}
+
+/// 捕获当前状态为新档（targets 由平台实现读取）
+pub fn profile_capture_impl(name: &str) -> Result<Profile, String> {
+    let targets = profile_capture_platform()?;
+    let ts = now_str();
+    let p = Profile {
+        id: new_profile_id(),
+        name: name.trim().to_string(),
+        created_at: ts.clone(),
+        updated_at: ts,
+        targets,
+        match_: None,
+        auto: false,
+    };
+    let mut list = load_profiles();
+    list.push(p.clone());
+    save_profiles(&list)?;
+    Ok(p)
+}
+
+/// 更新档位：改名 / 重捕获 targets（「更新为当前状态」）/ 开关自动触发标记
+pub fn profile_update_impl(
+    id: &str,
+    name: Option<&str>,
+    recapture: bool,
+    auto: Option<bool>,
+) -> Result<Profile, String> {
+    let mut list = load_profiles();
+    let idx = list
+        .iter()
+        .position(|p| p.id == id)
+        .ok_or_else(|| format!("未找到场景档 {}", id))?;
+    if let Some(n) = name {
+        let n = n.trim();
+        if !n.is_empty() {
+            list[idx].name = n.to_string();
+        }
+    }
+    if recapture {
+        list[idx].targets = profile_capture_platform()?;
+    }
+    if let Some(a) = auto {
+        list[idx].auto = a;
+    }
+    list[idx].updated_at = now_str();
+    save_profiles(&list)?;
+    Ok(list[idx].clone())
+}
+
+pub fn profile_delete_impl(id: &str) -> Result<(), String> {
+    let mut list = load_profiles();
+    let before = list.len();
+    list.retain(|p| p.id != id);
+    if list.len() == before {
+        return Err(format!("未找到场景档 {}", id));
+    }
+    save_profiles(&list)
+}
+
+pub fn profile_reorder_impl(ids: &[String]) -> Result<Vec<Profile>, String> {
+    let mut list = load_profiles();
+    let mut ordered: Vec<Profile> = Vec::with_capacity(list.len());
+    for id in ids {
+        if let Some(pos) = list.iter().position(|p| p.id == *id) {
+            ordered.push(list.remove(pos));
+        }
+    }
+    // ids 里没提到的档位保持在后面，不丢
+    ordered.extend(list);
+    save_profiles(&ordered)?;
+    Ok(ordered)
+}
+
+pub fn profile_export_json_impl(id: &str) -> Result<String, String> {
+    let list = load_profiles();
+    let p = list.iter().find(|p| p.id == id).ok_or_else(|| format!("未找到场景档 {}", id))?;
+    serde_json::to_string_pretty(p).map_err(|e| format!("序列化失败：{}", e))
+}
+
+/// 导入一个档（JSON 字符串）。id 冲突时重新生成；match/auto 字段容错缺失。
+pub fn profile_import_impl(raw: &str) -> Result<Profile, String> {
+    let mut p: Profile = serde_json::from_str(raw).map_err(|e| format!("JSON 解析失败：{}", e))?;
+    let mut list = load_profiles();
+    if list.iter().any(|x| x.id == p.id) {
+        p.id = new_profile_id();
+    }
+    let ts = now_str();
+    p.created_at = ts.clone();
+    p.updated_at = ts;
+    list.push(p.clone());
+    save_profiles(&list)?;
+    Ok(p)
+}
+
+/// 应用一个档（平台实现负责步骤与回滚）
+pub fn profile_apply_impl(id: &str) -> Result<ApplyReport, String> {
+    let list = load_profiles();
+    let p = list.into_iter().find(|p| p.id == id).ok_or_else(|| format!("未找到场景档 {}", id))?;
+    profile_apply_platform(&p)
+}
+
+/// 全局快捷键用：应用第 idx 个（0 起）档位；不存在时静默忽略（热键不该弹错）
+pub fn profile_apply_by_index(idx: usize) {
+    let list = load_profiles();
+    if let Some(p) = list.get(idx) {
+        let id = p.id.clone();
+        let _ = profile_apply_impl(&id);
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn profile_capture_platform() -> Result<ProfileTargets, String> {
+    profile_capture_impl_platform()
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn profile_apply_platform(p: &Profile) -> Result<ApplyReport, String> {
+    profile_apply_impl_platform(p)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn profile_capture_platform() -> Result<ProfileTargets, String> {
+    Err("当前平台暂不支持场景档".to_string())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn profile_apply_platform(_p: &Profile) -> Result<ApplyReport, String> {
+    Err("当前平台暂不支持场景档".to_string())
+}
 
 #[cfg(test)]
 mod markdown_tests {

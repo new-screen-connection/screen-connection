@@ -475,6 +475,82 @@ async fn repair_action(
     .map_err(|e| format!("后台任务失败：{}", e))?
 }
 
+// ---------- 场景档 Profile（P0-5） ----------
+
+#[tauri::command]
+async fn profiles_list() -> Vec<platform::Profile> {
+    tauri::async_runtime::spawn_blocking(platform::profiles_list_impl)
+        .await
+        .unwrap_or_default()
+}
+
+/// 捕获当前全部显示状态为一个新档
+#[tauri::command]
+async fn profile_capture(name: String) -> Result<platform::Profile, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::profile_capture_impl(&name))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 应用一个档：失败可回滚，逐步回读核验
+#[tauri::command]
+async fn profile_apply(id: String) -> Result<platform::ApplyReport, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::profile_apply_impl(&id))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 更新档位：改名 / 重捕获 targets（「更新为当前状态」）/ 开关自动触发标记
+#[tauri::command]
+async fn profile_update(
+    id: String,
+    name: Option<String>,
+    recapture: Option<bool>,
+    auto: Option<bool>,
+) -> Result<platform::Profile, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        platform::profile_update_impl(
+            &id,
+            name.as_deref(),
+            recapture.unwrap_or(false),
+            auto,
+        )
+    })
+    .await
+    .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+#[tauri::command]
+async fn profile_delete(id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || platform::profile_delete_impl(&id))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 调整档位顺序（拖拽排序用）；ids 未覆盖的档保持在末尾不丢
+#[tauri::command]
+async fn profile_reorder(ids: Vec<String>) -> Result<Vec<platform::Profile>, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::profile_reorder_impl(&ids))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 导出一个档的 JSON（不含机器特定路径，可直接分享）
+#[tauri::command]
+async fn profile_export_json(id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::profile_export_json_impl(&id))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 导入一个档（JSON 字符串）；id 冲突自动重新生成
+#[tauri::command]
+async fn profile_import_json(json: String) -> Result<platform::Profile, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::profile_import_impl(&json))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
 /// 在资源管理器里打开日志目录
 #[tauri::command]
 fn open_log_dir() -> Result<(), String> {
@@ -1742,6 +1818,14 @@ pub fn run() {
             health_report,
             health_report_markdown,
             repair_action,
+            profiles_list,
+            profile_capture,
+            profile_apply,
+            profile_update,
+            profile_delete,
+            profile_reorder,
+            profile_export_json,
+            profile_import_json,
             health_get_config,
             health_set_config,
             get_notify_payload,
