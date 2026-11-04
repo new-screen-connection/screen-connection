@@ -120,6 +120,16 @@ body {
   background: transparent;
 }
 
+/* 图标按钮（主题模式键）：方形居中 */
+.p-btn.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  padding: 0;
+  color: var(--muted);
+}
+
 /* ── 滚动区 ───────────────────────── */
 .p-scroll {
   flex: 0 1 auto;

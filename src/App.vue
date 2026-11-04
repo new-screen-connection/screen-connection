@@ -2,6 +2,7 @@
 import { onMounted, ref } from 'vue';
 import { store } from './store';
 import { invoke, isTauri, listenEvent } from './api/tauri';
+import { currentTheme, initTheme, toggleTheme, type ThemeMode } from './theme';
 import Icon from './components/Icon.vue';
 import appIcon from './assets/app-icon.png';
 import OverviewView from './views/OverviewView.vue';
@@ -24,6 +25,13 @@ type ViewKey = keyof typeof views;
 const current = ref<ViewKey>('overview');
 
 const platformLabel = ref('检测中');
+
+// 白天 / 夜晚模式
+initTheme();
+const theme = ref<ThemeMode>(currentTheme());
+function flipTheme(): void {
+  theme.value = toggleTheme();
+}
 
 onMounted(async () => {
   store.platform = await invoke<string>('get_platform');
@@ -63,11 +71,22 @@ onMounted(async () => {
       </nav>
 
       <div class="side-foot">
-        <span class="side-tag">
-          <span class="dot" :class="{ mock: !isTauri() }"></span>
-          {{ isTauri() ? '已连接后端' : '浏览器预览' }}
-        </span>
-        <span class="side-tag">{{ platformLabel }}</span>
+        <div class="side-foot-row">
+          <span
+            class="side-tag"
+            :title="isTauri() ? '已连接后端' : '浏览器预览（模拟数据）'"
+          >
+            <span class="dot" :class="{ mock: !isTauri() }"></span>
+            {{ platformLabel }}
+          </span>
+          <button
+            class="theme-toggle"
+            :title="theme === 'dark' ? '切换白天模式' : '切换夜晚模式'"
+            @click="flipTheme"
+          >
+            <Icon :name="theme === 'dark' ? 'moon' : 'sun'" :size="15" />
+          </button>
+        </div>
       </div>
     </aside>
 

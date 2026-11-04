@@ -140,6 +140,34 @@ body {
   color: var(--faint);
 }
 
+.side-foot-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--faint);
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+  flex: none;
+}
+
+.theme-toggle:hover {
+  color: var(--accent-strong);
+  background: var(--accent-dim);
+}
+
 .dot {
   width: 6px;
   height: 6px;

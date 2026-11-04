@@ -1,4 +1,7 @@
-:root {
+/* 主题令牌：默认夜晚，:root[data-theme='light'] 覆盖为白天。
+   切换由 theme.ts 在 <html> 上写 data-theme，不再跟随系统。 */
+:root,
+:root[data-theme='dark'] {
   /* 色板与官网 screenguard 站点保持一致 */
   --bg: #101526;
   --bg-sidebar: #121830;
@@ -21,23 +24,20 @@
   --mono: 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;
 }
 
-@media (prefers-color-scheme: light) {
-  :root {
-    --bg: #f2f5fc;
-    --bg-sidebar: #e9edf8;
-    --panel: #ffffff;
-    --panel-2: #f3f6fd;
-    --border: #dfe5f3;
-    --border-soft: #e8edf7;
-    --text: #1c2440;
-    --muted: #5f6b8a;
-    --faint: #97a1ba;
-    --accent: #5578e8;
-    --accent-strong: #4064d8;
-    --accent-dim: rgba(85, 120, 232, 0.1);
-    --ok: #2fae8b;
-    --warn: #e8a356;
-    --err: #e05c5c;
-  }
+:root[data-theme='light'] {
+  --bg: #f2f5fc;
+  --bg-sidebar: #e9edf8;
+  --panel: #ffffff;
+  --panel-2: #f3f6fd;
+  --border: #dfe5f3;
+  --border-soft: #e8edf7;
+  --text: #1c2440;
+  --muted: #5f6b8a;
+  --faint: #97a1ba;
+  --accent: #5578e8;
+  --accent-strong: #4064d8;
+  --accent-dim: rgba(85, 120, 232, 0.1);
+  --ok: #2fae8b;
+  --warn: #e8a356;
+  --err: #e05c5c;
 }
-

@@ -5,7 +5,9 @@
   "identifier": "com.nanyu.screenguard",
   "build": {
     "frontendDist": "../dist",
-    "devUrl": "http://localhost:5173"
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
   },
   "app": {
     "withGlobalTauri": true,
@@ -83,7 +85,8 @@
         "languages": [
           "SimpChinese",
           "English"
-        ]
+        ],
+        "installerHooks": "./installer-hooks.nsh"
       }
     }
   }

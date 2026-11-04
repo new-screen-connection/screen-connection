@@ -7,8 +7,10 @@
 import { computed, nextTick, onMounted, ref } from 'vue';
 import { invoke, isTauri, listenEvent, errText } from '../api/tauri';
 import { sendVCP } from '../api/vcp';
+import { currentTheme, toggleTheme, type ThemeMode } from '../theme';
 import type { DisplayInfo, SystemAudio } from '../types';
 import ChatPanel from '../components/ChatPanel.vue';
+import Icon from '../components/Icon.vue';
 import appIcon from '../assets/app-icon.png';
 
 interface PowerRow {
@@ -20,6 +22,12 @@ interface PowerRow {
 
 const version = ref('');
 const status = ref('');
+
+// 白天 / 夜晚模式
+const theme = ref<ThemeMode>(currentTheme());
+function flipTheme(): void {
+  theme.value = toggleTheme();
+}
 const statusOk = ref(true);
 const statusTimer = ref<ReturnType<typeof setTimeout> | null>(null);
 
@@ -274,6 +282,9 @@ onMounted(async () => {
         <strong>屏幕连接助手</strong>
       </div>
       <div class="p-head-btns">
+        <button class="p-btn ghost icon-btn" :title="theme === 'dark' ? '切换白天模式' : '切换夜晚模式'" @click="flipTheme">
+          <Icon :name="theme === 'dark' ? 'moon' : 'sun'" :size="14" />
+        </button>
         <button class="p-btn ghost" title="打开主窗口" @click="openMain">主窗</button>
         <button class="p-btn ghost" title="收起面板" @click="hidePanel">收起</button>
       </div>

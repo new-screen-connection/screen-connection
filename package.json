@@ -14,7 +14,7 @@
     "tauri:build:win": "tauri build --bundles nsis"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.9.0",
+    "@tauri-apps/api": "^2.11.1",
     "vue": "^3.5.13"
   },
   "devDependencies": {
