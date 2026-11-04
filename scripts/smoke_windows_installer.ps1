@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Parameter(Mandatory = $true)]
   [string]$InstallerPath
 )
@@ -6,7 +6,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $installer = (Resolve-Path -LiteralPath $InstallerPath).Path
 $installDir = Join-Path $env:RUNNER_TEMP ("screenguard-smoke-" + [guid]::NewGuid().ToString('N'))
-$appExe = Join-Path $installDir 'screenguard.exe'
+# 主程序文件名跟随 productName（当前为中文“屏幕连接助手.exe”），不硬编码，按“目录里唯一的非卸载器 exe”识别
+$appExe = $null
 $appProcess = $null
 $uninstaller = $null
 $uninstalled = $false
@@ -34,9 +35,13 @@ try {
   # Tauri NSIS supports /S for silent mode, /NS to suppress shortcuts, and /D=... as the final argument.
   Invoke-WaitedProcess -FilePath $installer -ArgumentList @('/S', '/NS', "/D=$installDir") -Label 'NSIS 安装'
 
-  if (-not (Test-Path -LiteralPath $appExe -PathType Leaf)) {
-    throw "安装完成后找不到主程序：$appExe"
+  $appExeItem = Get-ChildItem -LiteralPath $installDir -Filter '*.exe' -File |
+    Where-Object { $_.Name -notmatch '(?i)^uninstall.*\.exe$' } |
+    Select-Object -First 1
+  if (-not $appExeItem) {
+    throw "安装完成后找不到主程序（目录中无非卸载器 exe）：$installDir"
   }
+  $appExe = $appExeItem.FullName
   if ((Get-Item -LiteralPath $appExe).Length -le 0) {
     throw "安装后的主程序文件为空：$appExe"
   }

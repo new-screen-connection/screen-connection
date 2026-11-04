@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "ScreenConnection",
+  "productName": "屏幕连接助手",
   "version": "0.3.0",
   "identifier": "com.nanyu.screenguard",
   "build": {
@@ -68,6 +68,10 @@
     "longDescription": "屏幕连接助手（ScreenConnection）：跨平台显示器控制与多屏助手。DDC/CI 亮度音量、色彩同步、副屏横竖切换、双屏铺满看电影、开机自启。",
     "license": "MIT",
     "licenseFile": "../LICENSE",
+    "macOS": {
+      "signingIdentity": "-",
+      "entitlements": "entitlements.plist"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

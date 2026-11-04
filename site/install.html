@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101526">
+  <meta name="description" content="屏幕连接助手安装引导：macOS 与 Windows 首次运行放行步骤、SHA-256 校验方法。">
+  <title>安装引导 · 屏幕连接助手</title>
+  <link rel="icon" type="image/png" href="./icon.png">
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #f5f7ff;
+      --muted: #aeb7cf;
+      --soft: #727e9c;
+      --bg: #101526;
+      --panel: #171f34;
+      --line: rgba(193, 207, 255, .14);
+      --blue: #6b8cff;
+      --mint: #99e0cc;
+      --orange: #ffc07a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--bg);
+      font: 16px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    }
+    a { color: #9eb1ff; }
+    a:focus-visible, button:focus-visible { outline: 3px solid var(--mint); outline-offset: 3px; }
+    .wrap { width: min(880px, calc(100% - 40px)); margin-inline: auto; }
+    header { padding: 46px 0 10px; }
+    .brand { display: inline-flex; align-items: center; gap: 11px; text-decoration: none; color: var(--ink); font-weight: 700; font-size: 16px; }
+    .brand img { width: 34px; height: 34px; border-radius: 10px; }
+    h1 { margin: 26px 0 10px; font-size: clamp(30px, 5vw, 42px); letter-spacing: -.04em; line-height: 1.15; }
+    .lead { color: var(--muted); max-width: 620px; margin: 0; }
+    section { margin: 26px 0 34px; }
+    .card { padding: 24px 26px; border: 1px solid var(--line); border-radius: 16px; background: linear-gradient(155deg, #192239, #151b2c); }
+    .card h2 { margin: 0 0 6px; font-size: 20px; letter-spacing: -.02em; }
+    .card > p { margin: 0 0 14px; color: var(--muted); font-size: 14px; }
+    .tag { display: inline-block; margin-bottom: 12px; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; letter-spacing: .06em; }
+    .tag.mac { color: var(--mint); background: #70d8b21f; }
+    .tag.win { color: var(--blue); background: #7c95ff22; }
+    .tag.sha { color: var(--orange); background: #ffbd701f; }
+    .steps { margin: 0; padding: 0; list-style: none; display: grid; gap: 12px; }
+    .steps li { padding: 13px 15px; border: 1px solid var(--line); border-radius: 12px; background: #11182a8a; font-size: 14px; }
+    .steps b { display: block; margin-bottom: 3px; font-size: 14px; }
+    .steps span { color: var(--muted); font-size: 13px; }
+    .cmd { display: flex; align-items: stretch; gap: 0; margin-top: 9px; border: 1px solid #3c4765; border-radius: 10px; overflow: hidden; }
+    code { flex: 1; padding: 10px 13px; font: 13px/1.5 ui-monospace, "Cascadia Code", Consolas, monospace; color: #cfe0ff; background: #0c1220; overflow-x: auto; white-space: pre; }
+    .copy { flex: none; padding: 0 15px; border: 0; border-left: 1px solid #3c4765; color: var(--ink); background: #28334d; font-size: 12px; font-weight: 700; cursor: pointer; }
+    .copy:hover { background: #33405e; }
+    .copy.done { color: var(--mint); }
+    .note { margin-top: 13px; padding: 12px 15px; border: 1px solid #ffc07a44; border-radius: 11px; color: #e6c59e; background: #ffc07a0c; font-size: 13px; }
+    .hashes { display: grid; gap: 9px; margin-top: 14px; }
+    .hash-row { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 12px; padding: 11px 14px; border: 1px solid var(--line); border-radius: 11px; background: #11182a8a; font-size: 13px; }
+    .hash-row .name { font-family: ui-monospace, Consolas, monospace; word-break: break-all; }
+    .hash-row a { flex: none; font-size: 12px; font-weight: 700; text-decoration: none; padding: 6px 11px; border-radius: 8px; background: #28334d; color: var(--ink); }
+    .hash-row a:hover { background: #33405e; }
+    .status { display: inline-flex; align-items: center; gap: 7px; min-height: 1.5em; color: var(--soft); font-size: 12px; }
+    .status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: #8a96b2; }
+    .status[data-state="ok"]::before { background: var(--mint); }
+    .status[data-state="error"]::before { background: var(--orange); }
+    .why { margin: 14px 0 0; color: var(--muted); font-size: 13px; }
+    footer { margin-top: 30px; padding: 22px 0 40px; border-top: 1px solid var(--line); color: var(--soft); font-size: 12px; }
+    @media (max-width: 560px) {
+      .wrap { width: calc(100% - 28px); }
+      .card { padding: 18px 16px; }
+      .hash-row { grid-template-columns: 1fr; }
+      .hash-row a { justify-self: start; }
+      code { font-size: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <a class="brand" href="./index.html"><img src="./icon.png" alt=""><span>屏幕连接助手</span></a>
+      <h1>安装与首次运行</h1>
+      <p class="lead">这个应用没有做付费签名/公证：Windows 正在接入开源免费签名通道，macOS 因未购买每年 $99 的开发者账号而不做 Apple 公证。这不会让你的电脑更危险，但系统会让你多走一步——下面每条路都只需要一次。</p>
+    </header>
+
+    <section>
+      <div class="card">
+        <span class="tag mac">macOS</span>
+        <h2>首次打开被拦下了</h2>
+        <p>系统会提示「无法验证开发者」或「未验证的开发者」。这是未公证应用的正常提示，三种方式任选其一：</p>
+        <ul class="steps">
+          <li><b>方式一：右键打开（最简单）</b><span>在「应用程序」里按住 Control 点按（或右键）应用图标，选「打开」，再在弹窗里点「打开」。</span></li>
+          <li><b>方式二：系统设置放行</b><span>打开「系统设置 → 隐私与安全性」，向下找到关于本应用被拦的提示，点「仍要打开」。</span></li>
+          <li><b>方式三：终端命令</b><span>复制下面这条命令到「终端」回车执行，去掉网络下载标记：</span>
+            <div class="cmd"><code id="cmd-mac">xattr -dr com.apple.quarantine "/Applications/屏幕连接助手.app"</code><button class="copy" data-copy="cmd-mac" type="button">复制</button></div>
+          </li>
+        </ul>
+        <p class="why">为什么更新后「辅助功能」授权又失效了？ad-hoc 签名的应用每次更新后，系统里的旧授权可能失效——这是未公证应用更新后的正常现象，不是出了故障。删掉「系统设置 → 隐私与安全性 → 辅助功能」里的旧条目，重新添加一次即可。应用检测到这种情况时也会主动弹出说明。</p>
+      </div>
+    </section>
+
+    <section>
+      <div class="card">
+        <span class="tag win">Windows</span>
+        <h2>SmartScreen 提示「未知发布者」</h2>
+        <p>点击「更多信息 → 仍要运行」即可继续安装。这只影响来自网络的安装包标记，不改系统安全设置。如果按钮被卡住或想提前解除标记：</p>
+        <div class="cmd"><code id="cmd-win">Get-ChildItem "C:\Users\你\Downloads" -Recurse | Unblock-File</code><button class="copy" data-copy="cmd-win" type="button">复制</button></div>
+        <p class="why">把上面路径里的 <code style="padding:1px 5px;background:#0c1220;border-radius:5px;">C:\Users\你\Downloads</code> 换成安装包实际所在文件夹。该命令只移除「来自网络」的标记（Zone.Identifier），不会修改任何系统安全设置。</p>
+      </div>
+    </section>
+
+    <section>
+      <div class="card">
+        <span class="tag sha">校验</span>
+        <h2>核对 SHA-256</h2>
+        <p>只从官方 GitHub Releases 下载安装包。下载后建议核对哈希值，确认文件完整、来源正确：</p>
+        <div class="hashes" id="hash-list"><p class="status" id="hash-status" aria-live="polite">正在读取最新 Release 的校验文件…</p></div>
+        <p class="why">校验命令（在终端/PowerShell 里执行，把文件名换成你下载的那个）：</p>
+        <div class="cmd"><code id="cmd-sha-mac">shasum -a 256 ~/Downloads/ScreenConnection_x.y.z_x64-setup.exe</code><button class="copy" data-copy="cmd-sha-mac" type="button">复制</button></div>
+        <div class="cmd"><code id="cmd-sha-win">Get-FileHash "C:\Users\你\Downloads\ScreenConnection_x.y.z_x64-setup.exe" -Algorithm SHA256</code><button class="copy" data-copy="cmd-sha-win" type="button">复制</button></div>
+        <p class="why">计算结果与 .sha256 文件里的值一致（不区分大小写）就说明文件没被篡改。</p>
+      </div>
+    </section>
+
+    <footer>屏幕连接助手 · 开源项目（MIT）· <a href="https://github.com/new-screen-connection/screen-connection/releases">GitHub Releases</a> · <a href="https://github.com/new-screen-connection/screen-connection/blob/main/docs/SIGNING.md">签名策略</a></footer>
+  </div>
+
+  <script>
+    (() => {
+      // 一键复制：优先 navigator.clipboard，失败回退 textarea + execCommand
+      document.querySelectorAll(".copy").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const text = document.getElementById(btn.dataset.copy).textContent;
+          const done = () => {
+            btn.textContent = "已复制";
+            btn.classList.add("done");
+            setTimeout(() => { btn.textContent = "复制"; btn.classList.remove("done"); }, 2000);
+          };
+          if (navigator.clipboard && window.isSecureContext) {
+            navigator.clipboard.writeText(text).then(done).catch(() => fallback(text, done));
+          } else {
+            fallback(text, done);
+          }
+        });
+      });
+      function fallback(text, done) {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        try {
+          document.execCommand("copy");
+          done();
+        } catch (err) {
+          alert("复制失败，请手动选中命令文本复制。");
+        }
+        document.body.removeChild(ta);
+      }
+
+      // SHA-256 校验文件直接从 GitHub Release 读取，不在页面里硬编码会过期的值
+      const repo = "new-screen-connection/screen-connection";
+      const list = document.getElementById("hash-list");
+      const status = document.getElementById("hash-status");
+      fetch(`https://api.github.com/repos/${repo}/releases/latest`, { headers: { Accept: "application/vnd.github+json" } })
+        .then((r) => { if (!r.ok) throw new Error("release unavailable"); return r.json(); })
+        .then((release) => {
+          const files = (release.assets || []).filter((a) => /\.sha256$/i.test(a.name));
+          if (!files.length) throw new Error("no hash assets");
+          list.innerHTML = "";
+          files.forEach((a) => {
+            const row = document.createElement("div");
+            row.className = "hash-row";
+            const name = document.createElement("div");
+            name.className = "name";
+            name.textContent = a.name;
+            const link = document.createElement("a");
+            link.href = a.browser_download_url;
+            link.textContent = "打开校验文件";
+            row.appendChild(name);
+            row.appendChild(link);
+            list.appendChild(row);
+          });
+          const meta = document.createElement("p");
+          meta.className = "why";
+          meta.textContent = `以上为 ${release.tag_name} 的校验文件，点开即可看到对应安装包的 SHA-256 值。`;
+          list.appendChild(meta);
+          status.remove();
+        })
+        .catch(() => {
+          status.dataset.state = "error";
+          status.textContent = "暂时读不到校验文件，请直接到 GitHub Release 页面查看附件。";
+        });
+    })();
+  </script>
+</body>
+</html>

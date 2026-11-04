@@ -77,6 +77,8 @@ jobs:
             exit 1
           fi
           hdiutil verify "${dmg_files[0]}"
+      - name: 标记签名状态
+        run: echo "[sign] 未配置 Apple Developer ID 签名，本次 macOS 产物为 ad-hoc 签名（未公证），首次打开需手动放行。"
       - name: 生成安装包与 SHA-256
         shell: bash
         run: |
@@ -84,7 +86,7 @@ jobs:
           shopt -s nullglob
           files=(src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg)
           test "${#files[@]}" -eq 1
-          name="Screenguard_${GITHUB_REF_NAME#v}_${{ matrix.arch }}.dmg"
+          name="ScreenConnection_${GITHUB_REF_NAME#v}_${{ matrix.arch }}.dmg"
           cp "${files[0]}" "release-assets/$name"
           (
             cd release-assets
@@ -155,17 +157,39 @@ jobs:
           New-Item -ItemType Directory -Force release-assets | Out-Null
           $files = @(Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe)
           if ($files.Count -ne 1) { throw "Expected one NSIS installer, found $($files.Count)" }
-          $name = "Screenguard_$($env:GITHUB_REF_NAME.TrimStart('v'))_x64-setup.exe"
+          $name = "ScreenConnection_$($env:GITHUB_REF_NAME.TrimStart('v'))_x64-setup.exe"
           $dest = Join-Path release-assets $name
           Copy-Item $files[0].FullName $dest
           $hash = (Get-FileHash $dest -Algorithm SHA256).Hash.ToLowerInvariant()
           [System.IO.File]::WriteAllText(($dest + '.sha256'), "$hash  $name`n", [System.Text.Encoding]::ASCII)
+      - name: 标记签名状态
+        shell: pwsh
+        run: echo "[sign] 未配置代码签名，本次 Windows 产物为未签名版本；接入 SignPath Foundation 后由 sign-windows-installer 任务签名。"
       - uses: actions/upload-artifact@v4
         with:
           name: release-windows-x64
           path: release-assets/*
           if-no-files-found: error
           retention-days: 7
+
+  sign-windows-installer:
+    name: SignPath 云签名（默认跳过）
+    runs-on: ubuntu-24.04
+    needs: [package-windows]
+    if: startsWith(github.ref, 'refs/tags/v') && vars.SIGNPATH_ENABLED == 'true'
+    steps:
+      - name: 发起 SignPath 签名请求（占位，未接入真实参数前直接失败）
+        run: |
+          echo "[sign] vars.SIGNPATH_ENABLED 已开启，进入 SignPath 接入点。"
+          echo "[sign] 注意：签名请求需要在 SignPath 后台人工批准，无法全自动通过。"
+          # TODO: 申请通过 SignPath Foundation 后替换以下三项，并配置 secret SIGNPATH_API_TOKEN：
+          #   1. SignPath organization id
+          #   2. project slug
+          #   3. artifact configuration id
+          # 使用 SignPath 提供的官方 GitHub Action 提交签名请求，
+          # 对 package-windows 产出的 NSIS 安装包做后置云签名（私钥在 SignPath HSM，无需本地证书）。
+          # 不要在 workflow 里硬编码任何凭据；未配置 secret 时构建必须照常产出未签名产物。
+          exit 1
 
   create-draft-release:
     name: Create or update GitHub draft release
@@ -204,12 +228,15 @@ jobs:
           本草稿仅在 tag 已合入 main 且 macOS 与 Windows 安装包构建完成后生成。
 
           附件包含 Apple Silicon 与 Intel macOS DMG、Windows x64 NSIS 安装包及 SHA-256 校验文件。
+          校验方法与首次运行放行步骤见安装引导页：https://new-screen-connection.github.io/screen-connection/install.html
 
-          不使用 Apple Developer ID 或 Windows Authenticode 证书，也不提交 Apple 公证。macOS 首次打开可能需要用户在系统安全提示中手动允许；Windows 可能显示未知发布者/SmartScreen 提示。发布前仍需人工确认双平台真实设备验收、安装升级卸载和回滚路径；Draft 不代表公开发行或实机验收完成。
+          签名策略：macOS 为 ad-hoc 签名（未公证，首次打开需手动放行，更新后辅助功能授权可能需要重新添加）；
+          Windows 产物默认未签名（SmartScreen 可能提示未知发布者），SignPath Foundation 免费签名通道接入后自动替换为已签名产物。
+          发布前仍需人工确认双平台真实设备验收、安装升级卸载和回滚路径；Draft 不代表公开发行或实机验收完成。
           NOTES
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" release-assets/* --clobber
-            gh release edit "$TAG" --draft --title "Screenguard $TAG" --notes-file "$notes"
+            gh release edit "$TAG" --draft --title "屏幕连接助手 $TAG" --notes-file "$notes"
           else
-            gh release create "$TAG" release-assets/* --draft --verify-tag --title "Screenguard $TAG" --notes-file "$notes"
+            gh release create "$TAG" release-assets/* --draft --verify-tag --title "屏幕连接助手 $TAG" --notes-file "$notes"
           fi

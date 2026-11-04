@@ -1,3 +1,6 @@
+> 注意：本文记录的是旧仓库（Personalscreenguard/screenguard，产品名「屏幕守护」）时期的
+> 发布流程与历史验收快照，仅供追溯。当前签名与分发策略以 [docs/SIGNING.md](SIGNING.md) 为准。
+
 # Screenguard 桌面端交付状态与发布流程
 
 ## 发布策略更新（2026-10-20）

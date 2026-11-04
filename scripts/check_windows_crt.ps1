@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$ExecutablePath = 'src-tauri/target/release/screenguard.exe'
 )
 

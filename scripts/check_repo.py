@@ -1,8 +1,8 @@
-"""screenguard 仓库自检（跨平台，CI 友好）：
+"""screen-connection 仓库自检（跨平台，CI 友好）：
   ① 三处版本号一致（Cargo.toml / tauri.conf.json / package.json）
   ② JSON 文件可解析且能被读到关键字段
-  ③ tauri.conf.json 引用的 LICENSE / 图标存在
-  ④ ui/*.js 与 ui/*.html 内联 <script> 语法检查（node --check）
+  ③ tauri.conf.json 引用的 LICENSE / 图标存在，品牌与签名配置符合当前策略
+  ④ 前端内联 <script> 语法检查（node --check）
      —— 经典脚本里出现顶层 await 会直接报语法错误，
         正是 v0.2.4 修掉的「面板整段脚本失效」那类 bug 的回归防线
 
@@ -23,7 +23,9 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-UI = os.path.join(ROOT, "ui")
+SRC = os.path.join(ROOT, "src")
+TOP_HTML = ("index.html", "panel.html", "notify.html", "panel-legacy.html")
+PRODUCT_NAME = "屏幕连接助手"
 INLINE_RE = re.compile(r"<script(?P<attrs>[^>]*)>(?P<code>.*?)</script>", re.S)
 
 
@@ -38,7 +40,7 @@ def ok(msg):
 
 
 def check_versions():
-    print("[1/6] 版本一致性")
+    print("[1/7] 版本一致性")
     good = True
     cargo = open(os.path.join(ROOT, "src-tauri", "Cargo.toml"), encoding="utf-8").read()
     m = re.search(r'^version\s*=\s*"([^"]+)"', cargo, re.M)
@@ -60,7 +62,7 @@ def check_versions():
 
 
 def check_bundle_refs():
-    print("[2/6] tauri.conf.json 引用与 Windows WebView2 打包模式")
+    print("[2/7] tauri.conf.json 引用与 Windows WebView2 打包模式")
     conf = json.load(open(os.path.join(ROOT, "src-tauri", "tauri.conf.json"), encoding="utf-8"))
     good = True
     webview_mode = conf.get("bundle", {}).get("windows", {}).get("webviewInstallMode", {}).get("type")
@@ -83,7 +85,7 @@ def check_bundle_refs():
 
 def check_single_app_dependencies():
     """Protect the promise that supported display controls ship with Screenguard."""
-    print("[3/6] 单应用依赖与随包组件")
+    print("[3/7] 单应用依赖与随包组件")
     good = True
 
     package = json.load(open(os.path.join(ROOT, "package.json"), encoding="utf-8"))
@@ -111,13 +113,13 @@ def check_single_app_dependencies():
     else:
         ok("arm64 与 x64 displayplacer 均固定 SHA-256")
 
-    runtime_roots = [os.path.join(ROOT, "src-tauri", "src"), UI]
+    runtime_roots = [os.path.join(ROOT, "src-tauri", "src"), SRC]
     runtime_files = []
     for directory in runtime_roots:
         for current, _, names in os.walk(directory):
             runtime_files.extend(
                 os.path.join(current, name) for name in names
-                if name.endswith((".rs", ".js", ".html"))
+                if name.endswith((".rs", ".js", ".html", ".ts", ".vue"))
             )
     references = [
         os.path.relpath(path, ROOT) for path in runtime_files
@@ -154,25 +156,35 @@ def node_check(label, code):
 
 
 def check_js():
-    print("[4/6] 前端 JS 语法（node --check；临时文件按 CommonJS 解析，顶层 await 会报错）")
+    print("[4/7] 前端内联脚本语法（node --check；临时文件按 CommonJS 解析，顶层 await 会报错）")
     if not node_available():
         print("  ⚠️ node 不可用，跳过（CI 中会执行此检查）")
         return True
     good = True
     n = 0
-    for name in sorted(os.listdir(UI)):
-        p = os.path.join(UI, name)
-        if name.endswith(".js"):
-            n += 1
-            good = node_check(name, open(p, encoding="utf-8").read()) and good
-        elif name.endswith(".html"):
-            src = open(p, encoding="utf-8").read()
-            for i, m in enumerate(INLINE_RE.finditer(src)):
+    html_files = [name for name in TOP_HTML if os.path.exists(os.path.join(ROOT, name))]
+    js_files = []
+    for current, _, names in os.walk(SRC):
+        js_files.extend(
+            os.path.join(current, name) for name in names if name.endswith(".js")
+        )
+    for label, code in [
+        *( (os.path.relpath(p, ROOT), open(p, encoding="utf-8").read()) for p in js_files ),
+        *(
+            (name, open(os.path.join(ROOT, name), encoding="utf-8").read())
+            for name in html_files
+        ),
+    ]:
+        if label.endswith(".html"):
+            for i, m in enumerate(INLINE_RE.finditer(code)):
                 attrs = m.group("attrs")
                 if "src=" in attrs:  # 外链脚本不内联检查
                     continue
                 n += 1
-                good = node_check(f"{name} 第{i + 1}个内联<script>", m.group("code")) and good
+                good = node_check(f"{label} 第{i + 1}个内联<script>", m.group("code")) and good
+        else:
+            n += 1
+            good = node_check(label, code) and good
     if good:
         ok(f"共检查 {n} 段脚本，语法全部通过")
     return good
@@ -180,7 +192,7 @@ def check_js():
 
 def check_csharp_quote():
     """windows.rs 的 CORE_CS 内不允许出现单引号（PS 单引号包裹会截断）——与 check_cs.py 同规则的前置防线"""
-    print("[5/6] windows.rs CORE_CS 单引号检查")
+    print("[5/7] windows.rs CORE_CS 单引号检查")
     src = open(os.path.join(ROOT, "src-tauri", "src", "platform", "windows.rs"), encoding="utf-8").read()
     m = re.search(r'const CORE_CS: &str = r#"(.*?)"#;', src, re.S)
     if not m:
@@ -192,7 +204,7 @@ def check_csharp_quote():
 
 def check_release_architectures():
     """Both supported Mac architectures must be included in the signed release workflow."""
-    print("[6/6] 正式发布架构")
+    print("[6/7] 正式发布架构")
     path = os.path.join(ROOT, ".github", "workflows", "release.yml")
     release = open(path, encoding="utf-8").read()
     required = ("aarch64-apple-darwin", "x86_64-apple-darwin", "release-macos-${{ matrix.arch }}")
@@ -202,12 +214,46 @@ def check_release_architectures():
     return ok("正式发布包含 Apple Silicon 与 Intel 两种 Mac DMG")
 
 
+def check_brand_signing():
+    """品牌统一与零成本签名策略的配置守护（P0-0）"""
+    print("[7/7] 品牌统一与签名配置")
+    good = True
+    conf = json.load(open(os.path.join(ROOT, "src-tauri", "tauri.conf.json"), encoding="utf-8"))
+    product = conf.get("productName")
+    if product == PRODUCT_NAME:
+        ok(f"productName = {product}（用户可见名与安装名统一）")
+    else:
+        good = fail(f"productName 应为 {PRODUCT_NAME!r}，当前 {product!r}") and good
+    identifier = conf.get("identifier")
+    if identifier == "com.nanyu.screenguard":
+        ok("identifier 保持 com.nanyu.screenguard（macOS 辅助功能授权连续性）")
+    else:
+        good = fail(f"identifier 不允许改动，当前 {identifier!r}") and good
+    macos = conf.get("bundle", {}).get("macOS", {})
+    if macos.get("signingIdentity") == "-":
+        ok("macOS signingIdentity = -（ad-hoc 签名，避免 Apple Silicon 报「应用已损坏」）")
+    else:
+        good = fail(f"macOS signingIdentity 应缺省为 '-'，当前 {macos.get('signingIdentity')!r}") and good
+    entitlements = macos.get("entitlements")
+    if entitlements and os.path.exists(os.path.join(ROOT, "src-tauri", entitlements)):
+        ok(f"macOS entitlements 存在: {entitlements}")
+    else:
+        good = fail(f"macOS entitlements 缺失或不存在: {entitlements}") and good
+    hooks = conf.get("bundle", {}).get("windows", {}).get("nsis", {}).get("installerHooks")
+    if hooks and os.path.exists(os.path.join(ROOT, "src-tauri", hooks)):
+        ok(f"NSIS installerHooks 存在: {hooks}")
+    else:
+        good = fail(f"NSIS installerHooks 缺失或不存在: {hooks}") and good
+    return good
+
+
 def main():
     print("=" * 60)
-    print("screenguard 仓库自检")
+    print("screen-connection 仓库自检")
     print("=" * 60)
     good = all([check_versions(), check_bundle_refs(), check_single_app_dependencies(),
-                check_js(), check_csharp_quote(), check_release_architectures()])
+                check_js(), check_csharp_quote(), check_release_architectures(),
+                check_brand_signing()])
     print("=" * 60)
     print("✅ 全部通过" if good else "❌ 存在问题")
     sys.exit(0 if good else 1)
