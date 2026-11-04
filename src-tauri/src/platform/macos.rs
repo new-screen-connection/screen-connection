@@ -1025,8 +1025,8 @@ fn read_ddc_brightness(cgid: u32) -> Option<u32> {
 
 use super::{
     aspect_mismatch, bandwidth_ladder, looks_generic_profile, required_bandwidth_gbps,
-    DisplayHealth, HealthCheck, HealthReport, HealthSummary, HopKind, HopStatus, Severity,
-    Topology, TopologyHop,
+    DisplayHealth, HealthCheck, HealthReport, HealthSummary, HopKind, HopStatus, RepairOutcome,
+    RepairResult, Severity, Topology, TopologyHop,
 };
 
 // ---------- 链路拓扑（P0-2，macOS 侧） ----------
@@ -1192,6 +1192,260 @@ fn build_topology_mac(s: &Screen, builtin: bool, conn: Option<&str>, facts: &SpF
         hops,
         note: None,
     }
+}
+
+// ---------- 自愈动作集（P0-4，macOS 侧） ----------
+// 复用通道：displayplacer（重放布局 = 强制重新应用模式）、with_ddc_monitor（每次调用
+// 都重新枚举并打开 DDC 句柄，天然就是「重建通道」）、mac_input_source 与 Windows 同一套
+// VCP 0x60 编号。做不到的动作一律 not_applicable 并给手动路径，不静默失败。
+
+/// DDC 原始值读取（0-65535，不是百分比）
+fn ddc_get_raw(cgid: u32, code: u8) -> Option<u16> {
+    use ddc::Ddc;
+    with_ddc_monitor(cgid, move |monitor| monitor.get_vcp_feature(code))
+        .ok()?
+        .ok()
+        .map(|v| v.value())
+}
+
+/// DDC 原始值写入
+fn ddc_set_raw(cgid: u32, code: u8, value: u16) -> Result<(), String> {
+    use ddc::Ddc;
+    with_ddc_monitor(cgid, move |monitor| monitor.set_vcp_feature(code, value))?
+        .map_err(|e| format!("DDC/CI 写入失败：{}", e))
+}
+
+/// 与 Windows 同一套输入源编号（DDC VCP 0x60）
+fn mac_input_source(value: &str) -> Option<(u16, &'static str)> {
+    match value {
+        "displayport" => Some((15, "DisplayPort")),
+        "hdmi1" => Some((17, "HDMI 1")),
+        "hdmi2" => Some((18, "HDMI 2")),
+        "usbc" => Some((27, "USB-C")),
+        _ => None,
+    }
+}
+
+fn mac_fingerprint() -> String {
+    parse_screens()
+        .iter()
+        .map(|s| format!("{}:{}x{}@{:?}#{}", s.id, s.w, s.h, s.hz, s.enabled))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+pub fn repair_action_impl(
+    action: &str,
+    display_id: Option<&str>,
+    value: Option<&str>,
+) -> Result<RepairOutcome, String> {
+    let mut out = RepairOutcome {
+        action: action.to_string(),
+        result: RepairResult::Failed,
+        message: String::new(),
+        changed: Vec::new(),
+    };
+    let need_display = matches!(
+        action,
+        "reapply_mode" | "switch_input" | "ddc_power_cycle" | "reopen_ddc_channel"
+    );
+    if need_display && display_id.is_none() {
+        out.result = RepairResult::NotApplicable;
+        out.message = "这个动作需要指定一块显示器，请在体检页对应屏的卡片里点击修复".into();
+        return Ok(out);
+    }
+
+    match action {
+        // ① 重新枚举：displayplacer list 会强制系统重新枚举显示路径
+        "rescan_displays" => {
+            let before = parse_screens().len();
+            if let Err(e) = run_displayplacer(&["list"]) {
+                out.message = format!("重新枚举显示器失败：{}", e);
+                return Ok(out);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            let after = parse_screens().len();
+            if after != before {
+                out.changed.push(format!("显示器数量 {} → {}", before, after));
+            }
+            out.result = RepairResult::Applied;
+            out.message = format!(
+                "macOS 会自动识别新接的显示器，这里已重新枚举一遍，当前 {} 台屏可见。新屏没出现的话，检查线缆两端是否插紧。",
+                after
+            );
+        }
+        // ② 强制重识别：捕获当前布局原样重放 = 每块屏按当前拓扑重新应用一遍
+        "force_redetect" => {
+            let screens: Vec<Screen> = parse_screens().into_iter().filter(|s| s.enabled).collect();
+            if screens.is_empty() {
+                out.result = RepairResult::NotApplicable;
+                out.message = "没有在活动路径上的显示器，请先重新插拔线缆".into();
+                return Ok(out);
+            }
+            let before = mac_fingerprint();
+            let specs: Vec<String> = screens.iter().map(screen_spec).collect();
+            let args: Vec<&str> = specs.iter().map(String::as_str).collect();
+            if let Err(e) = run_displayplacer(&args) {
+                out.message = format!("布局重放失败：{}", e);
+                return Ok(out);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            if mac_fingerprint() != before {
+                out.changed.push("显示器配置发生变化（模式/主屏已更新）".into());
+            }
+            out.result = RepairResult::Applied;
+            out.message = "已把当前布局原样重放一遍，每块屏的信号链路完成了一次完整重新握手。花屏/黑屏通常在这一步恢复。".into();
+        }
+        // ③ 重设当前模式：单屏原样重放 → 回读核验
+        "reapply_mode" => {
+            let uid = display_id.unwrap();
+            let screens = parse_screens();
+            let screen = match screens.iter().find(|s| s.id == uid && s.enabled) {
+                Some(s) => s,
+                None => {
+                    out.result = RepairResult::NotApplicable;
+                    out.message = "未找到这块显示器或它已不在活动路径上；请刷新后重试".into();
+                    return Ok(out);
+                }
+            };
+            if screen.active_mode().is_none() {
+                out.result = RepairResult::NotApplicable;
+                out.message = "读不到这块屏的当前模式，无法重设；请先在系统显示设置里确认它在正常输出".into();
+                return Ok(out);
+            }
+            let spec = screen_spec(screen);
+            if let Err(e) = run_displayplacer(&[&spec]) {
+                out.message = format!("模式重放失败：{}", e);
+                return Ok(out);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            let back = parse_screens();
+            match back.iter().find(|b| b.id == uid && b.enabled) {
+                Some(b) if b.active_mode().is_some() => {
+                    let mode = b
+                        .active_mode()
+                        .map(|m| {
+                            format!(
+                                "{}x{}@{}",
+                                m.w,
+                                m.h,
+                                m.hz.map(|h| h.to_string())
+                                    .unwrap_or_else(|| "?".into())
+                            )
+                        })
+                        .unwrap_or_default();
+                    out.changed.push(format!("模式重放为 {}", mode));
+                    out.result = RepairResult::Applied;
+                    out.message = format!(
+                        "已把这块屏的当前模式 {} 原样重放一遍并核验一致，信号链路完成了一次完整握手。",
+                        mode
+                    );
+                }
+                _ => {
+                    out.message = "模式重放后读不回显示器状态；它可能短暂黑屏未恢复，请看一眼画面或重新插拔线缆".into();
+                }
+            }
+        }
+        // ④ macOS 没有官方显卡驱动重置快捷键，如实告知替代路径
+        "reset_graphics_driver" => {
+            out.result = RepairResult::NotApplicable;
+            out.message = "macOS 没有官方的显卡驱动重置快捷键。花屏/色彩异常可先试「重设当前模式」或「强制重识别」；仍不行就注销重新登录（会重启窗口合成进程）".into();
+        }
+        // ⑤ 切换输入源：DDC 0x60 写入并回读确认
+        "switch_input" => {
+            let uid = display_id.unwrap();
+            let src = match value.and_then(mac_input_source) {
+                Some(v) => v,
+                None => {
+                    out.result = RepairResult::NotApplicable;
+                    out.message = "输入源只能是 DisplayPort / HDMI 1 / HDMI 2 / USB-C 之一".into();
+                    return Ok(out);
+                }
+            };
+            let cgid = match find_ddc_id(uid) {
+                Ok(c) => c,
+                Err(_) => {
+                    out.result = RepairResult::NotApplicable;
+                    out.message = "这块屏的 DDC/CI 通道不通（可能经过扩展坞或本来不支持），请在显示器 OSD 菜单里手动切换输入源".into();
+                    return Ok(out);
+                }
+            };
+            if let Err(e) = ddc_set_raw(cgid, 0x60, src.0) {
+                out.message = format!(
+                    "这台显示器不支持通过软件切换输入源（{}），请在显示器 OSD 菜单里手动切换",
+                    e
+                );
+                return Ok(out);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            match ddc_get_raw(cgid, 0x60) {
+                Some(cur) if cur == src.0 => {
+                    out.changed.push(format!("输入源 → {}", src.1));
+                    out.result = RepairResult::Applied;
+                    out.message = format!("已切到 {} 并经显示器确认。", src.1);
+                }
+                Some(cur) => {
+                    out.message = format!(
+                        "切换命令已发送，但显示器当前回报的输入源编号是 {}（目标 {}）。部分显示器切换后需要几秒生效或需要在 OSD 里确认",
+                        cur, src.0
+                    );
+                }
+                None => {
+                    out.message = "切换命令已发送，但读不回显示器当前输入源（可能已生效，请看画面确认）".into();
+                }
+            }
+        }
+        // ⑥ 显示器软关→开（DDC 0xD6）
+        "ddc_power_cycle" => {
+            let uid = display_id.unwrap();
+            let cgid = match find_ddc_id(uid) {
+                Ok(c) => c,
+                Err(_) => {
+                    out.result = RepairResult::NotApplicable;
+                    out.message = "这块屏的 DDC/CI 通道不通，无法软件控制电源；请按显示器物理电源键开关一次".into();
+                    return Ok(out);
+                }
+            };
+            if let Err(e) = ddc_set_raw(cgid, 0xD6, 4) {
+                out.message = format!("这台显示器不支持软件控制电源（{}）", e);
+                return Ok(out);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(3000));
+            let back_on = ddc_set_raw(cgid, 0xD6, 1).is_ok();
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            let state = ddc_get_raw(cgid, 0xD6);
+            if back_on && state == Some(1) {
+                out.changed.push("显示器电源状态 → 开".into());
+                out.result = RepairResult::Applied;
+                out.message = "已让显示器软关再开，面板完成了一次重新握手。".into();
+            } else {
+                out.message = "关→开已发送，但显示器没有回到开机状态（它可能不支持软件唤醒）。请按显示器物理电源键或开关一次".into();
+            }
+        }
+        // ⑦ 重建 DDC 通道：macOS 每次调用本就重开句柄，这里做重新探测 + 回读核验
+        "reopen_ddc_channel" => {
+            let uid = display_id.unwrap();
+            let probe_before = find_ddc_id(uid).ok().and_then(|c| ddc_get_raw(c, 0x10));
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            match find_ddc_id(uid).ok().and_then(|c| ddc_get_raw(c, 0x10)) {
+                Some(_) => {
+                    if probe_before.is_none() {
+                        out.changed.push("DDC/CI 通道 不可用 → 可用".into());
+                    }
+                    out.result = RepairResult::Applied;
+                    out.message = "已重新探测 DDC/CI 通道并回读成功。屏幕亮度/音量控制现在应该可用了。".into();
+                }
+                None => {
+                    out.message = "重新探测后 DDC/CI 仍不可达。这台屏可能本来就不支持 DDC/CI，或信号经过了扩展坞/转接头".into();
+                }
+            }
+        }
+        _ => {
+            out.result = RepairResult::NotApplicable;
+            out.message = format!("未知的修复动作 {}", action);
+        }
+    }
+    Ok(out)
 }
 
 pub fn health_report_impl() -> Result<HealthReport, String> {

@@ -2,8 +2,8 @@
 import { onBeforeUnmount, onMounted, ref } from 'vue';
 import { invoke } from '../api/tauri';
 import { act, store } from '../store';
-import { CMD } from '../types';
-import type { DisplayHealth, HealthReport, HopKind, Severity } from '../types';
+import type { DisplayHealth, HealthReport, HopKind, RepairOutcome, RepairResult, Severity } from '../types';
+import { CMD, INPUT_SOURCES, REPAIR_LABELS } from '../types';
 import Card from '../components/Card.vue';
 import Icon from '../components/Icon.vue';
 
@@ -28,12 +28,17 @@ function sortChecks(list: DisplayHealth['checks']): DisplayHealth['checks'] {
   return [...list].sort((a, b) => SEV_ORDER[a.severity] - SEV_ORDER[b.severity] || a.id.localeCompare(b.id));
 }
 
+/** 拉取体检报告（不动展开状态；供刷新与修复后重跑共用） */
+async function loadReport(): Promise<void> {
+  const r = await invoke<HealthReport>(CMD.healthReport);
+  report.value = r;
+  loaded.value = true;
+}
+
 const refresh = (): void => {
   void act(async () => {
-    const r = await invoke<HealthReport>(CMD.healthReport);
-    report.value = r;
+    await loadReport();
     expanded.value = new Set();
-    loaded.value = true;
   }, '体检完成');
 };
 
@@ -119,6 +124,77 @@ function saveReport(): void {
     a.click();
     URL.revokeObjectURL(a.href);
   }, '报告已保存（不包含设备序列号）');
+}
+
+// ---------- 修复动作（P0-4）：逐个确认执行，成功后自动重跑体检 ----------
+
+/** key = `${display_id}:${check_id}` → 最近一次修复的就地结果 */
+const repairResults = ref<Record<string, RepairOutcome>>({});
+/** 当前打开确认/选择面板的 check 行 key（同一时刻只开一个） */
+const repairAsk = ref<string | null>(null);
+/** 待执行动作 id（确认面板用） */
+const repairPending = ref<string | null>(null);
+
+function fixLabel(id: string): string {
+  return REPAIR_LABELS[id]?.label ?? id;
+}
+
+function repairBadge(r: RepairResult): string {
+  return r === 'applied' ? '已执行' : r === 'not_applicable' ? '不适用' : '未成功';
+}
+
+function repairDesc(fix: string | null): string {
+  return fix ? (REPAIR_LABELS[fix]?.desc ?? '') : '';
+}
+
+/** 点修复按钮：switch_input 弹输入源选择（选择即确认），其余需确认的弹就地确认 */
+function askRepair(displayId: string, checkId: string, fix: string): void {
+  const key = `${displayId}:${checkId}`;
+  if (repairAsk.value === key) {
+    repairAsk.value = null;
+    repairPending.value = null;
+    return;
+  }
+  repairAsk.value = key;
+  repairPending.value = fix;
+}
+
+function cancelAsk(): void {
+  repairAsk.value = null;
+  repairPending.value = null;
+}
+
+function confirmRepair(displayId: string, checkId: string, fix: string): void {
+  cancelAsk();
+  void runRepair(displayId, checkId, fix);
+}
+
+/** 选输入源即视为确认（明确选择了目标源） */
+function pickInput(displayId: string, checkId: string, value: string): void {
+  cancelAsk();
+  void runRepair(displayId, checkId, 'switch_input', value);
+}
+
+async function runRepair(displayId: string, checkId: string, fix: string, value?: string): Promise<void> {
+  const key = `${displayId}:${checkId}`;
+  await act(async () => {
+    const o = await invoke<RepairOutcome>(CMD.repairAction, {
+      action: fix,
+      displayId,
+      value: value ?? null,
+    });
+    repairResults.value = { ...repairResults.value, [key]: o };
+    if (o.result === 'applied') {
+      // 成功后自动重跑体检；保持这条 check 展开，让用户看到回读核验到的新状态
+      await loadReport();
+      expanded.value = new Set([...expanded.value, key]);
+    }
+    return o;
+  }, (o: RepairOutcome) => {
+    if (o.result === 'applied') return `${fixLabel(fix)}已执行`;
+    if (o.result === 'not_applicable') return `${fixLabel(fix)}：当前环境不适用，原因见详情`;
+    return `${fixLabel(fix)}未成功，原因见详情`;
+  });
 }
 </script>
 
@@ -233,11 +309,63 @@ function saveReport(): void {
                 v-for="f in c.fix_ids"
                 :key="f"
                 class="btn sm"
-                disabled
-                :title="`修复动作 ${f}：待接入`"
+                :disabled="store.busy"
+                :title="REPAIR_LABELS[f]?.desc ?? f"
+                @click="askRepair(d.display_id, c.id, f)"
               >
-                <Icon name="wrench" :size="12" />修复（待接入）
+                <Icon name="wrench" :size="12" />{{ fixLabel(f) }}
               </button>
+            </div>
+
+            <!-- 切换输入源：选源即确认（明确选择目标源） -->
+            <div
+              v-if="repairAsk === d.display_id + ':' + c.id && repairPending === 'switch_input'"
+              class="repair-ask"
+            >
+              <p class="repair-ask-title">切换到哪个输入源？显示器会短暂重新握手。</p>
+              <div class="repair-actions">
+                <button
+                  v-for="s in INPUT_SOURCES"
+                  :key="s.value"
+                  class="btn sm"
+                  :disabled="store.busy"
+                  @click="pickInput(d.display_id, c.id, s.value)"
+                >
+                  {{ s.label }}
+                </button>
+                <button class="btn sm repair-cancel" :disabled="store.busy" @click="cancelAsk">取消</button>
+              </div>
+            </div>
+
+            <!-- 就地二次确认（会临时改变显示状态的动作） -->
+            <div
+              v-else-if="repairAsk === d.display_id + ':' + c.id && repairPending"
+              class="repair-ask"
+            >
+              <p class="repair-ask-title">
+                执行「{{ fixLabel(repairPending ?? '') }}」？{{ repairDesc(repairPending) }}
+              </p>
+              <div class="repair-actions">
+                <button class="btn sm" :disabled="store.busy" @click="confirmRepair(d.display_id, c.id, repairPending)">
+                  确认执行
+                </button>
+                <button class="btn sm repair-cancel" :disabled="store.busy" @click="cancelAsk">取消</button>
+              </div>
+            </div>
+
+            <!-- 结果三态：成功 / 不适用 / 未成功 -->
+            <div
+              v-if="repairResults[d.display_id + ':' + c.id]"
+              class="repair-outcome"
+              :class="repairResults[d.display_id + ':' + c.id].result"
+            >
+              <p class="repair-msg">
+                <span class="repair-badge">{{ repairBadge(repairResults[d.display_id + ':' + c.id].result) }}</span>
+                {{ repairResults[d.display_id + ':' + c.id].message }}
+              </p>
+              <p v-if="repairResults[d.display_id + ':' + c.id].changed.length" class="repair-changed">
+                回读核验：{{ repairResults[d.display_id + ':' + c.id].changed.join('；') }}
+              </p>
             </div>
           </div>
         </div>

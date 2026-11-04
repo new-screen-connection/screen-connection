@@ -1095,3 +1095,81 @@ input[type='range']:disabled {
   border-top: 1px solid var(--border-soft);
   padding-top: 6px;
 }
+
+/* ---------- 修复动作（P0-4）：就地确认与结果三态 ---------- */
+
+.repair-ask {
+  margin-top: 8px;
+  padding: 10px 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.repair-ask-title {
+  margin: 0 0 8px;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.repair-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.repair-cancel {
+  opacity: 0.75;
+}
+
+.repair-outcome {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  border-left: 3px solid var(--faint);
+  background: var(--panel-2);
+}
+
+.repair-outcome.applied {
+  border-left-color: var(--ok);
+}
+
+.repair-outcome.not_applicable {
+  border-left-color: var(--faint);
+}
+
+.repair-outcome.failed {
+  border-left-color: var(--warn);
+}
+
+.repair-msg {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.repair-badge {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 8px;
+  border-radius: 99px;
+  font-size: 11px;
+  background: var(--accent-dim);
+  color: var(--accent-strong);
+}
+
+.repair-outcome.applied .repair-badge {
+  background: rgba(85, 201, 165, 0.15);
+  color: var(--ok);
+}
+
+.repair-outcome.failed .repair-badge {
+  background: rgba(255, 192, 122, 0.15);
+  color: var(--warn);
+}
+
+.repair-changed {
+  margin: 4px 0 0;
+  font-size: 11.5px;
+  color: var(--faint);
+}

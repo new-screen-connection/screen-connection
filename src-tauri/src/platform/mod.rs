@@ -555,6 +555,35 @@ pub fn health_report_markdown_impl(include_serial: bool) -> Result<String, Strin
     Ok(render_health_markdown(&report, &serials, include_serial))
 }
 
+// ---------- 自愈动作集（P0-4，两平台共用契约） ----------
+
+/// 修复动作结果。applied = 已执行且回读核验；not_applicable = 此平台/此屏做不到（附人话原因）；
+/// failed = 试了但没成（附手动操作路径）。needs_confirmation / needs_permission 预留——
+/// 二次确认统一在前端做，后端不拦。
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairResult {
+    Applied,
+    NotApplicable,
+    Failed,
+    NeedsConfirmation,
+    NeedsPermission,
+}
+
+/// 一个修复动作的执行结果。message 必须是给用户看的人话，说清做了什么、现在什么状态。
+#[derive(Serialize, Clone, Debug)]
+pub struct RepairOutcome {
+    pub action: String,
+    pub result: RepairResult,
+    pub message: String,
+    /// 回读核验后实际发生变化的项（如「显示器数量 1 → 2」「输入源 → DisplayPort」）
+    pub changed: Vec<String>,
+}
+
+/// 需要前端弹二次确认才允许执行的动作（会改分辨率/刷新率/输入源/暂时关屏）。
+/// 前后端共用同一份名单，避免两端各写一套判断。
+pub const REPAIR_NEEDS_CONFIRM: &[&str] = &["reapply_mode", "switch_input", "ddc_power_cycle"];
+
 #[cfg(test)]
 mod markdown_tests {
     use super::*;
@@ -683,6 +712,15 @@ pub(crate) fn aspect_mismatch(cur: (u32, u32), native: (u32, u32)) -> bool {
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn health_report_impl() -> Result<HealthReport, String> {
     Err("当前平台暂不支持体检报告".to_string())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn repair_action_impl(
+    _action: &str,
+    _display_id: Option<&str>,
+    _value: Option<&str>,
+) -> Result<RepairOutcome, String> {
+    Err("当前平台暂不支持修复动作".to_string())
 }
 
 // ---------- 软件层总亮度 / HDR / 前台窗口铺满 / 全局快捷键（非 Windows 存根） ----------

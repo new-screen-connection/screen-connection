@@ -130,6 +130,44 @@ export interface HealthReport {
   summary: HealthSummary;
 }
 
+/** 修复动作结果：applied=已执行且回读核验 / not_applicable=此平台或此屏做不到 / failed=试了但没成 */
+export type RepairResult = 'applied' | 'not_applicable' | 'failed';
+
+/** 一个修复动作的执行结果（后端统一返回） */
+export interface RepairOutcome {
+  action: string;
+  result: RepairResult;
+  message: string;
+  /** 回读核验后实际发生变化的项（如「显示器数量 1 → 2」） */
+  changed: string[];
+}
+
+/** 会临时改变显示状态、需要前端二次确认的动作（与后端 REPAIR_NEEDS_CONFIRM 对应） */
+export const REPAIR_NEEDS_CONFIRM: ReadonlySet<string> = new Set([
+  'reapply_mode',
+  'switch_input',
+  'ddc_power_cycle',
+]);
+
+/** 修复动作的中文名与说明（体检页修复按钮用） */
+export const REPAIR_LABELS: Record<string, { label: string; desc: string }> = {
+  rescan_displays: { label: '重新枚举显示器', desc: '让系统重新找一遍所有显示器，新接的屏没出现时先试这个' },
+  force_redetect: { label: '强制重识别', desc: '按当前拓扑重新应用显示配置并重新枚举模式，花屏/黑屏常用' },
+  reapply_mode: { label: '重设当前模式', desc: '把当前分辨率/刷新率原样重放一遍，完成一次完整信号握手' },
+  reset_graphics_driver: { label: '重置显卡驱动', desc: '官方快捷键软重置显卡驱动，不改任何设置，屏幕会黑几秒' },
+  switch_input: { label: '切换输入源', desc: '通过 DDC/CI 让显示器切换到指定输入源' },
+  ddc_power_cycle: { label: '显示器软关再开', desc: '让显示器软关再开，强制面板重新握手，屏幕会黑几秒' },
+  reopen_ddc_channel: { label: '重建 DDC/CI 通道', desc: '重新探测 DDC/CI 通道，亮度/音量控制失灵时用' },
+};
+
+/** 输入源可选值（switch_input 的 value），编号与 Windows/macOS 共用 */
+export const INPUT_SOURCES: { value: string; label: string }[] = [
+  { value: 'displayport', label: 'DisplayPort' },
+  { value: 'hdmi1', label: 'HDMI 1' },
+  { value: 'hdmi2', label: 'HDMI 2' },
+  { value: 'usbc', label: 'USB-C' },
+];
+
 /** 所有前端会调用到的后端命令名，集中登记避免拼写漂移 */
 export const CMD = {
   getPlatform: 'get_platform',
@@ -186,6 +224,7 @@ export const CMD = {
   diagFix: 'diag_fix',
   healthReport: 'health_report',
   healthReportMarkdown: 'health_report_markdown',
+  repairAction: 'repair_action',
   diagLogPath: 'diag_log_path',
   openLogDir: 'open_log_dir',
   appStateJson: 'app_state_json',

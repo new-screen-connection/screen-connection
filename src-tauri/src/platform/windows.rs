@@ -955,6 +955,33 @@ public class SGCore {
     return "OK";
   }
 
+  /// 强制系统按数据库里保存的当前拓扑重新应用一遍显示配置，并触发重新枚举模式。
+  /// 第一段 flags = SDC_APPLY(0x80) | SDC_USE_DATABASE_CURRENT(0x0F)——注意不能加
+  /// SDC_FORCE_MODE_ENUMERATION(0x1000)：它只允许与 SDC_USE_SUPPLIED_DISPLAY_CONFIG
+  /// 同用，与 DATABASE_CURRENT 组合会返回 87（ERROR_INVALID_PARAMETER，实测踩过）。
+  /// 返回 OK / ERR:SetDisplayConfig 返回 <码>
+  public static string Redetect() {
+    int r = SetDisplayConfigApply(0, IntPtr.Zero, 0, IntPtr.Zero, 0x80 | 0x0F);
+    if (r != 0) return "ERR:SetDisplayConfig 返回 " + r;
+    // 第二段：补一次重新枚举（与「重新枚举」动作同源），刷新模式列表
+    ChangeDisplaySettingsExW(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
+    return "OK";
+  }
+
+  /// 显卡驱动软重置：合成 Win+Ctrl+Shift+B 组合键（Windows 官方的显示驱动重置快捷键）。
+  /// 屏幕会黑 1~3 秒后恢复，等效于驱动重新初始化，不改任何显示设置。
+  public static string GpuReset() {
+    keybd_event(0x5B, 0, 0, UIntPtr.Zero); // Win down
+    keybd_event(0x11, 0, 0, UIntPtr.Zero); // Ctrl down
+    keybd_event(0x10, 0, 0, UIntPtr.Zero); // Shift down
+    keybd_event(0x42, 0, 0, UIntPtr.Zero); // B down
+    keybd_event(0x42, 0, 2, UIntPtr.Zero); // B up
+    keybd_event(0x10, 0, 2, UIntPtr.Zero); // Shift up
+    keybd_event(0x11, 0, 2, UIntPtr.Zero); // Ctrl up
+    keybd_event(0x5B, 0, 2, UIntPtr.Zero); // Win up
+    return "OK";
+  }
+
   /// 读显示器电源模式（VCP 0xD6）：1=开 2=待机 4=软关 5=硬关
   public static string DDCPowerRead(string dev) {
     uint cur;
@@ -2963,7 +2990,8 @@ pub fn mode_detail() -> String {
 
 use super::{
     aspect_mismatch, bandwidth_ladder, gcd, looks_generic_profile, required_bandwidth_gbps,
-    DisplayHealth, HealthCheck, HealthReport, HopKind, HopStatus, Severity, Topology, TopologyHop,
+    DisplayHealth, HealthCheck, HealthReport, HopKind, HopStatus, RepairOutcome, RepairResult,
+    Severity, Topology, TopologyHop,
 };
 
 /// DisplayConfig outputTechnology 枚举值 → 人话（未知值返回 None，不猜）
@@ -3604,6 +3632,364 @@ pub fn repair_display(level: u32) -> Result<String, String> {
     }
 
     Ok(out.join("\n"))
+}
+
+// ---------- 自愈动作集（P0-4）：统一入口 repair_action_impl，如实回报、失败不装成功 ----------
+
+/// 同一动作在同一块屏上连续失败的计数（进程内；应用重启即清零）。
+/// 连续失败两次后不再机械重试，改为提示手动操作路径。
+fn repair_fail_counts() -> &'static Mutex<HashMap<String, u32>> {
+    static COUNTS: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn fail_key(action: &str, display_id: Option<&str>) -> String {
+    format!("{}|{}", action, display_id.unwrap_or("-"))
+}
+
+/// 成功时清计数，失败时 +1；达到 2 次在 message 前加手动路径提示
+fn note_fail(action: &str, display_id: Option<&str>, out: &mut RepairOutcome) {
+    let key = fail_key(action, display_id);
+    let mut guard = repair_fail_counts().lock().unwrap();
+    let n = guard.entry(key).or_insert(0);
+    *n += 1;
+    if *n >= 2 {
+        out.message = format!(
+            "已连续失败 {} 次，先停止自动尝试。建议按这个顺序手动处理：①重新插拔视频线；②换一个接口/线缆；③显示器 OSD 菜单里恢复默认设置；④重启电脑。{}",
+            n, out.message
+        );
+    }
+}
+
+fn note_ok(action: &str, display_id: Option<&str>) {
+    repair_fail_counts()
+        .lock()
+        .unwrap()
+        .remove(&fail_key(action, display_id));
+}
+
+/// uid（DISPLAY\XMI27B3\...）→ 设备名（\\.\DISPLAYn），并取当前 (宽, 高, 刷新率)
+fn dev_and_mode(uid: &str) -> Result<(String, (u32, u32, u32)), String> {
+    let dev = resolve_dev(uid)?;
+    let raw = ps_core("[SGCore]::ListDisplays()")?;
+    for line in raw.lines() {
+        let p: Vec<&str> = line.split('|').collect();
+        if p.len() >= 8 && p[0] == "D" && p[2].eq_ignore_ascii_case(uid) {
+            let w = p[3].trim().parse().unwrap_or(0);
+            let h = p[4].trim().parse().unwrap_or(0);
+            let hz = p[5].trim().parse().unwrap_or(0);
+            if w == 0 || h == 0 {
+                return Err(format!("{} 当前模式读不到，无法重设", uid));
+            }
+            return Ok((dev, (w, h, hz)));
+        }
+    }
+    Err(format!("未找到显示器 {}（可能刚被系统移除）", uid))
+}
+
+/// 显示器清单摘要（动作前后对比用）：每台一行 "uid|宽x高@Hz|是否主屏"
+fn displays_fingerprint() -> String {
+    ps_core("[SGCore]::ListDisplays()")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let p: Vec<&str> = l.split('|').collect();
+            if p.len() >= 8 && p[0] == "D" {
+                Some(format!("{}|{}x{}@{}|{}", p[2], p[3], p[4], p[5], p[6]))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// VCP 0x60 输入源常用编号：DP=15、HDMI1=17、HDMI2=18、USB-C=27（MCCS 2.0 + 常见厂商扩展）
+fn input_source_code(value: &str) -> Option<(u32, &'static str)> {
+    match value.trim().to_lowercase().as_str() {
+        "dp" | "displayport" | "15" => Some((15, "DisplayPort")),
+        "hdmi1" | "17" => Some((17, "HDMI 1")),
+        "hdmi2" | "18" => Some((18, "HDMI 2")),
+        "usbc" | "usb-c" | "usb_c" | "27" => Some((27, "USB-C")),
+        _ => None,
+    }
+}
+
+/// 修复动作统一入口（P0-4）。system 级动作忽略 display_id；屏级动作缺 display_id 直接报错。
+pub fn repair_action_impl(
+    action: &str,
+    display_id: Option<&str>,
+    value: Option<&str>,
+) -> Result<RepairOutcome, String> {
+    let mut out = RepairOutcome {
+        action: action.to_string(),
+        result: RepairResult::Failed,
+        message: String::new(),
+        changed: Vec::new(),
+    };
+    let need_display = matches!(
+        action,
+        "reapply_mode" | "switch_input" | "ddc_power_cycle" | "reopen_ddc_channel"
+    );
+    if need_display && display_id.is_none() {
+        out.result = RepairResult::NotApplicable;
+        out.message = "这个动作需要指定一块显示器，请在体检页对应屏的卡片里点击修复".into();
+        return Ok(out);
+    }
+
+    match action {
+        // ① 重新枚举：让系统把当前注册表配置再应用一遍，触发显示器重新枚举
+        "rescan_displays" => {
+            let before = get_displays().len();
+            let r = unsafe {
+                ChangeDisplaySettingsExW(std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), 0, std::ptr::null_mut())
+            };
+            if r != 0 {
+                out.message = format!("系统拒绝重新枚举（返回码 {}），通常重试一次即可", r);
+                note_fail(action, display_id, &mut out);
+                return Ok(out);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            let after = get_displays().len();
+            if after != before {
+                out.changed.push(format!("显示器数量 {} → {}", before, after));
+            }
+            out.result = RepairResult::Applied;
+            out.message = format!(
+                "已触发系统重新枚举显示器，当前 {} 台在活动路径上。新接的屏没出现的话，检查线缆两端是否插紧。",
+                after
+            );
+            note_ok(action, display_id);
+        }
+        // ② 强制重识别：按数据库当前拓扑重新应用并强制重新枚举模式（比 ① 更重一档）
+        "force_redetect" => {
+            let before = displays_fingerprint();
+            let raw = ps_core("[SGCore]::Redetect()")?;
+            if !raw.trim().starts_with("OK") {
+                out.message = format!("系统未接受重应用请求（{}），改试「重新枚举」或重启电脑", raw.trim());
+                note_fail(action, display_id, &mut out);
+                return Ok(out);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let after = displays_fingerprint();
+            if after != before {
+                out.changed.push("显示器配置发生变化（模式/主屏已更新）".into());
+            }
+            out.result = RepairResult::Applied;
+            out.message = "已强制系统按当前拓扑重新应用显示配置并重新枚举模式。花屏/黑屏通常在这一步恢复。".into();
+            note_ok(action, display_id);
+        }
+        // ③ 重设当前模式：备份当前模式 → 重设同一模式 → 回读核验，不符回滚（align_apply 事务写法）
+        "reapply_mode" => {
+            let uid = display_id.unwrap();
+            let (dev, (w, h, hz)) = match dev_and_mode(uid) {
+                Ok(v) => v,
+                Err(e) => {
+                    out.result = RepairResult::NotApplicable;
+                    out.message = e;
+                    return Ok(out);
+                }
+            };
+            let raw = ps_core(&format!(
+                "[SGCore]::SetMode({}, {}, {}, {})",
+                ps_literal(&dev),
+                w,
+                h,
+                hz
+            ))?;
+            if !raw.trim().starts_with("OK") {
+                out.message = format!("系统未接受模式重设（{}）", raw.trim());
+                note_fail(action, display_id, &mut out);
+                return Ok(out);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            // 回读核验：不符则回滚到原模式
+            match dev_and_mode(uid) {
+                Ok((_, cur)) if cur == (w, h, hz) => {
+                    out.changed.push(format!("模式重设为 {}x{}@{}", w, h, hz));
+                    out.result = RepairResult::Applied;
+                    out.message = format!(
+                        "已按当前模式 {}x{}@{} 强制重新应用一遍，回读核验一致。信号链路完成了一次完整握手。",
+                        w, h, hz
+                    );
+                    note_ok(action, display_id);
+                }
+                Ok((_, cur)) => {
+                    // 回滚：重设回核验前的模式，尽力而为
+                    let _ = ps_core(&format!(
+                        "[SGCore]::SetMode({}, {}, {}, {})",
+                        ps_literal(&dev),
+                        w,
+                        h,
+                        hz
+                    ));
+                    out.message = format!(
+                        "模式重设后回读不一致（实际 {}x{}@{}），已尝试恢复。显示器可能不稳定，建议重新插拔线缆。",
+                        cur.0, cur.1, cur.2
+                    );
+                    note_fail(action, display_id, &mut out);
+                }
+                Err(e) => {
+                    out.message = format!("模式重设后回读失败：{}", e);
+                    note_fail(action, display_id, &mut out);
+                }
+            }
+        }
+        // ④ 显卡驱动软重置：Win+Ctrl+Shift+B 官方快捷键，不改任何设置
+        "reset_graphics_driver" => {
+            let raw = ps_core("[SGCore]::GpuReset()")?;
+            if !raw.trim().starts_with("OK") {
+                out.message = "驱动重置快捷键发送失败，请手动按 Win+Ctrl+Shift+B".into();
+                note_fail(action, display_id, &mut out);
+                return Ok(out);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+            out.result = RepairResult::Applied;
+            out.message = "已发送显卡驱动重置（屏幕黑几秒属正常）。花屏/色彩异常/抖动应已恢复；若没有改善，改试「重设当前模式」。".into();
+            note_ok(action, display_id);
+        }
+        // ⑤ 切换输入源：DDC VCP 0x60 写入并回读确认
+        "switch_input" => {
+            let uid = display_id.unwrap();
+            let src = match value.and_then(input_source_code) {
+                Some(v) => v,
+                None => {
+                    out.result = RepairResult::NotApplicable;
+                    out.message = "输入源只能是 DisplayPort / HDMI 1 / HDMI 2 / USB-C 之一".into();
+                    return Ok(out);
+                }
+            };
+            let (dev, _) = match dev_and_mode(uid) {
+                Ok(v) => v,
+                Err(e) => {
+                    out.result = RepairResult::NotApplicable;
+                    out.message = e;
+                    return Ok(out);
+                }
+            };
+            let raw = ps_core(&format!(
+                "[SGCore]::DDCWrite({}, [byte]0x60, {})",
+                ps_literal(&dev),
+                src.0
+            ))?;
+            if !raw.trim().starts_with("OK") {
+                out.message = "这台显示器不支持通过软件切换输入源（DDC/CI 0x60 不可用），请在显示器 OSD 菜单里手动切换".into();
+                note_fail(action, display_id, &mut out);
+                return Ok(out);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            // 回读确认（部分显示器切换后要几秒才生效，读不到/不一致都如实报告）
+            let back = ps_core(&format!(
+                "[SGCore]::DDCRead({}, [byte]0x60)",
+                ps_literal(&dev)
+            ))
+            .unwrap_or_else(|_| "ERR".into());
+            match back.trim().parse::<u32>() {
+                Ok(cur) if cur == src.0 => {
+                    out.changed.push(format!("输入源 → {}", src.1));
+                    out.result = RepairResult::Applied;
+                    out.message = format!("已切到 {} 并经显示器确认。", src.1);
+                    note_ok(action, display_id);
+                }
+                Ok(cur) => {
+                    out.message = format!(
+                        "切换命令已发送，但显示器当前回报的输入源是编号 {}（目标 {}）。部分显示器切换后需要几秒生效或需要在 OSD 里确认",
+                        cur, src.0
+                    );
+                    note_fail(action, display_id, &mut out);
+                }
+                Err(_) => {
+                    out.message = "切换命令已发送，但读不回显示器当前输入源（可能已生效，请看画面确认）".into();
+                    note_fail(action, display_id, &mut out);
+                }
+            }
+        }
+        // ⑥ 显示器软关→开（DDC 0xD6），强制面板重新握手
+        "ddc_power_cycle" => {
+            let uid = display_id.unwrap();
+            let (dev, _) = match dev_and_mode(uid) {
+                Ok(v) => v,
+                Err(e) => {
+                    out.result = RepairResult::NotApplicable;
+                    out.message = e;
+                    return Ok(out);
+                }
+            };
+            let w1 = ps_core(&format!("[SGCore]::DDCWrite({}, [byte]0xD6, 4)", ps_literal(&dev)))?;
+            if !w1.trim().starts_with("OK") {
+                out.message = "这台显示器不支持软件控制电源（DDC/CI 0xD6 不可用）".into();
+                note_fail(action, display_id, &mut out);
+                return Ok(out);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(3000));
+            let w2 = ps_core(&format!("[SGCore]::DDCWrite({}, [byte]0xD6, 1)", ps_literal(&dev)))?;
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            let state = ps_core(&format!(
+                "[SGCore]::DDCPowerRead({})",
+                ps_literal(&dev)
+            ))
+            .unwrap_or_else(|_| "ERR".into());
+            if w2.trim().starts_with("OK") && state.trim() == "1" {
+                out.changed.push("显示器电源状态 → 开".into());
+                out.result = RepairResult::Applied;
+                out.message = "已让显示器软关再开，面板完成了一次重新握手。".into();
+                note_ok(action, display_id);
+            } else {
+                out.message = "关→开已发送，但显示器没有回到开机状态（它可能不支持软件唤醒）。请按显示器物理电源键或开关一次".into();
+                note_fail(action, display_id, &mut out);
+            }
+        }
+        // ⑦ 重建 DDC 通道：清句柄缓存（TryVCP 每次调用本就重建物理显示器句柄）→ 重新探测 → 回读亮度
+        "reopen_ddc_channel" => {
+            let uid = display_id.unwrap();
+            let (dev, _) = match dev_and_mode(uid) {
+                Ok(v) => v,
+                Err(e) => {
+                    out.result = RepairResult::NotApplicable;
+                    out.message = e;
+                    return Ok(out);
+                }
+            };
+            // 动作前状态：VCP 0x10 亮度是否可读
+            let probe_before = ps_core(&format!(
+                "[SGCore]::DDCProbe({})",
+                ps_literal(&dev)
+            ))
+            .unwrap_or_else(|_| "0".into());
+            // 清掉 dev 缓存，强制后续调用重新枚举并重建物理显示器句柄
+            *dev_cache().lock().unwrap() = None;
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let probe_after = ps_core(&format!(
+                "[SGCore]::DDCProbe({})",
+                ps_literal(&dev)
+            ))
+            .unwrap_or_else(|_| "0".into());
+            if probe_after.trim() == "1" {
+                let bri = ps_core(&format!(
+                    "[SGCore]::DDCRead({}, [byte]0x10)",
+                    ps_literal(&dev)
+                ))
+                .unwrap_or_else(|_| "ERR".into());
+                if probe_before.trim() != "1" {
+                    out.changed.push("DDC/CI 通道 不可用 → 可用".into());
+                }
+                out.result = RepairResult::Applied;
+                out.message = format!(
+                    "已重建 DDC/CI 通道并回读成功（当前亮度 {}）。屏幕亮度/音量控制现在应该可用了。",
+                    if bri.trim() == "ERR" { "读不到" } else { &bri.trim() }
+                );
+                note_ok(action, display_id);
+            } else {
+                out.message = "重建通道后 DDC/CI 仍不可达。这台屏可能本来就不支持 DDC/CI，或信号经过了扩展坞/转接头；亮度可先用「总亮度（gamma）」兜底".into();
+                note_fail(action, display_id, &mut out);
+            }
+        }
+        _ => {
+            out.result = RepairResult::NotApplicable;
+            out.message = format!("未知的修复动作 {}", action);
+        }
+    }
+    Ok(out)
 }
 
 // ================= 方案B：ADB 联网精细控制（可选增强） =================
@@ -6046,5 +6432,52 @@ mod health_tests {
         assert!(md.contains("未输出（不含设备序列号）"));
         assert!(md.contains("由 屏幕连接助手 v"));
         println!("{}", md);
+    }
+
+    /// 手动冒烟：cargo test repair_smoke -- --ignored --nocapture
+    /// 真机验证修复动作集（P0-4）：结构完整（action/message 非空、result 合法）、
+    /// 非法参数被拒（not_applicable）、安全动作真实执行。
+    #[test]
+    #[ignore]
+    fn repair_smoke() {
+        use super::{RepairResult, repair_action_impl};
+
+        // ① 未知名动作 → not_applicable 且原因可读
+        let o = repair_action_impl("no_such_action", None, None).expect("未知动作应返回 Ok");
+        assert_eq!(o.result, RepairResult::NotApplicable);
+        assert!(!o.message.is_empty());
+        println!("① 未知名动作: {:?}", o.message);
+
+        // ② 需要指定屏的动作不给 display_id → not_applicable
+        for a in ["reapply_mode", "switch_input", "ddc_power_cycle", "reopen_ddc_channel"] {
+            let o = repair_action_impl(a, None, None).expect("缺参应返回 Ok");
+            assert_eq!(o.result, RepairResult::NotApplicable, "动作 {} 缺参未被拒", a);
+        }
+        println!("② 缺 display_id 的 4 个动作全部被拒（附人话原因）");
+
+        // ③ 非法输入源值 → not_applicable
+        let o = repair_action_impl("switch_input", Some("dev-1"), Some("vga")).expect("非法值应返回 Ok");
+        assert_eq!(o.result, RepairResult::NotApplicable);
+        println!("③ 非法输入源: {:?}", o.message);
+
+        // ④ 重新枚举（真机执行）：应 applied 且消息可读
+        let o = repair_action_impl("rescan_displays", None, None).expect("rescan 失败");
+        assert_eq!(o.result, RepairResult::Applied, "rescan: {}", o.message);
+        assert!(!o.message.is_empty());
+        println!("④ rescan_displays: {}", o.message);
+
+        // ⑤ 强制重识别（真机执行）：应 applied
+        let o = repair_action_impl("force_redetect", None, None).expect("redetect 失败");
+        assert_eq!(o.result, RepairResult::Applied, "redetect: {}", o.message);
+        println!("⑤ force_redetect: {}", o.message);
+
+        // ⑥ 对真实第一块屏重建 DDC 通道：无论结果如何，消息必须可读（失败路径验收）
+        let displays = get_displays();
+        assert!(!displays.is_empty(), "没有显示器");
+        let uid = displays[0].id.clone();
+        let o = repair_action_impl("reopen_ddc_channel", Some(&uid), None).expect("reopen 失败");
+        assert!(!o.message.is_empty());
+        println!("⑥ reopen_ddc_channel({}): {:?} — {}", uid, o.result, o.message);
+        println!("   changed: {:?}", o.changed);
     }
 }

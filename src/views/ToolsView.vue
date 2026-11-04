@@ -2,6 +2,8 @@
 import { onMounted, ref } from 'vue';
 import { invoke } from '../api/tauri';
 import { act, store } from '../store';
+import { CMD, REPAIR_LABELS } from '../types';
+import type { RepairOutcome } from '../types';
 import Card from '../components/Card.vue';
 import Icon from '../components/Icon.vue';
 
@@ -20,10 +22,22 @@ const runDiag = (): void => {
   }, '检测完成');
 };
 
+/** 一键修复（P0-4 起统一走 repair_action，不再有独立的 diag_fix 流程）：
+ *  串行执行安全组合「重新枚举 → 强制重识别」，逐动作回报结果。 */
 const fixDiag = (): void => {
   void act(async () => {
-    const r = String(await invoke<string>('diag_fix'));
-    diagOut.value = r;
+    const seq = ['rescan_displays', 'force_redetect'];
+    const lines: string[] = [];
+    for (const action of seq) {
+      const o = await invoke<RepairOutcome>(CMD.repairAction, { action });
+      const name = REPAIR_LABELS[action]?.label ?? action;
+      const tag = o.result === 'applied' ? '✓' : o.result === 'not_applicable' ? '－' : '✗';
+      lines.push(`【${name}】${tag} ${o.message}`);
+      if (o.changed.length) lines.push(`  回读核验：${o.changed.join('；')}`);
+    }
+    lines.push('', '提示：这里只做安全的全局动作；针对单块屏的修复（切输入源/软关再开/重建通道等）请在「体检」页逐条执行。');
+    diagOut.value = lines.join('\n');
+    diagWhen.value = new Date().toLocaleTimeString('zh-CN', { hour12: false });
   }, '修复流程已执行');
 };
 

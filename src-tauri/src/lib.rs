@@ -460,6 +460,21 @@ async fn health_report_markdown(include_serial: Option<bool>) -> Result<String, 
         .map_err(|e| format!("后台任务失败：{}", e))?
 }
 
+/// 自愈修复动作（P0-4）：按动作 id 执行单个修复，返回统一的 RepairOutcome
+/// （applied / not_applicable / failed + 人话 message + 回读核验到的 changed 列表）
+#[tauri::command]
+async fn repair_action(
+    action: String,
+    display_id: Option<String>,
+    value: Option<String>,
+) -> Result<platform::RepairOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        platform::repair_action_impl(&action, display_id.as_deref(), value.as_deref())
+    })
+    .await
+    .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
 /// 在资源管理器里打开日志目录
 #[tauri::command]
 fn open_log_dir() -> Result<(), String> {
@@ -1726,6 +1741,7 @@ pub fn run() {
             repair_display,
             health_report,
             health_report_markdown,
+            repair_action,
             health_get_config,
             health_set_config,
             get_notify_payload,

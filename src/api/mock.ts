@@ -288,6 +288,21 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       return 'DDC/CI 通道：正常\n电源联动服务：正常\nADB 桥接：未安装（可选）\n结论：2 项通过，1 项可增强' as T;
     case 'health_report':
       return JSON.parse(JSON.stringify(healthReport)) as T;
+    case 'repair_action': {
+      // 假数据：演示三种结果——reopen 返回成功+变化，其余动作返回通用的已执行
+      const action = String(args?.action ?? '');
+      const MESSAGES: Record<string, { result: 'applied' | 'not_applicable' | 'failed'; message: string; changed: string[] }> = {
+        rescan_displays: { result: 'applied', message: '已触发系统重新枚举显示器，当前 2 台在活动路径上。新接的屏没出现的话，检查线缆两端是否插紧。', changed: [] },
+        force_redetect: { result: 'applied', message: '已强制系统按当前拓扑重新应用显示配置并重新枚举模式。花屏/黑屏通常在这一步恢复。', changed: [] },
+        reapply_mode: { result: 'applied', message: '已按当前模式 3840x2160@60 强制重新应用一遍，回读核验一致。信号链路完成了一次完整握手。', changed: ['模式重设为 3840x2160@60'] },
+        reset_graphics_driver: { result: 'applied', message: '已发送显卡驱动重置（屏幕黑几秒属正常）。花屏/色彩异常/抖动应已恢复；若没有改善，改试「重设当前模式」。', changed: [] },
+        switch_input: { result: 'applied', message: `已切到 ${String(args?.value ?? 'displayport')} 并经显示器确认。`, changed: [`输入源 → ${String(args?.value ?? 'displayport')}`] },
+        ddc_power_cycle: { result: 'applied', message: '已让显示器软关再开，面板完成了一次重新握手。', changed: ['显示器电源状态 → 开'] },
+        reopen_ddc_channel: { result: 'applied', message: '已重建 DDC/CI 通道并回读成功（当前亮度 65）。屏幕亮度/音量控制现在应该可用了。', changed: ['DDC/CI 通道 不可用 → 可用'] },
+      };
+      const m = MESSAGES[action] ?? { result: 'not_applicable' as const, message: `未知的修复动作 ${action}`, changed: [] };
+      return { action, ...m } as T;
+    }
     case 'health_report_markdown':
       return (
         '# 屏幕连接助手 · 显示体检报告\n\n' +
