@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
-import { invoke } from '../api/tauri';
-import { act, store } from '../store';
+import { invoke, listenEvent } from '../api/tauri';
+import { act, setStatus, store } from '../store';
 import { CMD } from '../types';
-import type { ApplyReport, Profile } from '../types';
+import type { ApplyReport, AutoConfig, AutoEvent, Profile, ProfileMatch } from '../types';
 import Card from '../components/Card.vue';
 import Icon from '../components/Icon.vue';
+import ToggleSwitch from '../components/ToggleSwitch.vue';
 
 const windows = ref<string[]>([]);
 const spanTarget = ref('');
@@ -152,6 +153,130 @@ function exportProfile(): void {
   }, '已导出场景档 JSON');
 }
 
+// ---------- 场景自动触发（P1-1） ----------
+
+const AUTO_EVENT = 'screens://auto-applied';
+const DEFAULT_MATCH: ProfileMatch = {
+  require_all_displays: true,
+  docking: null,
+  on_ac: null,
+  time_range: null,
+};
+
+const autoCfg = ref<AutoConfig | null>(null);
+const autoOpen = ref(false);
+
+async function loadAuto(): Promise<void> {
+  try {
+    autoCfg.value = await invoke<AutoConfig>(CMD.autoRulesGet);
+  } catch {
+    /* 配置读不到不阻塞页面 */
+  }
+}
+
+async function saveAuto(next: AutoConfig, okMsg: string): Promise<void> {
+  await act(async () => {
+    autoCfg.value = await invoke<AutoConfig>(CMD.autoRulesSet, { config: next });
+  }, okMsg);
+}
+
+/** 总开关。开启时弹一次说明（自动改屏幕是敏感操作，必须先讲清楚） */
+async function setAutoEnabled(v: boolean): Promise<void> {
+  const cfg = autoCfg.value;
+  if (!cfg || cfg.enabled === v) return;
+  if (v) {
+    const ok = window.confirm(
+      '开启后，插拔显示器、插拔电源或到达时间段时，应用可能自动调整分辨率、亮度和布局。\n' +
+        `你手动改动配置后的 ${cfg.quiet_minutes} 分钟内不会自动切换；托盘面板可「暂停 1 小时」。\n` +
+        '确定开启自动切换？',
+    );
+    if (!ok) return;
+  }
+  await saveAuto({ ...cfg, enabled: v }, v ? '自动切换已开启' : '自动切换已关闭');
+}
+
+function toggleSource(key: keyof AutoConfig['sources']): void {
+  const cfg = autoCfg.value;
+  if (!cfg) return;
+  void saveAuto(
+    { ...cfg, sources: { ...cfg.sources, [key]: !cfg.sources[key] } },
+    '触发源设置已保存',
+  );
+}
+
+const pausedLeftMin = computed(() => {
+  const until = autoCfg.value?.paused_until_epoch;
+  if (!until) return 0;
+  return Math.max(1, Math.ceil((until - Date.now() / 1000) / 60));
+});
+
+function pauseAuto(): void {
+  void act(async () => {
+    autoCfg.value = await invoke<AutoConfig>(CMD.autoPause, { minutes: 60 });
+  }, '自动切换已暂停 1 小时（到期自动恢复）');
+}
+
+function resumeAuto(): void {
+  void act(async () => {
+    autoCfg.value = await invoke<AutoConfig>(CMD.autoPause, { minutes: 0 });
+  }, '自动切换已恢复');
+}
+
+const lastAutoText = computed(() => {
+  const la = autoCfg.value?.last_applied;
+  if (!la) return '';
+  return `${la.at} ${la.ok ? '已应用' : '失败'}「${la.profile_name}」（${la.reason}）`;
+});
+
+/** 开关某档的自动触发；开启时若还没配过匹配条件，给默认条件（要求集合完全一致） */
+function toggleProfileAuto(p: Profile): void {
+  void act(async () => {
+    const enabling = !p.auto;
+    const matchArg: ProfileMatch | null = enabling && !p.match ? { ...DEFAULT_MATCH } : null;
+    const updated = await invoke<Profile>(CMD.profileUpdate, {
+      id: p.id,
+      name: null,
+      recapture: false,
+      auto: enabling,
+      match: matchArg,
+    });
+    profiles.value = profiles.value.map((x) => (x.id === p.id ? updated : x));
+    return updated;
+  }, (up: Profile) => (up.auto ? `「${up.name}」已开启自动触发` : `「${up.name}」已关闭自动触发`));
+}
+
+/** 改某档的匹配条件（整体提交 match 对象） */
+function patchMatch(p: Profile, patch: Partial<ProfileMatch>): void {
+  const base = p.match ?? { ...DEFAULT_MATCH };
+  void act(async () => {
+    const updated = await invoke<Profile>(CMD.profileUpdate, {
+      id: p.id,
+      name: null,
+      recapture: false,
+      auto: null,
+      match: { ...base, ...patch },
+    });
+    profiles.value = profiles.value.map((x) => (x.id === p.id ? updated : x));
+    return updated;
+  }, `「${p.name}」匹配条件已保存`);
+}
+
+function onAcChange(p: Profile, e: Event): void {
+  const v = (e.target as HTMLSelectElement).value;
+  patchMatch(p, { on_ac: v === '' ? null : v === 'true' });
+}
+
+/** select 绑定值：null → ''（任何供电） */
+function acSelectValue(p: Profile): string {
+  const v = p.match?.on_ac;
+  return v === null || v === undefined ? '' : String(v);
+}
+
+function onTimeRangeChange(p: Profile, e: Event): void {
+  const v = (e.target as HTMLInputElement).value.trim();
+  patchMatch(p, { time_range: v || null });
+}
+
 const SPAN_MODES = [
   { v: 2, label: '自动对齐两屏清晰度（推荐）' },
   { v: 1, label: '以主屏为基准' },
@@ -243,6 +368,19 @@ onMounted(async () => {
     /* 状态缺失不阻塞 */
   }
   void loadProfiles();
+  void loadAuto();
+  // 自动应用结果推送：状态栏轻提示；回滚/成功后刷新档位与配置（安全阀可能停用了某档）
+  await listenEvent(AUTO_EVENT, (payload) => {
+    const ev = payload as AutoEvent;
+    if (!ev || typeof ev !== 'object' || !ev.kind) return;
+    if (ev.kind === 'skipped') {
+      setStatus(ev.message || '检测到手动调整，本次未自动切换', true);
+      return;
+    }
+    setStatus(`自动触发「${ev.profile_name}」：${ev.message}`, ev.kind === 'applied');
+    void loadProfiles();
+    void loadAuto();
+  });
   document.addEventListener('click', closeMenu);
 });
 onBeforeUnmount(() => {
@@ -260,6 +398,15 @@ onBeforeUnmount(() => {
     <Card title="场景档" icon="target">
       <template #actions>
         <span class="tag" v-if="profiles.length >= 1">前 3 档可用 Ctrl/Cmd+Alt+1..3 快速应用</span>
+        <span v-if="autoCfg" class="auto-head">
+          <ToggleSwitch
+            :model-value="autoCfg.enabled"
+            on-text=""
+            off-text=""
+            @update:model-value="setAutoEnabled"
+          />
+          <button class="btn sm" :class="{ primary: autoOpen }" @click="autoOpen = !autoOpen">自动规则</button>
+        </span>
       </template>
 
       <div v-if="loadedProfiles && !profiles.length" class="profile-empty">
@@ -285,6 +432,7 @@ onBeforeUnmount(() => {
             <template v-else>
               <span class="profile-name" :title="`${p.name}（右键更多操作）`">{{ p.name }}</span>
               <span class="profile-meta">{{ p.targets.displays.length }} 屏</span>
+              <span v-if="p.auto" class="profile-auto-tag" title="已开启自动触发">自动</span>
               <button class="btn sm" :disabled="store.busy" @click="applyProfile(p)">
                 {{ applyingId === p.id ? '应用中…' : '应用' }}
               </button>
@@ -324,6 +472,82 @@ onBeforeUnmount(() => {
             <button class="btn sm" @click="creating = false">取消</button>
           </div>
         </div>
+      </div>
+
+      <div v-if="autoOpen && autoCfg" class="auto-panel">
+        <div v-if="autoCfg.paused_until_epoch" class="auto-paused">
+          自动切换已暂停（剩 {{ pausedLeftMin }} 分钟）
+          <button class="btn sm" @click="resumeAuto">立即恢复</button>
+        </div>
+        <div v-else-if="autoCfg.enabled" class="auto-row">
+          <button class="btn sm" @click="pauseAuto" title="会议、演示前临时停用；到期自动恢复">暂停自动切换 1 小时</button>
+        </div>
+
+        <div class="auto-row">
+          <span class="auto-label">触发源</span>
+          <label class="auto-check" title="显示器集合或连接状态变化（最主要的触发源）">
+            <input type="checkbox" :checked="autoCfg.sources.displays_changed" @change="toggleSource('displays_changed')" />
+            插拔显示器
+          </label>
+          <label class="auto-check" title="笔记本插拔电源适配器">
+            <input type="checkbox" :checked="autoCfg.sources.on_ac" @change="toggleSource('on_ac')" />
+            电源接入 / 断开
+          </label>
+          <label class="auto-check" title="到达档位配置的时间段（如 09:00-19:00）">
+            <input type="checkbox" :checked="autoCfg.sources.time_range" @change="toggleSource('time_range')" />
+            时间段
+          </label>
+        </div>
+
+        <p class="auto-note">
+          防抖 3 秒（固定）：显示器变化稳定后才应用，连插拔不会反复触发。
+          静默期 {{ autoCfg.quiet_minutes }} 分钟：你手动改过配置后，自动切换让路。
+          档位还要在下面开启「自动」并配好匹配条件才会被触发。
+        </p>
+
+        <div v-if="profiles.length" class="auto-profiles">
+          <div v-for="p in profiles" :key="p.id" class="auto-profile-row">
+            <span class="auto-profile-name" :title="p.name">{{ p.name }}</span>
+            <label class="auto-check">
+              <input type="checkbox" :checked="p.auto" @change="toggleProfileAuto(p)" />
+              自动
+            </label>
+            <template v-if="p.auto">
+              <label
+                class="auto-check"
+                :title="p.match?.require_all_displays ?? true ? '要求当前显示器集合与档内完全一致才触发' : '只要档内的屏都在线就触发'"
+              >
+                <input
+                  type="checkbox"
+                  :checked="p.match?.require_all_displays ?? true"
+                  @change="patchMatch(p, { require_all_displays: !(p.match?.require_all_displays ?? true) })"
+                />
+                集合完全一致
+              </label>
+              <select class="auto-sel" :value="acSelectValue(p)" @change="onAcChange(p, $event)">
+                <option value="">任何供电</option>
+                <option value="true">仅接通电源</option>
+                <option value="false">仅用电池</option>
+              </select>
+              <input
+                class="auto-time"
+                :value="p.match?.time_range ?? ''"
+                placeholder="09:00-19:00"
+                title="时间段触发（需开启「时间段」触发源），支持跨零点如 22:00-06:00，留空不限"
+                @change="onTimeRangeChange(p, $event)"
+              />
+            </template>
+          </div>
+        </div>
+
+        <p
+          v-if="lastAutoText"
+          class="auto-last"
+          :class="{ bad: !autoCfg.last_applied?.ok }"
+        >
+          最近自动应用：{{ lastAutoText }}
+          <template v-if="!autoCfg.last_applied?.ok">（该档自动触发已停用，可重新开启）</template>
+        </p>
       </div>
     </Card>
 

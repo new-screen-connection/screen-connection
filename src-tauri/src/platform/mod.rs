@@ -651,6 +651,9 @@ pub struct ProfileMatch {
     pub docking: Option<bool>,
     #[serde(default)]
     pub on_ac: Option<bool>,
+    /// 时间段触发，形如 "09:00-19:00"（支持跨零点如 "22:00-06:00"；空/非法 = 不限）
+    #[serde(default)]
+    pub time_range: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -719,8 +722,7 @@ pub fn save_profiles(list: &[Profile]) -> Result<(), String> {
     std::fs::write(&path, json).map_err(|e| format!("写入 profiles.json 失败：{}", e))
 }
 
-fn now_str() -> String {
-    #[cfg(target_os = "windows")]
+pub(crate) fn now_str() -> String {    #[cfg(target_os = "windows")]
     {
         // Windows 没有 Unix date；PowerShell 取本地时间（capture/apply 非热路径，可接受）
         std::process::Command::new("powershell")
@@ -775,12 +777,14 @@ pub fn profile_capture_impl(name: &str) -> Result<Profile, String> {
     Ok(p)
 }
 
-/// 更新档位：改名 / 重捕获 targets（「更新为当前状态」）/ 开关自动触发标记
+/// 更新档位：改名 / 重捕获 targets（「更新为当前状态」）/ 开关自动触发标记 / 改匹配条件。
+/// match_patch 用双层 Option 区分「没传」（外层 None，不动）与「传 null」（清空 match）。
 pub fn profile_update_impl(
     id: &str,
     name: Option<&str>,
     recapture: bool,
     auto: Option<bool>,
+    match_patch: Option<Option<ProfileMatch>>,
 ) -> Result<Profile, String> {
     let mut list = load_profiles();
     let idx = list
@@ -798,6 +802,9 @@ pub fn profile_update_impl(
     }
     if let Some(a) = auto {
         list[idx].auto = a;
+    }
+    if let Some(m) = match_patch {
+        list[idx].match_ = m;
     }
     list[idx].updated_at = now_str();
     save_profiles(&list)?;
@@ -849,8 +856,10 @@ pub fn profile_import_impl(raw: &str) -> Result<Profile, String> {
     Ok(p)
 }
 
-/// 应用一个档（平台实现负责步骤与回滚）
+/// 应用一个档（平台实现负责步骤与回滚）。按钮/热键都算用户手动操作：
+/// 记一次手动变更时间，让随后 quiet_minutes 内的自动触发让路。
 pub fn profile_apply_impl(id: &str) -> Result<ApplyReport, String> {
+    note_manual_change();
     let list = load_profiles();
     let p = list.into_iter().find(|p| p.id == id).ok_or_else(|| format!("未找到场景档 {}", id))?;
     profile_apply_platform(&p)
@@ -871,7 +880,7 @@ fn profile_capture_platform() -> Result<ProfileTargets, String> {
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn profile_apply_platform(p: &Profile) -> Result<ApplyReport, String> {
+pub(crate) fn profile_apply_platform(p: &Profile) -> Result<ApplyReport, String> {
     profile_apply_impl_platform(p)
 }
 
@@ -883,6 +892,291 @@ fn profile_capture_platform() -> Result<ProfileTargets, String> {
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn profile_apply_platform(_p: &Profile) -> Result<ApplyReport, String> {
     Err("当前平台暂不支持场景档".to_string())
+}
+
+// ---------- 场景自动触发（P1-1：插屏/接电/时间段自动应用场景档） ----------
+
+/// 三个触发源，各自可独立开关（总开关 enabled 关掉时全部失效）
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct AutoSources {
+    #[serde(default)]
+    pub displays_changed: bool,
+    #[serde(default)]
+    pub on_ac: bool,
+    #[serde(default)]
+    pub time_range: bool,
+}
+
+impl Default for AutoSources {
+    fn default() -> Self {
+        // 默认只开最主要的显示器变化源；接电与时间段由用户显式打开
+        AutoSources { displays_changed: true, on_ac: false, time_range: false }
+    }
+}
+
+/// 最近一次自动应用记录（设置面板展示用）
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct AutoLastApplied {
+    pub profile_id: String,
+    pub profile_name: String,
+    pub at: String,
+    pub reason: String,
+    pub ok: bool,
+}
+
+/// 自动触发配置。paused_until_epoch 用 Unix 秒（进程内不引本地时区解析，
+/// 剩余分钟由前端用 epoch 差值展示）。last_applied 在 auto_rules_set 时保留不覆盖。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct AutoConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub sources: AutoSources,
+    /// 用户手动改动后的静默分钟数（期间自动应用跳过）
+    #[serde(default = "default_quiet_minutes")]
+    pub quiet_minutes: u32,
+    /// 暂停截止时间（Unix 秒）；None = 未暂停
+    #[serde(default)]
+    pub paused_until_epoch: Option<u64>,
+    #[serde(default)]
+    pub last_applied: Option<AutoLastApplied>,
+}
+
+fn default_quiet_minutes() -> u32 {
+    5
+}
+
+impl Default for AutoConfig {
+    fn default() -> Self {
+        AutoConfig {
+            enabled: false,
+            sources: AutoSources::default(),
+            quiet_minutes: default_quiet_minutes(),
+            paused_until_epoch: None,
+            last_applied: None,
+        }
+    }
+}
+
+fn auto_cfg_file() -> std::path::PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        std::path::PathBuf::from(std::env::var("APPDATA").unwrap_or_default())
+            .join("Screenguard")
+            .join("auto.json")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        app_support_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+            .join("auto.json")
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        std::path::PathBuf::from("/tmp/screenguard-auto.json")
+    }
+}
+
+/// 读自动触发配置；文件缺失给默认（enabled=false），损坏时备份 .bak 后按默认继续
+pub fn auto_cfg_load() -> AutoConfig {
+    let path = auto_cfg_file();
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(v) => v,
+        Err(_) => return AutoConfig::default(),
+    };
+    if raw.trim().is_empty() {
+        return AutoConfig::default();
+    }
+    match serde_json::from_str::<AutoConfig>(&raw) {
+        Ok(c) => c,
+        Err(e) => {
+            let bak = path.with_extension("json.bak");
+            let _ = std::fs::rename(&path, &bak);
+            eprintln!("auto.json 损坏（{}），已备份为 {} 并按默认配置继续", e, bak.display());
+            AutoConfig::default()
+        }
+    }
+}
+
+pub fn auto_cfg_save(cfg: &AutoConfig) -> Result<(), String> {
+    let path = auto_cfg_file();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("创建配置目录失败：{}", e))?;
+    }
+    let json = serde_json::to_string_pretty(cfg).map_err(|e| format!("序列化失败：{}", e))?;
+    std::fs::write(&path, json).map_err(|e| format!("写入 auto.json 失败：{}", e))
+}
+
+pub fn auto_rules_get_impl() -> AutoConfig {
+    auto_cfg_load()
+}
+
+/// 保存用户在设置面板改的配置；last_applied 由引擎负责，这里保留旧值
+pub fn auto_rules_set_impl(mut cfg: AutoConfig) -> Result<AutoConfig, String> {
+    let old = auto_cfg_load();
+    cfg.last_applied = old.last_applied;
+    // 静默期至少 1 分钟，防止填 0 导致自动应用与用户操作互相打架
+    cfg.quiet_minutes = cfg.quiet_minutes.max(1);
+    auto_cfg_save(&cfg)?;
+    Ok(cfg)
+}
+
+/// 暂停自动切换 minutes 分钟（0 = 立即恢复）
+pub fn auto_pause_impl(minutes: u32) -> Result<AutoConfig, String> {
+    let mut cfg = auto_cfg_load();
+    if minutes == 0 {
+        cfg.paused_until_epoch = None;
+    } else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        cfg.paused_until_epoch = Some(now + u64::from(minutes) * 60);
+    }
+    auto_cfg_save(&cfg)?;
+    Ok(cfg)
+}
+
+/// "HH:MM-HH:MM" 是否包含当前时刻（hhmm = HH*100+MM）。支持跨零点；非法串一律 false。
+pub fn time_in_range(range: &str, hhmm: u32) -> bool {
+    let s = range.trim();
+    let (a, b) = match s.split_once('-') {
+        Some(v) => v,
+        None => return false,
+    };
+    let parse = |t: &str| -> Option<u32> {
+        let t = t.trim();
+        let (h, m) = t.split_once(':')?;
+        let h: u32 = h.trim().parse().ok()?;
+        let m: u32 = m.trim().parse().ok()?;
+        if h > 23 || m > 59 {
+            return None;
+        }
+        Some(h * 100 + m)
+    };
+    let (lo, hi) = match (parse(a), parse(b)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return false,
+    };
+    if lo == hi {
+        return false; // 零长度区间视为未配置
+    }
+    if lo < hi {
+        hhmm >= lo && hhmm < hi
+    } else {
+        // 跨零点：22:00-06:00
+        hhmm >= lo || hhmm < hi
+    }
+}
+
+/// 档位匹配判定（纯函数，便于测试）：
+/// - match 为 None 的档永不自动触发
+/// - 档内屏幕键（edid_key 优先，captured_id 兜底）必须全部在当前屏幕键集合里；
+///   require_all_displays=true 还要求集合完全一致（防「只接了部分屏也套全工位配置」）
+/// - match.on_ac 与当前供电一致才命中；match.time_range 与当前时刻一致才命中
+pub fn profile_match_hit(
+    p: &Profile,
+    current_keys: &[String],
+    on_ac: Option<bool>,
+    hhmm: Option<u32>,
+) -> bool {
+    let m = match p.match_.as_ref() {
+        Some(m) => m,
+        None => return false,
+    };
+    let want: Vec<String> = p
+        .targets
+        .displays
+        .iter()
+        .filter_map(|d| d.edid_key.clone().or_else(|| d.captured_id.clone()))
+        .collect();
+    if !want.is_empty() {
+        if m.require_all_displays {
+            if want.len() != current_keys.len() {
+                return false;
+            }
+        }
+        for k in &want {
+            if !current_keys.iter().any(|c| c == k) {
+                return false;
+            }
+        }
+    }
+    if let Some(ac) = m.on_ac {
+        if on_ac != Some(ac) {
+            return false;
+        }
+    }
+    if let Some(tr) = m.time_range.as_deref() {
+        if !tr.trim().is_empty() {
+            match hhmm {
+                Some(t) if time_in_range(tr, t) => {}
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
+/// 从候选档里挑第一个命中的（列表顺序优先，不叠加）。
+/// range_hits：刚进入时间段的档位 id（时间段触发不依赖全局触发源）。
+pub fn auto_pick_profile(
+    profiles: &[Profile],
+    current_keys: &[String],
+    on_ac: Option<bool>,
+    hhmm: Option<u32>,
+    trigger_reason: Option<&str>,
+    range_hits: &[String],
+) -> Option<(Profile, String)> {
+    for p in profiles {
+        if !p.auto {
+            continue;
+        }
+        if range_hits.iter().any(|id| id == &p.id) {
+            let tr = p
+                .match_
+                .as_ref()
+                .and_then(|m| m.time_range.clone())
+                .unwrap_or_default();
+            return Some((p.clone(), format!("到达时间段 {}", tr)));
+        }
+        if let Some(reason) = trigger_reason {
+            if profile_match_hit(p, current_keys, on_ac, hhmm) {
+                return Some((p.clone(), reason.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// 手动变更标记：两平台共用语义——用户主动改配置后，quiet_minutes 内自动触发让路。
+#[cfg(target_os = "windows")]
+pub fn note_manual_change() {
+    windows::mark_change();
+}
+
+#[cfg(target_os = "macos")]
+pub fn note_manual_change() {
+    macos::mark_change();
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn note_manual_change() {}
+
+/// quiet_minutes 内是否发生过用户手动改动
+#[cfg(target_os = "windows")]
+pub fn manual_recently(secs: u64) -> bool {
+    windows::recently_changed(secs)
+}
+
+#[cfg(target_os = "macos")]
+pub fn manual_recently(secs: u64) -> bool {
+    macos::recently_changed(secs)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn manual_recently(_secs: u64) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -1204,3 +1498,143 @@ mod windows;
 pub use macos::*;
 #[cfg(target_os = "windows")]
 pub use windows::*;
+
+#[cfg(test)]
+mod auto_tests {
+    use super::*;
+
+    fn prof(name: &str, edid: Option<&str>, m: Option<ProfileMatch>) -> Profile {
+        Profile {
+            id: format!("p-{}", name),
+            name: name.to_string(),
+            created_at: "2026-11-04 10:00:00".into(),
+            updated_at: "2026-11-04 10:00:00".into(),
+            targets: ProfileTargets {
+                displays: vec![DisplayTarget {
+                    edid_key: edid.map(|s| s.to_string()),
+                    captured_id: None,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            match_: m,
+            auto: true,
+        }
+    }
+
+    fn m_all() -> ProfileMatch {
+        ProfileMatch { require_all_displays: true, docking: None, on_ac: None, time_range: None }
+    }
+
+    #[test]
+    fn time_range_parses_and_handles_midnight_wrap() {
+        assert!(time_in_range("09:00-19:00", 900));
+        assert!(time_in_range("09:00-19:00", 1859));
+        assert!(!time_in_range("09:00-19:00", 1900)); // 右开区间
+        assert!(!time_in_range("09:00-19:00", 858));
+        assert!(time_in_range("22:00-06:00", 2330)); // 跨零点
+        assert!(time_in_range("22:00-06:00", 300));
+        assert!(!time_in_range("22:00-06:00", 1200));
+        assert!(!time_in_range("abc", 1200));
+        assert!(!time_in_range("25:00-26:00", 2530));
+        assert!(!time_in_range("09:00-09:00", 900)); // 零长度
+    }
+
+    #[test]
+    fn match_none_never_triggers() {
+        let p = prof("x", Some("JKA27B3"), None);
+        assert!(!profile_match_hit(&p, &["JKA27B3".to_string()], Some(true), None));
+    }
+
+    #[test]
+    fn require_all_needs_exact_set() {
+        let mut p = prof("work", Some("JKA27B3"), Some(m_all()));
+        p.targets.displays.push(DisplayTarget {
+            edid_key: Some("DEL1234".into()),
+            captured_id: None,
+            ..Default::default()
+        });
+        // 只接了档内一块屏 → require_all 拒绝
+        assert!(!profile_match_hit(&p, &["JKA27B3".to_string()], None, None));
+        // 两块都在 → 命中
+        assert!(profile_match_hit(&p, &["JKA27B3".to_string(), "DEL1234".to_string()], None, None));
+        // 多接了一块 → 集合不一致，拒绝
+        assert!(!profile_match_hit(
+            &p,
+            &["JKA27B3".to_string(), "DEL1234".to_string(), "HP5678".to_string()],
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn subset_mode_allows_extra_displays() {
+        let mut m = m_all();
+        m.require_all_displays = false;
+        let p = prof("main", Some("JKA27B3"), Some(m));
+        assert!(profile_match_hit(&p, &["JKA27B3".to_string(), "HP5678".to_string()], None, None));
+        assert!(!profile_match_hit(&p, &["HP5678".to_string()], None, None));
+    }
+
+    #[test]
+    fn on_ac_and_time_conditions_must_hold() {
+        let mut m = m_all();
+        m.on_ac = Some(false);
+        let p = prof("mobile", None, Some(m));
+        assert!(!profile_match_hit(&p, &[], Some(true), None));
+        assert!(profile_match_hit(&p, &[], Some(false), None));
+        assert!(!profile_match_hit(&p, &[], None, None)); // 未知供电不算命中
+
+        let mut m2 = m_all();
+        m2.time_range = Some("09:00-19:00".into());
+        let p2 = prof("day", None, Some(m2));
+        assert!(profile_match_hit(&p2, &[], None, Some(1000)));
+        assert!(!profile_match_hit(&p2, &[], None, Some(2000)));
+        assert!(!profile_match_hit(&p2, &[], None, None));
+    }
+
+    #[test]
+    fn pick_prefers_list_order_and_range_hits() {
+        let mut first = prof("a", Some("JKA27B3"), Some(m_all()));
+        first.auto = true;
+        let mut second = prof("b", None, Some(m_all()));
+        second.auto = false; // 关了 auto 的档绝不触发
+        let third = prof("c", None, Some(m_all()));
+        let list = vec![second, third, first.clone()];
+        // 列表靠前者优先：c 在 b（未启用）后，但 a 匹配也排后面——按列表顺序找第一个 auto 且命中的
+        let (hit, reason) = auto_pick_profile(
+            &list,
+            &["JKA27B3".to_string()],
+            None,
+            None,
+            Some("显示器连接变化"),
+            &[],
+        )
+        .expect("应命中 c");
+        assert_eq!(hit.id, "p-c");
+        assert_eq!(reason, "显示器连接变化");
+        // 时间段命中：即使没有全局触发
+        let mut with_range = prof("d", None, Some(m_all()));
+        with_range.match_.as_mut().unwrap().time_range = Some("09:00-19:00".into());
+        let list2 = vec![with_range];
+        let (hit2, reason2) = auto_pick_profile(&list2, &[], None, Some(900), None, &["p-d".to_string()])
+            .expect("时间段应命中");
+        assert_eq!(hit2.id, "p-d");
+        assert!(reason2.contains("时间段"));
+    }
+
+    #[test]
+    fn disabled_profile_never_triggers() {
+        let mut p = prof("off", Some("JKA27B3"), Some(m_all()));
+        p.auto = false;
+        assert!(auto_pick_profile(
+            &[p],
+            &["JKA27B3".to_string()],
+            None,
+            None,
+            Some("显示器连接变化"),
+            &[]
+        )
+        .is_none());
+    }
+}

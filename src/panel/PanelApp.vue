@@ -212,6 +212,16 @@ const quickActions = computed(() => [
   { key: 'rotate', label: '旋转副屏', icon: 'rotate', run: () => act(() => invoke('rotate_secondary'), '副屏已旋转') },
   { key: 'color', label: '色彩同步', icon: 'palette', run: () => act(() => invoke('apply_color_space', { space: 'sRGB' })) },
   { key: 'repair', label: '修复显示器', icon: 'wrench', run: () => act(() => invoke('repair_display')) },
+  {
+    key: 'autopause',
+    label: '暂停自动切换 1 小时',
+    icon: 'moon',
+    run: () =>
+      act(
+        () => invoke('auto_pause', { minutes: 60 }),
+        '自动切换已暂停 1 小时（主窗口「自动规则」可恢复）',
+      ),
+  },
 ]);
 
 /** 把窗口高度校准为内容实际高度，消除底部留白（浏览器预览下跳过） */

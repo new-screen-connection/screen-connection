@@ -202,6 +202,8 @@ export interface ProfileMatch {
   require_all_displays: boolean;
   docking: boolean | null;
   on_ac: boolean | null;
+  /** 时间段触发，形如 "09:00-19:00"（支持跨零点；空/非法 = 不限） */
+  time_range: string | null;
 }
 
 /** 应用过程的一步（want/got 都是人话） */
@@ -219,6 +221,41 @@ export interface ApplyReport {
   ok: boolean;
   rolled_back: boolean;
   steps: ApplyStep[];
+}
+
+/** 自动触发源开关（P1-1） */
+export interface AutoSources {
+  displays_changed: boolean;
+  on_ac: boolean;
+  time_range: boolean;
+}
+
+/** 最近一次自动应用记录 */
+export interface AutoLastApplied {
+  profile_id: string;
+  profile_name: string;
+  at: string;
+  reason: string;
+  ok: boolean;
+}
+
+/** 自动触发配置（后端 2 秒轮询引擎读这份配置） */
+export interface AutoConfig {
+  enabled: boolean;
+  sources: AutoSources;
+  quiet_minutes: number;
+  /** 暂停截止时间（Unix 秒）；null = 未暂停 */
+  paused_until_epoch: number | null;
+  last_applied: AutoLastApplied | null;
+}
+
+/** 自动应用事件（screens://auto-applied 推送载荷） */
+export interface AutoEvent {
+  kind: 'applied' | 'rolled_back' | 'skipped';
+  profile_id: string;
+  profile_name: string;
+  reason: string;
+  message: string;
 }
 
 /** 所有前端会调用到的后端命令名，集中登记避免拼写漂移 */
@@ -286,6 +323,9 @@ export const CMD = {
   profileReorder: 'profile_reorder',
   profileExportJson: 'profile_export_json',
   profileImportJson: 'profile_import_json',
+  autoRulesGet: 'auto_rules_get',
+  autoRulesSet: 'auto_rules_set',
+  autoPause: 'auto_pause',
   diagLogPath: 'diag_log_path',
   openLogDir: 'open_log_dir',
   appStateJson: 'app_state_json',

@@ -956,6 +956,7 @@ pub fn get_display_modes(display_id: &str) -> Result<Vec<DisplayMode>, String> {
 
 /// Apply a selected mode by its displayplacer index, then read it back and roll back on mismatch.
 pub fn set_display_mode(display_id: &str, mode_index: u32) -> Result<String, String> {
+    mark_change(); // 用户主动改的显示配置：自动触发 quiet_minutes 内让路
     let mut screens = parse_screens();
     let original = screens.clone();
     let target = screens
@@ -2150,6 +2151,7 @@ fn find_ddc_id(display_id: &str) -> Result<u32, String> {
 /// 设置亮度 0-100
 pub fn set_brightness(display_id: &str, value: u32) -> Result<(), String> {
     use ddc::Ddc;
+    mark_change(); // 用户主动改的显示配置：自动触发 quiet_minutes 内让路
     let cgid = find_ddc_id(display_id)?;
     with_ddc_monitor(cgid, move |monitor| {
         monitor.get_vcp_feature(0x10).and_then(|current| {
@@ -2164,6 +2166,7 @@ pub fn set_brightness(display_id: &str, value: u32) -> Result<(), String> {
 /// 设置音量 0-100
 pub fn set_volume(display_id: &str, value: u32) -> Result<(), String> {
     use ddc::Ddc;
+    mark_change(); // 用户主动改的显示配置：自动触发 quiet_minutes 内让路
     let cgid = find_ddc_id(display_id)?;
     with_ddc_monitor(cgid, move |monitor| {
         monitor.get_vcp_feature(0x62).and_then(|current| {
@@ -2391,6 +2394,7 @@ pub fn match_ppi() -> Result<(), String> {
 
 /// 副屏横/竖屏切换（再点一次转回，可恢复）
 pub fn rotate_secondary() -> Result<(), String> {
+    mark_change(); // 用户主动改的显示配置：自动触发 quiet_minutes 内让路
     let screens = parse_screens();
     let (main, sec) = main_secondary(&screens)?;
     let sps = screens_native();
@@ -3692,4 +3696,59 @@ pub fn restore_foreground() -> Result<(), String> {
         return Err(format!("窗口未能完全还原：原位置 ({},{}) {}x{}，当前 ({},{}) {}x{}；还原信息已保留", saved.x, saved.y, saved.w, saved.h, actual.x, actual.y, actual.w, actual.h));
     }
     std::fs::remove_file(path).map_err(|e| format!("窗口已还原，但清除状态失败：{}", e))
+}
+
+// ===== 场景自动触发轮询原语（P1-1，macOS 侧） =====
+
+static LAST_INTENT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// 用户主动改了显示配置（set_brightness/set_volume/set_display_mode/rotate 都会标记）
+pub fn mark_change() {
+    if let Ok(mut g) = LAST_INTENT.lock() {
+        *g = Some(std::time::Instant::now());
+    }
+}
+
+/// 最近 secs 秒内是否由用户主动改过显示配置
+pub fn recently_changed(secs: u64) -> bool {
+    if let Ok(g) = LAST_INTENT.lock() {
+        if let Some(t) = *g {
+            return t.elapsed().as_secs() < secs;
+        }
+    }
+    false
+}
+
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    /// -1.0 = 接通电源（不剩续航时间）、-2.0 = 未知、其他 = 电池剩余秒数
+    fn IOPSGetTimeRemainingEstimate() -> std::os::raw::c_double;
+}
+
+/// 在用显示器集合指纹（在线显示器 id 集合；CoreGraphics 原生，微秒级）
+pub fn auto_display_fingerprint() -> String {
+    display_snapshot().join("\n")
+}
+
+/// 是否接通交流电：Some(是/否)；None = 系统报不上来
+pub fn auto_on_ac() -> Option<bool> {
+    let v = unsafe { IOPSGetTimeRemainingEstimate() };
+    if v == -1.0 {
+        Some(true)
+    } else if v == -2.0 {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+/// 本地时刻 HH*100+MM（时间段触发用；30 秒一次的频度下 date 进程开销可忽略）
+pub fn auto_local_hhmm() -> Option<u32> {
+    let out = run_cmd("date", &["+%H%M"]).ok()?;
+    out.trim().parse::<u32>().ok()
+}
+
+/// 当前屏幕的匹配键集合：macOS 捕获存的是 display id（EDID 无来源），直接用 id
+pub fn auto_current_keys() -> Vec<String> {
+    display_snapshot()
 }

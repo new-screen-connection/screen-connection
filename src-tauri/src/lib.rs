@@ -500,24 +500,45 @@ async fn profile_apply(id: String) -> Result<platform::ApplyReport, String> {
         .map_err(|e| format!("后台任务失败：{}", e))?
 }
 
-/// 更新档位：改名 / 重捕获 targets（「更新为当前状态」）/ 开关自动触发标记
+/// 更新档位：改名 / 重捕获 targets（「更新为当前状态」）/ 开关自动触发标记 / 改匹配条件
+/// （match 用双层 Option：不传 = 不动；传 null = 清空匹配条件）
 #[tauri::command]
 async fn profile_update(
     id: String,
     name: Option<String>,
     recapture: Option<bool>,
     auto: Option<bool>,
+    r#match: Option<Option<platform::ProfileMatch>>,
 ) -> Result<platform::Profile, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        platform::profile_update_impl(
-            &id,
-            name.as_deref(),
-            recapture.unwrap_or(false),
-            auto,
-        )
+        platform::profile_update_impl(&id, name.as_deref(), recapture.unwrap_or(false), auto, r#match)
     })
     .await
     .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 自动触发配置读取（P1-1）
+#[tauri::command]
+async fn auto_rules_get() -> platform::AutoConfig {
+    tauri::async_runtime::spawn_blocking(platform::auto_rules_get_impl)
+        .await
+        .unwrap_or_default()
+}
+
+/// 自动触发配置保存
+#[tauri::command]
+async fn auto_rules_set(config: platform::AutoConfig) -> Result<platform::AutoConfig, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::auto_rules_set_impl(config))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 暂停自动切换 minutes 分钟（0 = 立即恢复）
+#[tauri::command]
+async fn auto_pause(minutes: u32) -> Result<platform::AutoConfig, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::auto_pause_impl(minutes))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
 }
 
 #[tauri::command]
@@ -1663,6 +1684,234 @@ fn spawn_windows_power_link_watch(app: tauri::AppHandle) {
     });
 }
 
+// ===== 场景自动触发引擎（P1-1）=====
+// 2 秒一轮：便宜指纹（原生 API）查变化 → 3 秒防抖 → 匹配档位 → 静默期检查 → 应用。
+// 纯自动路径直接调 profile_apply_platform（不标手动变更）；应用前后拉开回声窗口，
+// 把自己造成的指纹变化吞掉，避免「应用→检测到变化→再应用」死循环。
+
+fn auto_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn auto_watch_loop(app: tauri::AppHandle) {
+    use std::time::{Duration, Instant};
+    use tauri::Emitter;
+
+    let emit_auto = |kind: &str, p: Option<&platform::Profile>, reason: &str, message: &str| {
+        let payload = serde_json::json!({
+            "kind": kind,
+            "profile_id": p.map(|x| x.id.clone()).unwrap_or_default(),
+            "profile_name": p.map(|x| x.name.clone()).unwrap_or_default(),
+            "reason": reason,
+            "message": message,
+        });
+        let _ = app.emit("screens://auto-applied", payload);
+    };
+
+    // 启动先等显示栈稳定再采基线，避免开机瞬间把「初始化」当「插拔」
+    std::thread::sleep(Duration::from_secs(10));
+    let mut baseline = platform::auto_display_fingerprint();
+    let mut prev_ac = platform::auto_on_ac();
+    let mut change_at: Option<Instant> = None;
+    let mut range_in: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut last_range_check = Instant::now();
+    let mut echo_until = Instant::now();
+
+    loop {
+        std::thread::sleep(Duration::from_secs(2));
+        let cfg = platform::auto_cfg_load();
+
+        let paused = cfg
+            .paused_until_epoch
+            .map(|until| auto_epoch_secs() < until)
+            .unwrap_or(false);
+        if !cfg.enabled || paused {
+            // 关闭/暂停期间只刷基线，保证重新开启后不会拿陈旧基线立刻误触发
+            let fp = platform::auto_display_fingerprint();
+            if !fp.is_empty() {
+                baseline = fp;
+            }
+            prev_ac = platform::auto_on_ac();
+            change_at = None;
+            continue;
+        }
+        if Instant::now() < echo_until {
+            // 回声窗口：刚应用过，等显示栈稳定后直接把新状态当基线
+            let fp = platform::auto_display_fingerprint();
+            if !fp.is_empty() {
+                baseline = fp;
+            }
+            prev_ac = platform::auto_on_ac();
+            change_at = None;
+            continue;
+        }
+
+        let mut trigger: Option<String> = None;
+
+        // ① 显示器集合变化 → 3 秒防抖（防抖期内再变就重新计时）
+        if cfg.sources.displays_changed {
+            let fp = platform::auto_display_fingerprint();
+            if fp != baseline {
+                if !fp.is_empty() {
+                    baseline = fp;
+                }
+                change_at = Some(Instant::now());
+                continue;
+            }
+            if let Some(t) = change_at {
+                if t.elapsed() >= Duration::from_secs(3) {
+                    change_at = None;
+                    trigger = Some("显示器连接变化".to_string());
+                } else {
+                    continue; // 防抖未满，等下一轮
+                }
+            }
+        }
+
+        // ② 电源接入/断开（笔记本插拔适配器）
+        if trigger.is_none() && cfg.sources.on_ac {
+            let ac = platform::auto_on_ac();
+            if let (Some(a), Some(p)) = (ac, prev_ac) {
+                if a != p {
+                    trigger = Some(if a { "接通电源" } else { "切换到电池" }.to_string());
+                }
+            }
+            prev_ac = ac;
+        }
+
+        // ③ 时间段进出：每 30 秒查一次，刚进入时间段的档位作为候选
+        let mut range_hits: Vec<String> = Vec::new();
+        if cfg.sources.time_range && last_range_check.elapsed() >= Duration::from_secs(30) {
+            last_range_check = Instant::now();
+            if let Some(hhmm) = platform::auto_local_hhmm() {
+                for p in platform::load_profiles() {
+                    let Some(m) = p.match_.as_ref() else { continue };
+                    let Some(tr) = m.time_range.as_deref() else { continue };
+                    if tr.trim().is_empty() || !p.auto {
+                        continue;
+                    }
+                    let now_in = platform::time_in_range(tr, hhmm);
+                    let was_in = range_in.get(&p.id).copied().unwrap_or(false);
+                    range_in.insert(p.id.clone(), now_in);
+                    if now_in && !was_in {
+                        range_hits.push(p.id);
+                    }
+                }
+            }
+        }
+
+        if trigger.is_none() && range_hits.is_empty() {
+            continue;
+        }
+
+        // 静默期：用户最近手动改过 → 跳过本次并轻提示
+        let quiet_secs = u64::from(cfg.quiet_minutes.max(1)) * 60;
+        if platform::manual_recently(quiet_secs) {
+            emit_auto(
+                "skipped",
+                None,
+                trigger.as_deref().unwrap_or("到达时间段"),
+                "检测到手动调整，本次未自动切换",
+            );
+            continue;
+        }
+
+        // 匹配：列表顺序取第一个命中的
+        let profiles = platform::load_profiles();
+        let hhmm = platform::auto_local_hhmm();
+        let on_ac = platform::auto_on_ac();
+        let keys = platform::auto_current_keys();
+        let Some((p, reason)) = platform::auto_pick_profile(
+            &profiles,
+            &keys,
+            on_ac,
+            hhmm,
+            trigger.as_deref(),
+            &range_hits,
+        ) else {
+            continue; // 没有档位命中：常见情况，不打扰
+        };
+
+        // 应用（拉开回声窗口吞掉自己造成的变化）
+        echo_until = Instant::now() + Duration::from_secs(15);
+        let last = match platform::profile_apply_platform(&p) {
+            Ok(r) => {
+                let rolled = r.rolled_back;
+                let ok = r.ok && !rolled;
+                if rolled {
+                    // 安全阀：自动应用回滚 → 停用该档 auto，防止反复乱改
+                    let mut list = platform::load_profiles();
+                    if let Some(x) = list.iter_mut().find(|x| x.id == p.id) {
+                        x.auto = false;
+                    }
+                    let _ = platform::save_profiles(&list);
+                    show_notify(
+                        &app,
+                        "⚠️",
+                        "场景自动应用失败",
+                        &format!(
+                            "「{}」自动应用失败已回滚。为避免反复改动，该档自动触发已停用，可重新开启。",
+                            p.name
+                        ),
+                    );
+                }
+                emit_auto(
+                    if rolled { "rolled_back" } else { "applied" },
+                    Some(&p),
+                    &reason,
+                    if rolled {
+                        "自动应用失败，已整体回滚；该档自动触发已停用"
+                    } else if r.ok {
+                        "自动应用完成"
+                    } else {
+                        "部分成功：个别项这台显示器不支持"
+                    },
+                );
+                platform::AutoLastApplied {
+                    profile_id: p.id.clone(),
+                    profile_name: p.name.clone(),
+                    at: platform::now_str(),
+                    reason,
+                    ok,
+                }
+            }
+            Err(e) => {
+                let mut list = platform::load_profiles();
+                if let Some(x) = list.iter_mut().find(|x| x.id == p.id) {
+                    x.auto = false;
+                }
+                let _ = platform::save_profiles(&list);
+                show_notify(
+                    &app,
+                    "⚠️",
+                    "场景自动应用失败",
+                    &format!("「{}」自动应用出错（{}）。该档自动触发已停用。", p.name, e),
+                );
+                emit_auto("rolled_back", Some(&p), &reason, &format!("自动应用出错：{}", e));
+                platform::AutoLastApplied {
+                    profile_id: p.id.clone(),
+                    profile_name: p.name.clone(),
+                    at: platform::now_str(),
+                    reason,
+                    ok: false,
+                }
+            }
+        };
+        let mut c = platform::auto_cfg_load();
+        c.last_applied = Some(last);
+        let _ = platform::auto_cfg_save(&c);
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn spawn_auto_watch(app: tauri::AppHandle) {
+    std::thread::spawn(move || auto_watch_loop(app));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1759,6 +2008,10 @@ pub fn run() {
             #[cfg(target_os = "windows")]
             spawn_windows_power_link_watch(app.handle().clone());
 
+            // 场景自动触发引擎（P1-1）：显示器变化/电源/时间段 → 自动应用场景档
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            spawn_auto_watch(app.handle().clone());
+
             // v0.3.3：启动后采集一次「基线快照」（供「一键恢复默认」和「退出自动还原」）
             // 延后几秒，等显示/音频栈就绪再读，避免采到空值
             std::thread::spawn(|| {
@@ -1826,6 +2079,9 @@ pub fn run() {
             profile_reorder,
             profile_export_json,
             profile_import_json,
+            auto_rules_get,
+            auto_rules_set,
+            auto_pause,
             health_get_config,
             health_set_config,
             get_notify_payload,

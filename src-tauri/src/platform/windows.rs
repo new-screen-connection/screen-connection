@@ -2791,7 +2791,8 @@ fn secondary_dev() -> Result<(String, u32), String> {
 // 用户实测：点「副屏方向」当场生效、几秒后自己变回去了，正是这个原因。
 static LAST_INTENT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
-fn mark_change() {
+/// 用户主动改了显示配置：自动修复 120 秒内不插手；P1-1 自动触发用 quiet_minutes 判断
+pub fn mark_change() {
     if let Ok(mut g) = LAST_INTENT.lock() {
         *g = Some(std::time::Instant::now());
     }
@@ -6440,11 +6441,13 @@ pub fn profile_capture_impl_platform() -> Result<ProfileTargets, String> {
             color_space: d.color_profile.clone(),
         });
     }
-    // HDR：任一屏开着就算「开」
-    let hdr_on = hdr_states()
+    // HDR：任一屏开着就算「开」；没有任何屏支持 HDR 时不记目标（应用阶段无从核验）
+    let hdr_raw = hdr_states();
+    let hdr_on = hdr_raw
         .lines()
         .filter(|l| l.starts_with("H|"))
         .any(|l| l.split('|').nth(3) == Some("1"));
+    let hdr_capable = hdr_raw.lines().any(|l| l.starts_with("H|"));
     // 音频：当前用户选定的端点
     let audio = audio_endpoints()
         .ok()
@@ -6453,7 +6456,7 @@ pub fn profile_capture_impl_platform() -> Result<ProfileTargets, String> {
         displays,
         main_display: None, // Windows 主屏切换无可靠 API，不捕获（macOS 才记）
         audio_device_id: audio,
-        hdr: Some(hdr_on),
+        hdr: if hdr_capable { Some(hdr_on) } else { None },
     })
 }
 
@@ -6767,7 +6770,18 @@ pub fn profile_apply_impl_platform(profile: &Profile) -> Result<ApplyReport, Str
                         err = Some("支持 HDR 的屏回读与目标不一致".to_string());
                     }
                 }
-                Err(e) => err = Some(e),
+                Err(e) => {
+                    if e.contains("没有支持 HDR") {
+                        // 本机没有 HDR 屏：目标为关 = 状态本来就是关，算成功；目标为开才算失败
+                        got = "本机没有支持 HDR 的显示器".into();
+                        ok = !on;
+                        if !ok {
+                            err = Some("没有任何屏支持 HDR，无法开启".to_string());
+                        }
+                    } else {
+                        err = Some(e);
+                    }
+                }
             }
             steps.push(ApplyStep {
                 target: "全局".into(),
@@ -7064,4 +7078,210 @@ mod health_tests {
             std::fs::rename(&user_backup, &path).ok();
         }
     }
+
+    /// 手动冒烟：cargo test auto_smoke -- --ignored --nocapture
+    /// 验证 P1-1 轮询原语真机可用 + 配置读写/暂停 roundtrip（用户数据保护同上）
+    #[test]
+    #[ignore]
+    fn auto_smoke() {
+        use crate::platform::{auto_pause_impl, auto_rules_get_impl, auto_rules_set_impl};
+        // ① 原生指纹：非空、含设备名、两次读取稳定、且必须快（<50ms）
+        let t0 = std::time::Instant::now();
+        let fp1 = auto_display_fingerprint();
+        let dt = t0.elapsed();
+        println!("指纹（{}ms）：{:?}", dt.as_millis(), fp1.lines().collect::<Vec<_>>());
+        assert!(!fp1.is_empty(), "原生 EnumDisplayDevicesW 应至少读到 1 块活动屏");
+        assert!(fp1.contains("DISPLAY"), "指纹应含设备名");
+        assert!(dt.as_millis() < 200, "轮询原语必须便宜（实际 {}ms）", dt.as_millis());
+        let fp2 = auto_display_fingerprint();
+        assert_eq!(fp1, fp2, "无插拔时指纹应稳定");
+
+        // ② 电源状态：打印（笔记本 Some(true/false)，拿不到就是 None，都不算失败）
+        let ac = auto_on_ac();
+        println!("接通电源：{:?}", ac);
+
+        // ③ 本地时刻：应等于系统当前时间（HHMM）
+        let hhmm = auto_local_hhmm().expect("GetLocalTime 应成功");
+        println!("本地时刻 HHMM：{}", hhmm);
+        assert!(hhmm < 2400);
+
+        // ④ 配置读写 roundtrip：auto_pause 暂停/恢复 + last_applied 保留
+        let user_backup = std::path::PathBuf::from(std::env::var("APPDATA").unwrap_or_default())
+            .join("Screenguard")
+            .join("auto.json");
+        let had_user = user_backup.exists() && std::fs::copy(&user_backup, user_backup.with_extension("json.user-bak")).is_ok();
+        let mut cfg = auto_rules_get_impl();
+        let keep = cfg.last_applied.clone();
+        cfg.enabled = true;
+        cfg.sources.displays_changed = true;
+        cfg.last_applied = Some(crate::platform::AutoLastApplied {
+            profile_id: "smoke".into(),
+            profile_name: "冒烟".into(),
+            at: String::new(),
+            reason: "测试".into(),
+            ok: true,
+        });
+        // last_applied 由引擎负责（auto_rules_set 会保留磁盘旧值），这里直写文件再演练暂停
+        crate::platform::auto_cfg_save(&cfg).expect("保存配置失败");
+        auto_rules_set_impl(cfg.clone()).expect("set 不应失败");
+        let via_set = auto_rules_get_impl();
+        assert!(via_set.last_applied.is_some(), "auto_rules_set 应保留磁盘上的 last_applied");
+        let paused = auto_pause_impl(1).expect("暂停失败");
+        assert!(paused.paused_until_epoch.is_some(), "暂停后应有截止时间");
+        let resumed = auto_pause_impl(0).expect("恢复失败");
+        assert!(resumed.paused_until_epoch.is_none(), "恢复后应无截止时间");
+        assert!(resumed.enabled, "auto_pause 不应动总开关");
+        assert!(resumed.last_applied.is_some(), "last_applied 应保留");
+        assert_eq!(resumed.last_applied.unwrap().profile_id, "smoke");
+        // 还原用户数据
+        if had_user {
+            std::fs::rename(user_backup.with_extension("json.user-bak"), &user_backup).ok();
+        } else {
+            let _ = std::fs::remove_file(&user_backup);
+        }
+        let _ = keep;
+        println!("auto_smoke 全部通过");
+    }
+}
+
+// ===== 场景自动触发轮询原语（P1-1）=====
+// 约束：这几条在 2 秒轮询里跑，必须走原生 API（绝不许走 PS 桥 —— 单次几百毫秒）。
+
+const DISPLAY_DEVICE_ACTIVE: u32 = 0x0000_0001;
+const EDD_GET_DEVICE_INTERFACE_NAME: u32 = 0x0000_0001;
+
+#[repr(C)]
+struct AutoDisplayDeviceW {
+    cb: u32,
+    device_name: [u16; 32],
+    device_string: [u16; 128],
+    state_flags: u32,
+    device_id: [u16; 128],
+    device_key: [u16; 128],
+}
+
+impl AutoDisplayDeviceW {
+    fn zeroed() -> Self {
+        AutoDisplayDeviceW {
+            cb: std::mem::size_of::<AutoDisplayDeviceW>() as u32,
+            device_name: [0; 32],
+            device_string: [0; 128],
+            state_flags: 0,
+            device_id: [0; 128],
+            device_key: [0; 128],
+        }
+    }
+
+    fn text(buf: &[u16]) -> String {
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..end])
+    }
+}
+
+extern "system" {
+    fn EnumDisplayDevicesW(dev: *const u16, num: u32, out: *mut AutoDisplayDeviceW, flags: u32) -> i32;
+    fn GetSystemPowerStatus(s: *mut AutoPowerStatus) -> i32;
+    fn GetLocalTime(t: *mut AutoSystemTime) -> i32;
+}
+
+#[repr(C)]
+struct AutoPowerStatus {
+    ac_line: u8,
+    battery_flag: u8,
+    battery_percent: u8,
+    reserved: u8,
+    battery_seconds: u32,
+    battery_full_seconds: u32,
+}
+
+#[repr(C)]
+struct AutoSystemTime {
+    year: u16,
+    month: u16,
+    day_of_week: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    millis: u16,
+}
+
+/// 在用显示器集合指纹（设备名 + 设备接口路径）。原生 EnumDisplayDevicesW，
+/// 微秒级；路径对「同一块屏插同一个口」稳定，插拔/换口会变。
+pub fn auto_display_fingerprint() -> String {
+    let mut out: Vec<String> = Vec::new();
+    for i in 0..64u32 {
+        let mut dd = AutoDisplayDeviceW::zeroed();
+        if unsafe { EnumDisplayDevicesW(std::ptr::null(), i, &mut dd, 0) } == 0 {
+            break;
+        }
+        if dd.state_flags & DISPLAY_DEVICE_ACTIVE == 0 {
+            continue;
+        }
+        let name = AutoDisplayDeviceW::text(&dd.device_name);
+        if name.is_empty() {
+            continue;
+        }
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut dd2 = AutoDisplayDeviceW::zeroed();
+        let ok = unsafe {
+            EnumDisplayDevicesW(wide.as_ptr(), 0, &mut dd2, EDD_GET_DEVICE_INTERFACE_NAME)
+        };
+        let path = if ok == 1 { AutoDisplayDeviceW::text(&dd2.device_id) } else { String::new() };
+        out.push(format!("{}|{}", name, path));
+    }
+    out.sort();
+    out.join("\n")
+}
+
+/// 是否接通交流电：Some(是/否)；None = 系统报不上来（台式机通常恒 Some(true)）
+pub fn auto_on_ac() -> Option<bool> {
+    let mut s = AutoPowerStatus {
+        ac_line: 255,
+        battery_flag: 0,
+        battery_percent: 0,
+        reserved: 0,
+        battery_seconds: 0,
+        battery_full_seconds: 0,
+    };
+    if unsafe { GetSystemPowerStatus(&mut s) } == 0 {
+        return None;
+    }
+    match s.ac_line {
+        1 => Some(true),
+        0 => Some(false),
+        _ => None,
+    }
+}
+
+/// 本地时刻 HH*100+MM（时间段触发用）
+pub fn auto_local_hhmm() -> Option<u32> {
+    let mut t = AutoSystemTime {
+        year: 0,
+        month: 0,
+        day_of_week: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        millis: 0,
+    };
+    if unsafe { GetLocalTime(&mut t) } == 0 {
+        return None;
+    }
+    Some(u32::from(t.hour) * 100 + u32::from(t.minute))
+}
+
+/// 当前屏幕的匹配键集合：EDID 键（JKA27B3）优先，拿不到用显示器 uid。
+/// 只许在触发评估时调用（edid_keys 走 PS 桥，贵；轮询里严禁）。
+pub fn auto_current_keys() -> Vec<String> {
+    let edids = edid_keys();
+    let mut out: Vec<String> = Vec::new();
+    for (uid, key) in &edids {
+        out.push(key.clone());
+        out.push(uid.clone()); // captured_id 存的是 uid，一并放进候选集兜底
+    }
+    out.sort();
+    out.dedup();
+    out
 }

@@ -3,9 +3,18 @@
  * 在 Tauri WebView 内不生效；`npm run dev` 直接在浏览器打开时可预览全部界面与交互。
  */
 import type { AudioEndpoint, BatteryInfo, DisplayInfo, HealthReport, Topology } from '../types';
-import type { ApplyReport, Profile } from '../types';
+import type { ApplyReport, AutoConfig, Profile } from '../types';
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** 自动触发配置假数据（浏览器预览） */
+const mockAuto: AutoConfig = {
+  enabled: false,
+  sources: { displays_changed: true, on_ac: false, time_range: false },
+  quiet_minutes: 5,
+  paused_until_epoch: null,
+  last_applied: null,
+};
 
 const displays: DisplayInfo[] = [
   {
@@ -382,6 +391,11 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       const p = mockProfiles.find((x) => x.id === id);
       if (!p) throw new Error(`未找到场景档 ${id}`);
       if (args?.name) p.name = String(args.name);
+      if (args?.recapture) {
+        for (const d of p.targets.displays) d.brightness = 60 + Math.floor(Math.random() * 30);
+      }
+      if (typeof args?.auto === 'boolean') p.auto = args.auto;
+      if (args?.match !== undefined) p.match = args.match as Profile['match'];
       p.updated_at = '刚刚';
       return JSON.parse(JSON.stringify(p)) as T;
     }
@@ -411,6 +425,24 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       p.id = 'mock-' + Date.now();
       mockProfiles.push(JSON.parse(JSON.stringify(p)));
       return p as T;
+    }
+    // ---------- 场景自动触发（P1-1）：假配置可改、可暂停 ----------
+    case 'auto_rules_get':
+      return JSON.parse(JSON.stringify(mockAuto)) as T;
+    case 'auto_rules_set': {
+      const cfg = args?.config as AutoConfig;
+      mockAuto.enabled = cfg.enabled;
+      mockAuto.sources = { ...cfg.sources };
+      mockAuto.quiet_minutes = cfg.quiet_minutes;
+      if (!mockAuto.enabled) mockAuto.paused_until_epoch = null;
+      return JSON.parse(JSON.stringify(mockAuto)) as T;
+    }
+    case 'auto_pause': {
+      const minutes = Number(args?.minutes ?? 0);
+      mockAuto.enabled = true;
+      mockAuto.paused_until_epoch =
+        minutes > 0 ? Math.floor(Date.now() / 1000) + minutes * 60 : null;
+      return JSON.parse(JSON.stringify(mockAuto)) as T;
     }
     case 'health_report_markdown':
       return (
