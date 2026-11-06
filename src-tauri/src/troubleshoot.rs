@@ -589,10 +589,18 @@ pub fn build_llm_payload(text: &str, report: &HealthReport) -> serde_json::Value
 
 /// 记录「是否联网分析过」——只在日志目录追加一行时间戳，不记录任何内容（隐私铁律）。
 fn log_llm_used() {
+    #[cfg(target_os = "windows")]
     let dir = match std::env::var("APPDATA") {
         Ok(v) => std::path::PathBuf::from(v).join("Screenguard").join("logs"),
         Err(_) => return,
     };
+    #[cfg(target_os = "macos")]
+    let dir = match crate::platform::app_support_dir() {
+        Ok(d) => d.join("logs"),
+        Err(_) => return,
+    };
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let dir = std::env::temp_dir().join("screenguard-logs");
     if dir.exists() {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -2571,7 +2571,7 @@ struct SavedLayout {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct MacAppState {
+pub(crate) struct MacAppState {
     #[serde(default = "default_enabled")]
     pub(crate) revert_on_exit: bool,
     #[serde(default)]

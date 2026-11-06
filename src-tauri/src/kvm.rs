@@ -732,7 +732,7 @@ fn tcp_addr(ip: &str) -> Result<SocketAddr, String> {
 
 fn connect_peer(rec: &PeerRecord) -> Result<TcpStream, String> {
     let to = Duration::from_millis(1200); // 拔网线的场景必须 1 秒级给出提示
-    let mut last_err = String::new();
+    let last_err;
     // ① 上次地址
     match rec.peer.addr.rsplit_once(':') {
         Some((ip, _)) => match tcp_addr(ip) {
