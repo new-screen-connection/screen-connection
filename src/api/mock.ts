@@ -3,7 +3,7 @@
  * 在 Tauri WebView 内不生效；`npm run dev` 直接在浏览器打开时可预览全部界面与交互。
  */
 import type { AudioEndpoint, BatteryInfo, DisplayInfo, HealthReport, Topology } from '../types';
-import type { ApplyReport, AutoConfig, Profile } from '../types';
+import type { ApplyReport, AutoConfig, KvmPeer, Profile } from '../types';
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -15,6 +15,18 @@ const mockAuto: AutoConfig = {
   paused_until_epoch: null,
   last_applied: null,
 };
+
+/** 软 KVM 假对端（浏览器预览） */
+const mockKvmPeers: KvmPeer[] = [
+  {
+    id: 'mock-peer-1',
+    name: 'MacBook Pro',
+    addr: '192.168.1.23:47822',
+    fingerprint: '9f8e7d6c5b4a3210',
+    my_source: 'dp',
+    paired_at: '2026-11-05 21:02:14',
+  },
+];
 
 const displays: DisplayInfo[] = [
   {
@@ -444,6 +456,53 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
         minutes > 0 ? Math.floor(Date.now() / 1000) + minutes * 60 : null;
       return JSON.parse(JSON.stringify(mockAuto)) as T;
     }
+    // ---------- 软 KVM（P1-2）：假配对可走通、假切换有进度 ----------
+    case 'kvm_devices':
+      return {
+        me: '演示机',
+        peers: mockKvmPeers,
+        discovered: [
+          { name: '客厅 Mac mini', ip: '192.168.1.44' },
+        ],
+      } as T;
+    case 'kvm_pair_start':
+      return String(Math.floor(100000 + Math.random() * 900000)) as T;
+    case 'kvm_pair_join': {
+      const peer: KvmPeer = {
+        id: 'mock-' + Date.now(),
+        name: '新配对的设备',
+        addr: '192.168.1.50:47822',
+        fingerprint: 'a1b2c3d4e5f6a7b8',
+        my_source: 'hdmi1',
+        paired_at: '刚刚',
+      };
+      mockKvmPeers.push(JSON.parse(JSON.stringify(peer)));
+      return peer as T;
+    }
+    case 'kvm_peer_remove': {
+      const id = String(args?.id ?? '');
+      const i = mockKvmPeers.findIndex((p) => p.id === id);
+      if (i >= 0) mockKvmPeers.splice(i, 1);
+      return undefined as T;
+    }
+    case 'kvm_peer_set_source': {
+      const p = mockKvmPeers.find((x) => x.id === String(args?.id ?? ''));
+      if (p) p.my_source = String(args?.source ?? 'hdmi1');
+      return undefined as T;
+    }
+    case 'kvm_unpair_all':
+      mockKvmPeers.length = 0;
+      return undefined as T;
+    case 'kvm_switch':
+      await wait(600);
+      return {
+        ack_ok: true,
+        ack_detail: '音频：默认输出已切到 Mi Monitor；剪贴板：已写入',
+        input_ok: true,
+        input_msg: '已切到 HDMI 1 并经显示器确认。',
+        audio_msg: '音频：本机默认输出已切回 扬声器 (Realtek)',
+        clip_msg: '',
+      } as T;
     case 'health_report_markdown':
       return (
         '# 屏幕连接助手 · 显示体检报告\n\n' +

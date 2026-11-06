@@ -1407,3 +1407,130 @@ input[type='range']:disabled {
 .export-item.danger {
   color: var(--err);
 }
+
+/* ===== 软 KVM（P1-2） ===== */
+.btn.lg {
+  padding: 10px 22px;
+  font-size: 15px;
+}
+.btn.danger {
+  background: var(--err);
+  border-color: var(--err);
+  color: #fff;
+}
+.btn.danger-ghost {
+  color: var(--err);
+  border-color: color-mix(in srgb, var(--err) 45%, transparent);
+  background: transparent;
+}
+.btn.danger-ghost:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--err) 10%, transparent);
+}
+
+.kvm-switch-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0 4px;
+}
+.kvm-target {
+  min-width: 150px;
+}
+.kvm-progress {
+  margin: 8px 0 0;
+  color: var(--accent);
+  font-size: 13px;
+}
+.kvm-report {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  display: grid;
+  gap: 4px;
+}
+.kvm-report .ok {
+  color: var(--ok);
+}
+.kvm-report .bad {
+  color: var(--err);
+}
+
+.kvm-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+.kvm-pair-col h4 {
+  margin: 0 0 8px;
+  font-size: 13px;
+}
+.kvm-pair-row {
+  display: flex;
+  gap: 8px;
+}
+.kvm-code {
+  margin: 10px 0 4px;
+  padding: 10px 16px;
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  background: var(--panel-2);
+  border: 1px dashed var(--accent);
+  border-radius: var(--radius-sm);
+  width: fit-content;
+  user-select: all;
+}
+.kvm-code-input {
+  width: 120px;
+  font-size: 18px;
+  letter-spacing: 6px;
+  text-align: center;
+}
+.kvm-peers {
+  margin-top: 14px;
+  display: grid;
+  gap: 8px;
+}
+.kvm-peer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.kvm-peer-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.kvm-peer-side {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.kvm-peer-side select {
+  font-size: 12px;
+  padding: 3px 6px;
+}
+.kvm-unpair {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+@media (max-width: 720px) {
+  .kvm-pair {
+    grid-template-columns: 1fr;
+  }
+}

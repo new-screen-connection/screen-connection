@@ -1,6 +1,7 @@
 mod platform;
 #[cfg(any(target_os = "windows", test))]
 mod icc_profile;
+pub mod kvm;
 
 use platform::DisplayInfo;
 
@@ -568,6 +569,62 @@ async fn profile_export_json(id: String) -> Result<String, String> {
 #[tauri::command]
 async fn profile_import_json(json: String) -> Result<platform::Profile, String> {
     tauri::async_runtime::spawn_blocking(move || platform::profile_import_impl(&json))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+// ---------------- 软 KVM（P1-2） ----------------
+
+/// 发起配对：生成 6 位配对码（5 分钟内有效），等对端输入
+#[tauri::command]
+async fn kvm_pair_start() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(kvm::pair_start_impl)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 输入对端的 6 位配对码完成配对
+#[tauri::command]
+async fn kvm_pair_join(code: String) -> Result<kvm::KvmPeer, String> {
+    tauri::async_runtime::spawn_blocking(move || kvm::pair_join_impl(&code))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 已配对设备 + 局域网发现的设备
+#[tauri::command]
+fn kvm_devices() -> kvm::KvmDevices {
+    kvm::devices_impl()
+}
+
+/// 解除与一台设备的配对
+#[tauri::command]
+async fn kvm_peer_remove(id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || kvm::peer_remove_impl(&id))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 设置本机在共享屏上的输入口（对端把屏切回来时用）
+#[tauri::command]
+async fn kvm_peer_set_source(id: String, source: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || kvm::peer_set_source_impl(&id, &source))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 解除所有配对
+#[tauri::command]
+async fn kvm_unpair_all() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(kvm::unpair_all_impl)
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 一键切换（peer_id 缺省 = 唯一对端；多个时必须指定）
+#[tauri::command]
+async fn kvm_switch(peer_id: Option<String>) -> Result<kvm::KvmSwitchReport, String> {
+    tauri::async_runtime::spawn_blocking(move || kvm::switch_impl(peer_id.as_deref()))
         .await
         .map_err(|e| format!("后台任务失败：{}", e))?
 }
@@ -2012,6 +2069,10 @@ pub fn run() {
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             spawn_auto_watch(app.handle().clone());
 
+            // 软 KVM（P1-2）：UDP 发现 + TCP 协议服务（配对/切换）
+            kvm::set_app_handle(app.handle().clone());
+            kvm::ensure_started();
+
             // v0.3.3：启动后采集一次「基线快照」（供「一键恢复默认」和「退出自动还原」）
             // 延后几秒，等显示/音频栈就绪再读，避免采到空值
             std::thread::spawn(|| {
@@ -2082,6 +2143,13 @@ pub fn run() {
             auto_rules_get,
             auto_rules_set,
             auto_pause,
+            kvm_pair_start,
+            kvm_pair_join,
+            kvm_devices,
+            kvm_peer_remove,
+            kvm_peer_set_source,
+            kvm_unpair_all,
+            kvm_switch,
             health_get_config,
             health_set_config,
             get_notify_payload,

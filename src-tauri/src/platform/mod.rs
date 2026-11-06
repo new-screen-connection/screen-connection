@@ -1499,6 +1499,109 @@ pub use macos::*;
 #[cfg(target_os = "windows")]
 pub use windows::*;
 
+// ===== 软 KVM 跨平台分发（P1-2）=====
+// kvm.rs 只调这组 kvm_* 函数，不直接碰平台模块，避免 cfg 分支散落。
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub fn kvm_device_name() -> String {
+    device_name()
+}
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn kvm_device_name() -> String {
+    "未知设备".to_string()
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub fn kvm_clip_get() -> Option<String> {
+    clipboard_get_text()
+}
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn kvm_clip_get() -> Option<String> {
+    None
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub fn kvm_clip_set(text: &str) -> Result<(), String> {
+    clipboard_set_text(text)
+}
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn kvm_clip_set(_text: &str) -> Result<(), String> {
+    Err("当前平台不支持剪贴板".to_string())
+}
+
+/// 把系统默认输出切到指定端点（软 KVM 接管侧用）
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub fn kvm_audio_set_default(id: &str) -> Result<(), String> {
+    audio_set_default(id)
+}
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn kvm_audio_set_default(_id: &str) -> Result<(), String> {
+    Err("当前平台不支持音频切换".to_string())
+}
+
+/// 音频输出端点候选：接管侧要挑「显示器自带音频」；发起侧要挑「本机扬声器」
+/// 返回 (id, name, form_factor, is_default)；form_factor==9 视为 HDMI/DP 音频（显示器）
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub fn kvm_audio_endpoints() -> Result<Vec<(String, String, u32, bool)>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let list = audio_endpoints()?;
+        Ok(list
+            .into_iter()
+            .map(|e| (e.id, e.name, e.form_factor, e.is_default))
+            .collect())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Ok(audio_endpoints_list()?
+            .into_iter()
+            .map(|(id, name, is_def)| (id, name, 0u32, is_def))
+            .collect())
+    }
+}
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn kvm_audio_endpoints() -> Result<Vec<(String, String, u32, bool)>, String> {
+    Err("当前平台不支持音频端点列表".to_string())
+}
+
+/// 本机执行 DDC 切输入源：优先主屏且支持 DDC 的，其次任一 DDC 屏，最后主屏。
+/// 返回（是否真发出 DDC 写入、人类可读结果）。
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub fn kvm_switch_input(source: &str) -> (bool, String) {
+    let src_key = match source.trim().to_lowercase().as_str() {
+        "dp" | "displayport" | "15" => "dp",
+        "hdmi1" | "17" => "hdmi1",
+        "hdmi2" | "18" => "hdmi2",
+        "usbc" | "usb-c" | "usb_c" | "27" => "usbc",
+        _ => source.trim(),
+    };
+    let displays = {
+        let v = get_displays();
+        if v.is_empty() {
+            return (false, "未枚举到显示器，无法切换输入源".to_string());
+        }
+        v
+    };
+    let pick = displays
+        .iter()
+        .find(|d| d.main && d.ddc)
+        .or_else(|| displays.iter().find(|d| d.ddc))
+        .or_else(|| displays.iter().find(|d| d.main))
+        .unwrap_or(&displays[0]);
+    match repair_action_impl("switch_input", Some(&pick.id), Some(src_key)) {
+        Ok(o) => match o.result {
+            RepairResult::Applied => (true, o.message),
+            RepairResult::NotApplicable => (false, o.message),
+            _ => (false, o.message),
+        },
+        Err(e) => (false, e),
+    }
+}
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn kvm_switch_input(_source: &str) -> (bool, String) {
+    (false, "当前平台不支持输入源切换".to_string())
+}
+
 #[cfg(test)]
 mod auto_tests {
     use super::*;

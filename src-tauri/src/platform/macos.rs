@@ -100,11 +100,13 @@ const CARBON_KEY_R: u32 = 0x0f;
 const CARBON_KEY_1: u32 = 0x12;
 const CARBON_KEY_2: u32 = 0x13;
 const CARBON_KEY_3: u32 = 0x14;
+const CARBON_KEY_K: u32 = 0x28; // kVK_ANSI_K，软 KVM 一键切换
 const CARBON_HOTKEY_TOGGLE_ID: u32 = 1;
 const CARBON_HOTKEY_RESTORE_ID: u32 = 2;
 const CARBON_HOTKEY_PROFILE1_ID: u32 = 3;
 const CARBON_HOTKEY_PROFILE2_ID: u32 = 4;
 const CARBON_HOTKEY_PROFILE3_ID: u32 = 5;
+const CARBON_HOTKEY_KVM_ID: u32 = 6;
 
 fn hotkeys_registered() -> &'static AtomicBool {
     static REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -164,6 +166,11 @@ unsafe extern "C" fn carbon_hotkey_handler(
             let idx = (hotkey.id - CARBON_HOTKEY_PROFILE1_ID) as usize;
             std::thread::spawn(move || {
                 crate::platform::profile_apply_by_index(idx);
+            });
+        }
+        CARBON_HOTKEY_KVM_ID => {
+            std::thread::spawn(move || {
+                crate::kvm::switch_from_hotkey();
             });
         }
         _ => {}
@@ -252,6 +259,20 @@ pub fn hotkey_start() -> Result<String, String> {
         }
         if let Some(e) = first_profile_err {
             eprintln!("[screenguard] macOS 场景档快捷键：{}", e);
+        }
+
+        // 软 KVM：Control+Option+K（注册失败只降级提示）
+        let mut hk = std::ptr::null_mut();
+        let status = RegisterEventHotKey(
+            CARBON_KEY_K,
+            modifiers,
+            CarbonEventHotKeyId { signature: CARBON_HOTKEY_SIGNATURE, id: CARBON_HOTKEY_KVM_ID },
+            target,
+            0,
+            &mut hk,
+        );
+        if status != 0 {
+            eprintln!("[screenguard] macOS Control+Option+K 注册失败（Carbon 错误码 {}）", status);
         }
 
         hotkeys_registered().store(true, Ordering::Release);
@@ -3751,4 +3772,92 @@ pub fn auto_local_hhmm() -> Option<u32> {
 /// 当前屏幕的匹配键集合：macOS 捕获存的是 display id（EDID 无来源），直接用 id
 pub fn auto_current_keys() -> Vec<String> {
     display_snapshot()
+}
+
+// ===== 软 KVM 辅助（P1-2）=====
+
+/// 本机设备名（发现/配对展示用）
+pub fn device_name() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| run_cmd("/bin/hostname", &[]).ok().map(|s| s.trim().to_string()))
+        .unwrap_or_else(|| "Mac".to_string())
+}
+
+/// 读剪贴板纯文本（pbpaste；空/失败返回 None）
+pub fn clipboard_get_text() -> Option<String> {
+    let out = run_cmd("/usr/bin/pbpaste", &[]).ok()?;
+    let t = out.trim_end_matches(['\r', '\n']);
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// 写剪贴板纯文本（pbcopy，经 stdin 传入避免转义问题）
+pub fn clipboard_set_text(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("/usr/bin/pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("pbcopy 启动失败：{}", e))?;
+    child
+        .stdin
+        .take()
+        .ok_or("pbcopy stdin 获取失败")?
+        .write_all(text.as_bytes())
+        .map_err(|e| format!("pbcopy 写入失败：{}", e))?;
+    let st = child.wait().map_err(|e| format!("pbcopy 等待失败：{}", e))?;
+    if st.success() {
+        Ok(())
+    } else {
+        Err("pbcopy 写入失败".to_string())
+    }
+}
+
+/// 把系统默认输出设备切到指定音频端点。
+/// macOS 没有系统内置 CLI，用 SwitchAudioSource（brew install switchaudio-osx）；
+/// 未安装时如实报错，调用方按「部分成功优于整体失败」继续。
+pub fn audio_set_default(id: &str) -> Result<(), String> {
+    if id.trim().is_empty() {
+        return Err("音频端点 id 为空".to_string());
+    }
+    let path = run_cmd("/bin/sh", &["-c", "command -v SwitchAudioSource"])
+        .map_err(|_| "未检测到 SwitchAudioSource（brew install switchaudio-osx 后可用音频切换）".to_string())?;
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Err("未检测到 SwitchAudioSource".to_string());
+    }
+    let out = run_cmd(&path, &["-t", "output", "-a", "set", "-n", id])?;
+    let t = out.trim();
+    if t.is_empty() || t.contains("error") || t.contains("Error") {
+        Err(format!("SwitchAudioSource 返回：{}", if t.is_empty() { "无输出" } else { t }))
+    } else {
+        Ok(())
+    }
+}
+
+/// 列出音频输出端点（id + 名称），同依赖 SwitchAudioSource
+pub fn audio_endpoints_list() -> Result<Vec<(String, String, bool)>, String> {
+    let path = run_cmd("/bin/sh", &["-c", "command -v SwitchAudioSource"])
+        .map_err(|_| "未检测到 SwitchAudioSource".to_string())?;
+    let path = path.trim().to_string();
+    let out = run_cmd(&path, &["-t", "output", "-a"])?;
+    let mut list = Vec::new();
+    let cur_default = run_cmd(&path, &["-t", "output", "-c", "get"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    for l in out.lines() {
+        let name = l.trim();
+        if name.is_empty() {
+            continue;
+        }
+        // SwitchAudioSource -a 输出设备名；无独立 id，用名称当 id（它自己的 -a set 也按名称/索引接受，
+        // 这里统一用名称匹配，避免误配）
+        list.push((name.to_string(), name.to_string(), name == cur_default));
+    }
+    Ok(list)
 }

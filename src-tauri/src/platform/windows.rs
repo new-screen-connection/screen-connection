@@ -1287,6 +1287,64 @@ public class SGCore {
     try { return InstallColorProfileW(IntPtr.Zero, profile) ? "OK" : "ERR:InstallColorProfile 失败"; }
     catch { return "ERR:InstallColorProfile 异常"; }
   }
+
+  // ---------------- 剪贴板（软 KVM 用，raw Win32，不依赖 WinForms） ----------------
+  [DllImport("user32.dll")] static extern bool OpenClipboard(IntPtr h);
+  [DllImport("user32.dll")] static extern bool CloseClipboard();
+  [DllImport("user32.dll")] static extern bool EmptyClipboard();
+  [DllImport("user32.dll")] static extern IntPtr SetClipboardData(uint f, IntPtr h);
+  [DllImport("user32.dll")] static extern IntPtr GetClipboardData(uint f);
+  [DllImport("user32.dll")] static extern bool IsClipboardFormatAvailable(uint f);
+  [DllImport("kernel32.dll")] static extern IntPtr GlobalAlloc(uint flags, UIntPtr bytes);
+  [DllImport("kernel32.dll")] static extern IntPtr GlobalLock(IntPtr h);
+  [DllImport("kernel32.dll")] static extern bool GlobalUnlock(IntPtr h);
+  [DllImport("kernel32.dll")] static extern UIntPtr GlobalSize(IntPtr h);
+
+  /// 读剪贴板纯文本 → 文本内容 / NONE / ERR:<原因>
+  public static string ClipboardGet() {
+    try {
+      if (!IsClipboardFormatAvailable(13)) return "NONE";
+      if (!OpenClipboard(IntPtr.Zero)) return "ERR:OpenClipboard 失败";
+      try {
+        IntPtr h = GetClipboardData(13);
+        if (h == IntPtr.Zero) return "NONE";
+        IntPtr p = GlobalLock(h);
+        if (p == IntPtr.Zero) return "ERR:GlobalLock 失败";
+        try {
+          int bytes = (int)GlobalSize(h);
+          if (bytes <= 0) return "NONE";
+          int chars = bytes / 2;
+          if (chars > 131072) chars = 131072;
+          string s = Marshal.PtrToStringUni(p, chars);
+          if (s == null) return "NONE";
+          int z = s.IndexOf("\0", StringComparison.Ordinal);
+          if (z >= 0) s = s.Substring(0, z);
+          return s;
+        } finally { GlobalUnlock(h); }
+      } finally { CloseClipboard(); }
+    } catch (Exception e) { return "ERR:" + e.Message; }
+  }
+
+  /// 写剪贴板纯文本（CF_UNICODETEXT）→ OK / ERR:<原因>
+  public static string ClipboardSet(string text) {
+    if (text == null) text = "";
+    try {
+      if (!OpenClipboard(IntPtr.Zero)) return "ERR:OpenClipboard 失败";
+      try {
+        EmptyClipboard();
+        IntPtr h = GlobalAlloc(2, (UIntPtr)((text.Length + 1) * 2));
+        if (h == IntPtr.Zero) return "ERR:GlobalAlloc 失败";
+        IntPtr p = GlobalLock(h);
+        if (p == IntPtr.Zero) return "ERR:GlobalLock 失败";
+        try {
+          if (text.Length > 0) Marshal.Copy(text.ToCharArray(), 0, p, text.Length);
+          Marshal.WriteInt16(p, text.Length * 2, 0);
+        } finally { GlobalUnlock(h); }
+        if (SetClipboardData(13, h) == IntPtr.Zero) return "ERR:SetClipboardData 失败";
+        return "OK";
+      } finally { CloseClipboard(); }
+    } catch (Exception e) { return "ERR:" + e.Message; }
+  }
 }
 
 // ---------------- 系统音频端点（CoreAudio COM） ----------------
@@ -1363,6 +1421,27 @@ public struct SGPV {
   [FieldOffset(8)] public IntPtr p;
   [FieldOffset(8)] public int i32;
 }
+
+// 未公开 COM 接口 IPolicyConfig：切换系统默认音频输出设备的唯一途径
+// （SoundSwitch / AudioDeviceCmdlets 同款方案，Win7~Win11 可用）。
+// 虚表 12 个方法必须按此顺序声明，SetDefaultEndpoint 在第 11 位。
+[Guid("f8679f50-850a-41cf-9c72-430f290290c8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface SGPolicyCfg {
+  [PreserveSig] int GetMixFormat(string a, IntPtr b);
+  [PreserveSig] int GetDeviceFormat(string a, bool b, IntPtr c);
+  [PreserveSig] int ResetDeviceFormat(string a);
+  [PreserveSig] int SetDeviceFormat(string a, IntPtr b, IntPtr c);
+  [PreserveSig] int GetProcessingPeriod(string a, bool b, IntPtr c, IntPtr d);
+  [PreserveSig] int SetProcessingPeriod(string a, IntPtr b);
+  [PreserveSig] int GetShareMode(string a, IntPtr b);
+  [PreserveSig] int SetShareMode(string a, IntPtr b);
+  [PreserveSig] int GetPropertyValue(string a, bool b, IntPtr c, IntPtr d);
+  [PreserveSig] int SetPropertyValue(string a, bool b, IntPtr c, IntPtr d);
+  [PreserveSig] int SetDefaultEndpoint(string a, int role);
+  [PreserveSig] int SetEndpointVisibility(string a, bool b);
+}
+[ComImport, Guid("870af99c-171d-4f9e-af0d-e63df40c2bc9")]
+class SGPolicyClient { }
 
 public class SGAudio {
   static Guid IID_VOL = new Guid("5CDF2C82-841E-4546-9722-0CF74078229A");
@@ -1633,8 +1712,20 @@ public class SGAudio {
       SGEndVol vol = VolOf(dev);
       if (vol == null) return "ERR:端点激活失败";
       if (v > 100) v = 100;
-      int r = vol.SetMasterVolumeLevelScalar(v / 100f, IntPtr.Zero);
-      return r == 0 ? "OK" : ("ERR:设置失败 hr=" + r + "（该端点是固定音量，换一个输出设备）");
+    int r = vol.SetMasterVolumeLevelScalar(v / 100f, IntPtr.Zero);
+    return r == 0 ? "OK" : ("ERR:设置失败 hr=" + r + "（该端点是固定音量，换一个输出设备）");
+  } catch (Exception e) { return "ERR:" + Esc(e.Message); }
+  }
+
+  /// 把系统默认输出设备切到指定端点（软 KVM 音频切换用）
+  /// role 0=eConsole（与托盘「默认设备」一致）
+  public static string AudioSetDefault(string id) {
+    try {
+      if (id == null || id.Length == 0) return "ERR:端点 id 为空";
+      object o = new SGPolicyClient();
+      SGPolicyCfg pc = (SGPolicyCfg)o;
+      int hr = pc.SetDefaultEndpoint(id, 0);
+      return hr == 0 ? "OK" : "ERR:hr=0x" + hr.ToString("X");
     } catch (Exception e) { return "ERR:" + Esc(e.Message); }
   }
 
@@ -4347,6 +4438,7 @@ pub fn hotkey_start() -> Result<String, String> {
         let idp1 = 0x5349;
         let idp2 = 0x534A;
         let idp3 = 0x534B;
+        let idk = 0x534C; // SG6：Ctrl+Alt+K 软 KVM 一键切到对端（P1-2）
         if RegisterHotKey(std::ptr::null_mut(), id, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_L) == 0 {
             return; // 注册失败：状态保持 (false, "")，由调用方读到失败
         }
@@ -4355,6 +4447,7 @@ pub fn hotkey_start() -> Result<String, String> {
         RegisterHotKey(std::ptr::null_mut(), idp1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 0x31);
         RegisterHotKey(std::ptr::null_mut(), idp2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 0x32);
         RegisterHotKey(std::ptr::null_mut(), idp3, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 0x33);
+        RegisterHotKey(std::ptr::null_mut(), idk, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 0x4B);
         {
             let mut g = hotkey_status().lock().unwrap();
             g.0 = true;
@@ -4373,6 +4466,9 @@ pub fn hotkey_start() -> Result<String, String> {
                     // 场景档应用耗时数秒，放独立线程，别堵住热键消息循环
                     let idx = (m.wparam - idp1 as usize) as usize;
                     std::thread::spawn(move || crate::platform::profile_apply_by_index(idx));
+                } else if m.wparam == idk as usize {
+                    // 软 KVM 切换含网络往返，独立线程执行
+                    std::thread::spawn(move || crate::kvm::switch_from_hotkey());
                 }
             }
         }
@@ -4825,6 +4921,53 @@ pub fn set_audio_device(id: &str) -> Result<(), String> {
     let mut st = app_state();
     st.audio_dev = id.to_string();
     save_app_state(&st)
+}
+
+/// 把系统默认输出设备切到指定端点（软 KVM 用；与「选定控制端点」不同，这是真切换）
+pub fn audio_set_default(id: &str) -> Result<(), String> {
+    let out = ps_core(&format!(
+        "[SGAudio]::AudioSetDefault({})",
+        ps_literal(id)
+    ))?;
+    let t = out.trim();
+    if t == "OK" {
+        Ok(())
+    } else {
+        Err(t.trim_start_matches("ERR:").to_string())
+    }
+}
+
+/// 读当前剪贴板文本（软 KVM 用；非文本/为空返回 None）
+pub fn clipboard_get_text() -> Option<String> {
+    let out = ps_core("[SGCore]::ClipboardGet()").ok()?;
+    let t = out.trim_end_matches(['\r', '\n']);
+    if t.is_empty() || t.starts_with("ERR:") || t == "NONE" {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// 写剪贴板文本
+pub fn clipboard_set_text(text: &str) -> Result<(), String> {
+    let out = ps_core(&format!(
+        "[SGCore]::ClipboardSet({})",
+        ps_literal(text)
+    ))?;
+    let t = out.trim();
+    if t == "OK" {
+        Ok(())
+    } else {
+        Err(t.trim_start_matches("ERR:").to_string())
+    }
+}
+
+/// 本机设备名（软 KVM 发现/配对展示用）
+pub fn device_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "Windows 主机".to_string())
 }
 
 /// 设置音量：优先作用于「用户选定的端点」，没选就作用于系统默认端点
@@ -7141,6 +7284,34 @@ mod health_tests {
         }
         let _ = keep;
         println!("auto_smoke 全部通过");
+    }
+
+    #[test]
+    #[ignore]
+    fn kvm_smoke() {
+        // ① 剪贴板 roundtrip（动真实剪贴板：先备份、测完恢复）
+        let saved = clipboard_get_text();
+        clipboard_set_text("SG-KVM-测试 12345 ✓").expect("写剪贴板失败");
+        assert_eq!(clipboard_get_text().as_deref(), Some("SG-KVM-测试 12345 ✓"));
+        match saved {
+            Some(t) => {
+                clipboard_set_text(&t).ok();
+            }
+            None => {
+                clipboard_set_text(" ").ok();
+            }
+        }
+        // ② 音频端点枚举 + AudioSetDefault 幂等调用（切回当前默认端点，不产生变化）
+        let eps = audio_endpoints().expect("音频端点枚举失败");
+        if let Some(def) = eps.iter().find(|e| e.is_default) {
+            audio_set_default(&def.id).expect("IPolicyConfig SetDefaultEndpoint 调用失败");
+            println!("audio_set_default 幂等调用 OK：{}", def.name);
+        } else {
+            println!("警告：没有 is_default 端点，跳过音频验证");
+        }
+        // ③ 设备名非空
+        assert!(!device_name().is_empty());
+        println!("kvm_smoke 全部通过（设备名：{}）", device_name());
     }
 }
 

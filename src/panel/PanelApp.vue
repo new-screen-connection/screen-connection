@@ -222,6 +222,16 @@ const quickActions = computed(() => [
         '自动切换已暂停 1 小时（主窗口「自动规则」可恢复）',
       ),
   },
+  {
+    key: 'kvm',
+    label: '切到对端（KVM）',
+    icon: 'keyboard',
+    run: () =>
+      act(
+        () => invoke('kvm_switch', { peerId: null }),
+        '已发起切换',
+      ),
+  },
 ]);
 
 /** 把窗口高度校准为内容实际高度，消除底部留白（浏览器预览下跳过） */

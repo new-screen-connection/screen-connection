@@ -258,6 +258,54 @@ export interface AutoEvent {
   message: string;
 }
 
+/** 软 KVM 已配对的对端（P1-2） */
+export interface KvmPeer {
+  id: string;
+  name: string;
+  addr: string;
+  /** sha256(psk) 前 8 字节 hex，供两端人工比对 */
+  fingerprint: string;
+  /** 本机在共享屏上的输入口 */
+  my_source: string;
+  paired_at: string;
+}
+
+/** 局域网里发现的未配对设备 */
+export interface KvmDevice {
+  name: string;
+  ip: string;
+}
+
+export interface KvmDevices {
+  me: string;
+  peers: KvmPeer[];
+  discovered: KvmDevice[];
+}
+
+/** 一键切换结果 */
+export interface KvmSwitchReport {
+  ack_ok: boolean;
+  ack_detail: string;
+  input_ok: boolean;
+  input_msg: string;
+  audio_msg: string;
+  clip_msg: string;
+}
+
+/** kvm-status 事件载荷 */
+export interface KvmEvent {
+  stage: 'progress' | 'done' | 'partial' | 'failed' | 'info';
+  message: string;
+}
+
+/** KVM 输入口选项 */
+export const KVM_SOURCES = [
+  { value: 'dp', label: 'DisplayPort' },
+  { value: 'hdmi1', label: 'HDMI 1' },
+  { value: 'hdmi2', label: 'HDMI 2' },
+  { value: 'usbc', label: 'USB-C' },
+] as const;
+
 /** 所有前端会调用到的后端命令名，集中登记避免拼写漂移 */
 export const CMD = {
   getPlatform: 'get_platform',
@@ -326,6 +374,13 @@ export const CMD = {
   autoRulesGet: 'auto_rules_get',
   autoRulesSet: 'auto_rules_set',
   autoPause: 'auto_pause',
+  kvmPairStart: 'kvm_pair_start',
+  kvmPairJoin: 'kvm_pair_join',
+  kvmDevices: 'kvm_devices',
+  kvmPeerRemove: 'kvm_peer_remove',
+  kvmPeerSetSource: 'kvm_peer_set_source',
+  kvmUnpairAll: 'kvm_unpair_all',
+  kvmSwitch: 'kvm_switch',
   diagLogPath: 'diag_log_path',
   openLogDir: 'open_log_dir',
   appStateJson: 'app_state_json',

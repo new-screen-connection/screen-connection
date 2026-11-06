@@ -12,10 +12,12 @@ import LayoutView from './views/LayoutView.vue';
 import DevicesView from './views/DevicesView.vue';
 import ToolsView from './views/ToolsView.vue';
 import AgentView from './views/AgentView.vue';
+import KvmView from './views/KvmView.vue';
 
 const views = {
   quality: { label: '画质', icon: 'palette', comp: QualityView },
   layout: { label: '布局', icon: 'layout', comp: LayoutView },
+  kvm: { label: '切换', icon: 'keyboard', comp: KvmView },
   overview: { label: '总览', icon: 'monitor', comp: OverviewView },
   health: { label: '体检', icon: 'gauge', comp: HealthView },
   devices: { label: '设备', icon: 'battery', comp: DevicesView },
