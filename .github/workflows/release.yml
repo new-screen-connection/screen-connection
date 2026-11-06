@@ -65,7 +65,7 @@ jobs:
       - name: 安装前端依赖
         run: npm ci
       - name: 构建未签名 ${{ matrix.arch }} Mac App 与 DMG
-        run: npm run build -- --target ${{ matrix.target }}
+        run: npm run tauri:build -- --target ${{ matrix.target }}
       - name: 验证未签名 DMG 镜像完整性
         shell: bash
         run: |

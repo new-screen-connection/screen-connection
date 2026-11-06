@@ -247,13 +247,39 @@ def check_brand_signing():
     return good
 
 
+def check_workflow_npm_scripts():
+    """CI/发布工作流里每个 npm run X 都必须在 package.json 有对应脚本。
+
+    历史教训（2026-11-07 整体走查发现）：工作流写的是 npm run build:win，
+    package.json 里却叫 tauri:build:win；macOS 构建调 npm run build（仅
+    vue-tsc+vite，不产 DMG）。三平台构建在 CI 上从未真正跑通过。
+    """
+    print("[8/8] 工作流 npm 脚本引用")
+    package = json.load(open(os.path.join(ROOT, "package.json"), encoding="utf-8"))
+    scripts = package.get("scripts", {})
+    wf_dir = os.path.join(ROOT, ".github", "workflows")
+    bad = []
+    checked = 0
+    for name in sorted(os.listdir(wf_dir)):
+        if not name.endswith((".yml", ".yaml")):
+            continue
+        text = open(os.path.join(wf_dir, name), encoding="utf-8").read()
+        for ref in re.findall(r"npm run ([A-Za-z0-9:_-]+)", text):
+            checked += 1
+            if ref not in scripts:
+                bad.append(f"{name}: npm run {ref}")
+    if bad:
+        return fail("工作流引用了 package.json 不存在的脚本: " + "; ".join(bad))
+    return ok(f"工作流共 {checked} 处 npm run 引用全部有对应脚本")
+
+
 def main():
     print("=" * 60)
     print("screen-connection 仓库自检")
     print("=" * 60)
     good = all([check_versions(), check_bundle_refs(), check_single_app_dependencies(),
                 check_js(), check_csharp_quote(), check_release_architectures(),
-                check_brand_signing()])
+                check_brand_signing(), check_workflow_npm_scripts()])
     print("=" * 60)
     print("✅ 全部通过" if good else "❌ 存在问题")
     sys.exit(0 if good else 1)

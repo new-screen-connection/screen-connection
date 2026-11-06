@@ -54,6 +54,7 @@ npm run tauri:build:win  # 打 Windows NSIS 安装包
 
 - [docs/SIGNING.md](docs/SIGNING.md) —— 签名与分发策略（零成本版）
 - [docs/DELIVERY_AND_RELEASE.md](docs/DELIVERY_AND_RELEASE.md) —— 发布流程与历史验收记录
+- [CHANGELOG.md](CHANGELOG.md) —— 更新日志
 - [PRIVACY.md](PRIVACY.md) —— 隐私说明：本机运行，不联网上报
 
 ## License

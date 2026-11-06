@@ -1,7 +1,7 @@
 {
   "name": "screen-connection",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,7 +11,8 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "tauri:build:win": "tauri build --bundles nsis"
+    "tauri:build:win": "tauri build --bundles nsis",
+    "build:win": "tauri build --bundles nsis"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
