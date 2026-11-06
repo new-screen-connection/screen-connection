@@ -746,7 +746,7 @@ pub(crate) fn now_str() -> String {    #[cfg(target_os = "windows")]
     }
 }
 
-fn new_profile_id() -> String {
+pub(crate) fn new_profile_id() -> String {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -1498,6 +1498,38 @@ mod windows;
 pub use macos::*;
 #[cfg(target_os = "windows")]
 pub use windows::*;
+
+// ===== 迁移用偏好读写（P1-3：只碰通用开关，不碰设备相关状态）=====
+
+/// 「退出时自动还原」开关当前值
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub fn pref_revert_on_exit() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows::app_state().revert_on_exit
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::mac_app_state().revert_on_exit
+    }
+}
+
+/// 写「退出时自动还原」开关
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub fn pref_set_revert_on_exit(v: bool) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut st = windows::app_state();
+        st.revert_on_exit = v;
+        windows::save_app_state(&st)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut st = macos::mac_app_state();
+        st.revert_on_exit = v;
+        macos::save_mac_app_state(&st)
+    }
+}
 
 // ===== 软 KVM 跨平台分发（P1-2）=====
 // kvm.rs 只调这组 kvm_* 函数，不直接碰平台模块，避免 cfg 分支散落。

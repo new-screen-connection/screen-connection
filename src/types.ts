@@ -249,6 +249,43 @@ export interface AutoConfig {
   last_applied: AutoLastApplied | null;
 }
 
+/** 迁移包里的通用偏好（P1-3，只迁不涉设备的开关） */
+export interface MigratePrefs {
+  revert_on_exit: boolean;
+}
+
+/** 解密后的迁移包（后端契约镜像，预览接口不直接返回此结构） */
+export interface MigrateBundle {
+  schema: number;
+  exported_at: string;
+  app_version: string;
+  platform: string;
+  profiles: Profile[];
+  prefs: MigratePrefs;
+}
+
+/** 导入前预览：新增 / 同名覆盖 / 硬件适配提示，未落盘 */
+export interface MigratePreview {
+  schema: number;
+  exported_at: string;
+  app_version: string;
+  platform: string;
+  new_profiles: Profile[];
+  overwrite_profiles: Profile[];
+  /** 这些档内的显示器 EDID 与本机不匹配（应用时可能部分项不生效） */
+  mismatched: string[];
+}
+
+/** 导入结果 */
+export interface MigrateImportReport {
+  added: number;
+  overwritten: number;
+  added_names: string[];
+  overwritten_names: string[];
+  mismatched: string[];
+  prefs_applied: boolean;
+}
+
 /** 自动应用事件（screens://auto-applied 推送载荷） */
 export interface AutoEvent {
   kind: 'applied' | 'rolled_back' | 'skipped';
@@ -374,6 +411,9 @@ export const CMD = {
   autoRulesGet: 'auto_rules_get',
   autoRulesSet: 'auto_rules_set',
   autoPause: 'auto_pause',
+  migrateExport: 'migrate_export',
+  migratePreview: 'migrate_preview',
+  migrateImport: 'migrate_import',
   kvmPairStart: 'kvm_pair_start',
   kvmPairJoin: 'kvm_pair_join',
   kvmDevices: 'kvm_devices',

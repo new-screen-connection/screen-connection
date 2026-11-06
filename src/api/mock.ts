@@ -3,7 +3,7 @@
  * 在 Tauri WebView 内不生效；`npm run dev` 直接在浏览器打开时可预览全部界面与交互。
  */
 import type { AudioEndpoint, BatteryInfo, DisplayInfo, HealthReport, Topology } from '../types';
-import type { ApplyReport, AutoConfig, KvmPeer, Profile } from '../types';
+import type { ApplyReport, AutoConfig, KvmPeer, MigrateBundle, Profile } from '../types';
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -455,6 +455,48 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       mockAuto.paused_until_epoch =
         minutes > 0 ? Math.floor(Date.now() / 1000) + minutes * 60 : null;
       return JSON.parse(JSON.stringify(mockAuto)) as T;
+    }
+    // ---------- 配置迁移（P1-3）：假载荷，走完 预览→导入 流程 ----------
+    case 'migrate_export': {
+      const pw = String(args?.password ?? '');
+      if (pw.length < 6 || pw.length > 32) {
+        throw new Error('口令需要 6–32 位字符');
+      }
+      const bundle: MigrateBundle = {
+        schema: 1,
+        exported_at: new Date().toLocaleString(),
+        app_version: '0.3.0',
+        platform: 'windows',
+        profiles: JSON.parse(JSON.stringify(mockProfiles)) as Profile[],
+        prefs: { revert_on_exit: true },
+      };
+      return ('SCMIG1:MOCK' + btoa(unescape(encodeURIComponent(JSON.stringify(bundle))))) as T;
+    }
+    case 'migrate_preview': {
+      const payload = String(args?.payload ?? '');
+      if (!payload.startsWith('SCMIG1:')) throw new Error('口令不正确或文件已损坏');
+      if (String(args?.password ?? '').length < 6) throw new Error('口令不正确或文件已损坏');
+      return {
+        schema: 1,
+        exported_at: new Date().toLocaleString(),
+        app_version: '0.3.0',
+        platform: 'macos',
+        new_profiles: mockProfiles.slice(0, 1),
+        overwrite_profiles: [],
+        mismatched: ['观影模式（本机没有它使用的显示器）'],
+      } as T;
+    }
+    case 'migrate_import': {
+      if (!String(args?.payload ?? '').startsWith('SCMIG1:')) throw new Error('口令不正确或文件已损坏');
+      if (String(args?.password ?? '').length < 6) throw new Error('口令不正确或文件已损坏');
+      return {
+        added: 1,
+        overwritten: 0,
+        added_names: ['工作模式'],
+        overwritten_names: [],
+        mismatched: ['观影模式（本机没有它使用的显示器）'],
+        prefs_applied: true,
+      } as T;
     }
     // ---------- 软 KVM（P1-2）：假配对可走通、假切换有进度 ----------
     case 'kvm_devices':

@@ -2,6 +2,7 @@ mod platform;
 #[cfg(any(target_os = "windows", test))]
 mod icc_profile;
 pub mod kvm;
+pub mod migrate;
 
 use platform::DisplayInfo;
 
@@ -625,6 +626,34 @@ async fn kvm_unpair_all() -> Result<(), String> {
 #[tauri::command]
 async fn kvm_switch(peer_id: Option<String>) -> Result<kvm::KvmSwitchReport, String> {
     tauri::async_runtime::spawn_blocking(move || kvm::switch_impl(peer_id.as_deref()))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+// ===== 配置跨设备迁移（P1-3）=====
+
+/// 导出加密载荷：全部（或指定 id 的）场景档 + 通用偏好
+#[tauri::command]
+async fn migrate_export(profile_ids: Option<Vec<String>>, password: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        migrate::migrate_export_impl(profile_ids.as_deref(), &password)
+    })
+    .await
+    .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 导入前预览：新增 / 同名覆盖 / 硬件适配提示，不落盘
+#[tauri::command]
+async fn migrate_preview(payload: String, password: String) -> Result<migrate::MigratePreview, String> {
+    tauri::async_runtime::spawn_blocking(move || migrate::migrate_preview_impl(&payload, &password))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 导入落盘：同名覆盖（保留本地 id），其余新增
+#[tauri::command]
+async fn migrate_import(payload: String, password: String) -> Result<migrate::MigrateImportReport, String> {
+    tauri::async_runtime::spawn_blocking(move || migrate::migrate_import_impl(&payload, &password))
         .await
         .map_err(|e| format!("后台任务失败：{}", e))?
 }
@@ -2150,6 +2179,9 @@ pub fn run() {
             kvm_peer_set_source,
             kvm_unpair_all,
             kvm_switch,
+            migrate_export,
+            migrate_preview,
+            migrate_import,
             health_get_config,
             health_set_config,
             get_notify_payload,

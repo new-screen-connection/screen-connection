@@ -2570,7 +2570,7 @@ struct SavedLayout {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct MacAppState {
     #[serde(default = "default_enabled")]
-    revert_on_exit: bool,
+    pub(crate) revert_on_exit: bool,
     #[serde(default)]
     baseline_taken: bool,
     #[serde(default)]
@@ -2608,14 +2608,14 @@ fn mac_app_state_path() -> Result<std::path::PathBuf, String> {
     Ok(app_support_dir()?.join("state.json"))
 }
 
-fn mac_app_state() -> MacAppState {
+pub(crate) fn mac_app_state() -> MacAppState {
     mac_app_state_path().ok()
         .and_then(|path| std::fs::read(path).ok())
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
 }
 
-fn save_mac_app_state(state: &MacAppState) -> Result<(), String> {
+pub(crate) fn save_mac_app_state(state: &MacAppState) -> Result<(), String> {
     save_json_atomic(&mac_app_state_path()?, state)
 }
 

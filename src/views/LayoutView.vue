@@ -386,6 +386,128 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   document.removeEventListener('click', closeMenu);
 });
+
+// ---------- 配置跨设备迁移（P1-3） ----------
+
+import qrcode from 'qrcode-generator';
+import type { MigrateImportReport, MigratePreview } from '../types';
+
+/** 二维码容量阈值（字节），超出提示改用文本/文件方式 */
+const QR_MAX_BYTES = 800;
+
+const migPw = ref('');
+const migPw2 = ref('');
+const migPayload = ref('');
+const migQrOpen = ref(false);
+const migQrUrl = ref('');
+const migImportText = ref('');
+const migImportPw = ref('');
+const migPreview = ref<MigratePreview | null>(null);
+const migReport = ref<MigrateImportReport | null>(null);
+
+const migPayloadBytes = computed(() => new TextEncoder().encode(migPayload.value).length);
+const migCanQr = computed(() => migPayloadBytes.value > 0 && migPayloadBytes.value <= QR_MAX_BYTES);
+
+function resetImport(): void {
+  migPreview.value = null;
+  migReport.value = null;
+}
+
+async function migrateExport(): Promise<void> {
+  if (profiles.value.length === 0) {
+    setStatus('还没有场景档可导出，先在上方「保存当前状态」', false);
+    return;
+  }
+  const pw = migPw.value;
+  if (pw.length < 6 || pw.length > 32) {
+    setStatus('口令需要 6–32 位字符', false);
+    return;
+  }
+  if (pw !== migPw2.value) {
+    setStatus('两次输入的口令不一致', false);
+    return;
+  }
+  await act(async () => {
+    const payload = await invoke<string>(CMD.migrateExport, { profileIds: null, password: pw });
+    migPayload.value = payload;
+    migQrOpen.value = false;
+    migImportText.value = '';
+    resetImport();
+    return payload;
+  }, '迁移串已生成——在下方选择传递方式');
+}
+
+async function copyMigratePayload(): Promise<void> {
+  if (!migPayload.value) return;
+  try {
+    await navigator.clipboard.writeText(migPayload.value);
+    setStatus('已复制到剪贴板——到另一台电脑粘贴后「解密预览」', true);
+  } catch {
+    setStatus('复制失败，请手动选中下方文本复制', false);
+  }
+}
+
+function saveMigrateFile(): void {
+  if (!migPayload.value) return;
+  const blob = new Blob([migPayload.value], { type: 'text/plain;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `screen-connection-${new Date().toISOString().slice(0, 10)}.scprofile`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function showMigrateQr(): void {
+  if (!migCanQr.value) return;
+  const q = qrcode(0, 'M');
+  q.addData(migPayload.value);
+  q.make();
+  migQrUrl.value = q.createDataURL(4, 2);
+  migQrOpen.value = true;
+}
+
+function pickImportFile(e: Event): void {
+  const input = e.target as HTMLInputElement;
+  const f = input.files?.[0];
+  if (!f) return;
+  void f.text().then((t) => {
+    migImportText.value = t.trim();
+    resetImport();
+  });
+}
+
+async function runMigratePreview(): Promise<void> {
+  const payload = migImportText.value.trim();
+  if (!payload) {
+    setStatus('先粘贴迁移串或选择 .scprofile 文件', false);
+    return;
+  }
+  if (migImportPw.value.length < 6) {
+    setStatus('输入对方设置的 6–32 位口令', false);
+    return;
+  }
+  migReport.value = null;
+  await act(async () => {
+    migPreview.value = await invoke<MigratePreview>(CMD.migratePreview, {
+      payload,
+      password: migImportPw.value,
+    });
+    return migPreview.value;
+  }, '解密成功——请确认内容后落盘');
+}
+
+async function confirmMigrateImport(): Promise<void> {
+  const payload = migImportText.value.trim();
+  await act(async () => {
+    migReport.value = await invoke<MigrateImportReport>(CMD.migrateImport, {
+      payload,
+      password: migImportPw.value,
+    });
+    migPreview.value = null;
+    await loadProfiles();
+    return migReport.value;
+  }, '导入完成');
+}
 </script>
 
 <template>
@@ -611,6 +733,79 @@ onBeforeUnmount(() => {
         <button class="btn" :disabled="store.busy" @click="saveSizes">保存尺寸</button>
       </div>
       <p v-if="alignSizes" class="status-line">{{ alignSizes }}</p>
+    </Card>
+
+    <Card title="跨设备迁移" icon="download">
+      <p class="status-line">配置只在你选择的设备之间传递，不经过任何服务器。配置里可能包含你的显示器型号与亮度偏好，请勿分享给陌生人。</p>
+      <div class="mig-section">
+        <h4>导出到另一台电脑</h4>
+        <div class="inline-field">
+          <input v-model="migPw" type="password" placeholder="设置口令（6–32 位）" autocomplete="new-password" />
+          <input v-model="migPw2" type="password" placeholder="再输一遍口令" autocomplete="new-password" />
+          <button class="btn primary" :disabled="store.busy" @click="migrateExport">生成迁移串</button>
+        </div>
+        <template v-if="migPayload">
+          <p class="status-line">迁移串已生成（{{ migPayloadBytes }} 字节），口令用于加密，导入方必须输入同一个口令。</p>
+          <div class="btn-grid">
+            <button class="btn" @click="copyMigratePayload">复制文本</button>
+            <button class="btn" @click="saveMigrateFile">存为 .scprofile 文件</button>
+            <button class="btn" :disabled="!migCanQr" @click="showMigrateQr">生成二维码</button>
+          </div>
+          <p v-if="!migCanQr" class="status-line mig-warn">配置较大（{{ migPayloadBytes }} 字节），二维码放不下，请用文本或文件方式</p>
+          <div v-if="migQrOpen" class="mig-qr">
+            <img :src="migQrUrl" alt="迁移配置二维码" />
+            <span>另一台电脑扫码或用手机扫码后把文本传过去</span>
+          </div>
+          <pre class="output mig-payload">{{ migPayload }}</pre>
+        </template>
+      </div>
+      <div class="mig-section">
+        <h4>从另一台电脑导入</h4>
+        <textarea
+          v-model="migImportText"
+          class="mig-import-text"
+          rows="3"
+          placeholder="粘贴迁移串（SCMIG1:…），或选择 .scprofile 文件"
+          @input="resetImport"
+        ></textarea>
+        <div class="inline-field">
+          <input type="file" accept=".scprofile,.txt" @change="pickImportFile" />
+        </div>
+        <div class="inline-field">
+          <input
+            v-model="migImportPw"
+            type="password"
+            placeholder="对方设置的口令"
+            autocomplete="off"
+            @keyup.enter="runMigratePreview"
+          />
+          <button class="btn primary" :disabled="store.busy" @click="runMigratePreview">解密预览</button>
+        </div>
+        <div v-if="migPreview" class="mig-preview">
+          <p>
+            来自 {{ migPreview.platform === 'windows' ? 'Windows' : migPreview.platform === 'macos' ? 'macOS' : migPreview.platform }}
+            设备 · 应用版本 {{ migPreview.app_version }} · 导出于 {{ migPreview.exported_at }}
+          </p>
+          <p v-if="migPreview.new_profiles.length">
+            将<b>新增</b> {{ migPreview.new_profiles.length }} 个档：
+            <span v-for="p in migPreview.new_profiles" :key="p.id" class="tag">{{ p.name }}（{{ p.targets.displays.length }} 屏）</span>
+          </p>
+          <p v-if="migPreview.overwrite_profiles.length">
+            将<b>覆盖</b> {{ migPreview.overwrite_profiles.length }} 个同名档：
+            <span v-for="p in migPreview.overwrite_profiles" :key="p.id" class="tag">{{ p.name }}（{{ p.targets.displays.length }} 屏）</span>
+          </p>
+          <p v-if="migPreview.mismatched.length" class="mig-warn">
+            {{ migPreview.mismatched.join('、') }} 基于其他显示器创建，应用时可能部分项不生效
+          </p>
+          <button class="btn primary" :disabled="store.busy" @click="confirmMigrateImport">确认导入</button>
+        </div>
+        <div v-if="migReport" class="mig-preview mig-ok">
+          <p>✓ 导入完成：新增 {{ migReport.added }} 个、覆盖 {{ migReport.overwritten }} 个档位<template v-if="migReport.prefs_applied">，通用偏好已合并</template></p>
+          <p v-if="migReport.mismatched.length" class="mig-warn">
+            {{ migReport.mismatched.join('、') }} 基于其他显示器创建，应用时可能部分项不生效
+          </p>
+        </div>
+      </div>
     </Card>
   </div>
 </template>
