@@ -159,7 +159,10 @@ fn peers_file() -> PathBuf {
     }
     #[cfg(target_os = "macos")]
     {
-        crate::platform::app_support_dir()?.join("peers.json")
+        // macOS 的 app_support_dir 可能失败（目录创建失败等），回退临时目录
+        crate::platform::app_support_dir()
+            .map(|d| d.join("peers.json"))
+            .unwrap_or_else(|_| std::env::temp_dir().join("screenguard-peers.json"))
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {

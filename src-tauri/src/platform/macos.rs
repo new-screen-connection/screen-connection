@@ -1913,7 +1913,7 @@ pub fn health_report_impl() -> Result<HealthReport, String> {
     let facts = sp_display_facts();
     let n_external = screens
         .iter()
-        .filter(|s| s.enabled && unsafe { CGDisplayIsBuiltin(s.ctx.unwrap_or(0)) } == 0)
+        .filter(|s| s.enabled && !unsafe { CGDisplayIsBuiltin(s.ctx.unwrap_or(0)) })
         .count();
 
     let mut displays: Vec<DisplayHealth> = Vec::new();
@@ -1950,7 +1950,7 @@ pub fn health_report_impl() -> Result<HealthReport, String> {
             None => (None, None),
         };
         let prof = s.ctx.and_then(read_color_profile);
-        let builtin = s.ctx.map(|c| unsafe { CGDisplayIsBuiltin(c) }).unwrap_or(0) != 0;
+        let builtin = s.ctx.map(|c| unsafe { CGDisplayIsBuiltin(c) }).unwrap_or(false);
 
         // 模式统计：优先取非缩放档（displayplacer 的 scaling 档不反映面板原生像素）
         let mut modes: Vec<(u32, u32, u32)> = s
