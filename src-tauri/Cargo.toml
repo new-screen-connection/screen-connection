@@ -25,6 +25,9 @@ sha2 = "0.10"
 getrandom = "0.2"
 hex = "0.4"
 base64 = "0.22"
+# 排障助手第三层（可选联网分析，默认关闭）走 HTTPS 需要 TLS 客户端；
+# ureq 是同步阻塞的最小实现，不引 tokio 全家桶，且只在用户明确同意后才被调用
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "=0.10.1"

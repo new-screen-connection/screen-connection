@@ -358,6 +358,26 @@ export const KVM_SOURCES = [
 ] as const;
 
 /** 所有前端会调用到的后端命令名，集中登记避免拼写漂移 */
+/** 排障助手（P2-1）：一个可能原因（推测原因 + 体检证据 + 修复动作），数值全部来自体检报告 */
+export interface DiagCause {
+  title: string;
+  evidence: string[];
+  fix_ids?: string[];
+  display_id?: string;
+  /** 无修复按钮时的手动操作建议 */
+  manual?: string[];
+}
+
+/** 排障回答：一句结论 + 原因卡片 + 可操作建议；healthy_note = 定位不了时的诚实回答 */
+export interface DiagReply {
+  scene: string;
+  conclusion: string;
+  causes: DiagCause[];
+  healthy_note?: string;
+  advice?: string[];
+  show_report: boolean;
+}
+
 export const CMD = {
   getPlatform: 'get_platform',
   getVersion: 'get_version',
@@ -428,6 +448,9 @@ export const CMD = {
   migrateExport: 'migrate_export',
   migratePreview: 'migrate_preview',
   migrateImport: 'migrate_import',
+  troubleshootDiag: 'troubleshoot_diag',
+  troubleshootLlmPayload: 'troubleshoot_llm_payload',
+  agentLlmChat: 'agent_llm_chat',
   kvmPairStart: 'kvm_pair_start',
   kvmPairJoin: 'kvm_pair_join',
   kvmDevices: 'kvm_devices',

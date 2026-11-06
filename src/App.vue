@@ -48,6 +48,12 @@ onMounted(async () => {
     store.status = msg;
     store.statusOk = true;
   });
+
+  // 排障对话「查看完整体检报告」跳转（ChatPanel 派发）
+  window.addEventListener('sc:navigate', (e) => {
+    const key = (e as CustomEvent<string>).detail;
+    if (key in views) current.value = key as ViewKey;
+  });
 });
 </script>
 

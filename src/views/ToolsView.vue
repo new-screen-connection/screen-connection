@@ -13,6 +13,17 @@ const backupStatus = ref('');
 const revertOnExit = ref(true);
 const autostart = ref(false);
 const fileInput = ref<HTMLInputElement | null>(null);
+// 联网分析（P2-1）：默认关闭；key 只存本机 localStorage，不随设置导出
+const llmEnabled = ref(localStorage.getItem('sc_llm_enabled') === '1');
+const llmKey = ref(localStorage.getItem('sc_llm_key') ?? '');
+
+function toggleLlm(on: boolean): void {
+  llmEnabled.value = on;
+  localStorage.setItem('sc_llm_enabled', on ? '1' : '0');
+}
+function saveLlmKey(): void {
+  localStorage.setItem('sc_llm_key', llmKey.value.trim());
+}
 
 const runDiag = (): void => {
   void act(async () => {
@@ -136,6 +147,24 @@ onMounted(async () => {
         <input ref="fileInput" type="file" accept="application/json,.json" hidden @change="importSettings" />
       </div>
       <p v-if="backupStatus" class="status-line">{{ backupStatus }}</p>
+    </Card>
+
+    <Card title="联网分析（默认关闭）" icon="wrench">
+      <label class="check-row">
+        <input type="checkbox" :checked="llmEnabled" @change="toggleLlm(($event.target as HTMLInputElement).checked)" />
+        <span>允许排障助手联网分析（本地体检无法定位时才询问，发送前先展示完整内容，你确认后才发）</span>
+      </label>
+      <div v-if="llmEnabled" class="llm-key-row">
+        <input
+          v-model="llmKey"
+          type="password"
+          placeholder="API Key（DeepSeek 等兼容 OpenAI 接口的服务）"
+          autocomplete="new-password"
+          @change="saveLlmKey"
+        />
+        <span class="llm-key-tip">Key 只保存在本机，不会上传，也不会随设置导出</span>
+      </div>
+      <p class="llm-offline-tip">关闭时排障完全离线可用，不发出任何网络请求。</p>
     </Card>
 
     <Card title="版本与更新" icon="update">

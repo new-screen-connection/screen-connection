@@ -3,7 +3,7 @@
  * 在 Tauri WebView 内不生效；`npm run dev` 直接在浏览器打开时可预览全部界面与交互。
  */
 import type { AudioEndpoint, BatteryInfo, DisplayInfo, HealthReport, PortableSection, Topology } from '../types';
-import type { ApplyReport, AutoConfig, KvmPeer, MigrateBundle, Profile } from '../types';
+import type { ApplyReport, AutoConfig, DiagCause, KvmPeer, MigrateBundle, Profile } from '../types';
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -626,6 +626,113 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
     case 'set_revert_on_exit':
       state.revertOnExit = Boolean((args as { on?: boolean })?.on);
       return undefined as T;
+    case 'troubleshoot_diag': {
+      // 浏览器预览用的简化规则引擎：与后端同一套场景关键词，数值全部来自假体检报告
+      const text = String((args as { text?: string })?.text ?? '');
+      const t = text.trim().toLowerCase();
+      const is = (...keys: string[]) => keys.some((k) => t.includes(k));
+      const health = healthReport;
+      const inactive = health.displays.filter((d) => !d.connected);
+      const causes: DiagCause[] = [];
+      let scene = 'other';
+      let healthyNote: string | undefined;
+      let advice: string[] = [];
+
+      if (is('黑屏', '不亮', '黑了', '没信号', '无信号')) {
+        scene = 'black_screen';
+        for (const d of inactive) {
+          causes.push({
+            title: `「${d.name}」当前未点亮`,
+            evidence: ['体检：3 台显示器中有 1 台未处于活动状态，该屏在系统里已登记但拿不到画面'],
+            fix_ids: ['rescan_displays', 'force_redetect'],
+            display_id: d.display_id,
+            manual: ['确认显示器电源已打开', '确认显示器输入源与所接接口一致（用显示器 OSD 菜单查看）'],
+          });
+        }
+        advice = ['重新插拔视频线（显示器和电脑两端都要）', '换一条视频线或换一个接口再试'];
+      } else if (is('不识别', '识别不到', '检测不到', '找不到', '掉屏', '掉了', '消失', '不见了', '连不上')) {
+        scene = 'not_detected';
+        for (const d of inactive) {
+          causes.push({
+            title: `「${d.name}」被系统记住但当前未响应`,
+            evidence: ['体检：该屏在系统显示列表中有登记（线缆身份识别曾经成功）', '当前状态：未连接 / 拿不到画面'],
+            fix_ids: ['rescan_displays', 'force_redetect'],
+            display_id: d.display_id,
+          });
+        }
+        advice = ['重新插拔视频线（显示器和电脑两端都要）', '若是扩展坞 / 转接头接入，改为直连试一次（坞是掉屏高发环节）'];
+      } else if (is('分辨率', '字糊', '模糊', '发虚', '锯齿', '拉伸')) {
+        scene = 'res_blur';
+        for (const d of health.displays)
+          for (const c of d.checks)
+            if (c.id === 'resolution_not_native')
+              causes.push({ title: `「${d.name}」在用非原生分辨率，发虚/拉伸多半是它`, evidence: c.evidence, fix_ids: c.fix_ids, display_id: d.display_id, manual: ['到系统显示设置把分辨率切回原生（报告里已列出原生值）；或在本应用「画质」页直接切换'] });
+      } else if (is('刷新率', 'hz', '赫兹')) {
+        scene = 'refresh_low';
+        for (const d of health.displays)
+          for (const c of d.checks)
+            if (c.id === 'refresh_below_max')
+              causes.push({ title: `「${d.name}」刷新率低于该分辨率下支持的最高值`, evidence: c.evidence, display_id: d.display_id, manual: ['线材带宽不足是常见原因：换 DP 线或 HDMI 2.0 以上规格的线', '确认线材后在系统显示设置把刷新率调到最高档'] });
+      } else if (is('亮度调不了', '亮度没反应', '亮度无效', '亮度失灵', '亮度不起作用')) {
+        scene = 'brightness_stuck';
+        for (const d of health.displays)
+          for (const c of d.checks)
+            if (c.id === 'ddc_unreachable')
+              causes.push({ title: `「${d.name}」的 DDC/CI 通道不可用，软件调不了它的亮度`, evidence: c.evidence, fix_ids: c.fix_ids, display_id: d.display_id, manual: ['到显示器 OSD 菜单确认 DDC/CI 选项已开启（部分机型默认关闭）'] });
+        if (!causes.length) healthyNote = '体检显示各屏亮度通道正常（DDC/CI 可读）。可能只是刚才一次调节没有生效。';
+      } else if (is('偏色', '偏黄', '偏蓝', '颜色', '色彩', '色差', '发黄')) {
+        scene = 'color_wrong';
+        for (const d of health.displays)
+          for (const c of d.checks)
+            if (c.id === 'color_profile_generic')
+              causes.push({ title: `「${d.name}」用的是系统通用色彩配置（未校准）`, evidence: c.evidence, display_id: d.display_id, manual: ['对色彩要求高时，用「画质 → 色彩同步」把这块屏对齐到标准色域'] });
+      } else if (is('切换', '切回', '换电脑', '另一台', '对端', 'kvm')) {
+        scene = 'after_switch';
+        for (const d of health.displays.filter((x) => x.connected && x.topology)) {
+          causes.push({
+            title: `「${d.name}」输入源可能停在上一个主机的档位`,
+            evidence: [`体检：该屏当前点亮（${d.current_resolution} @ ${d.current_hz}Hz），但切换主机后显示器输入源经常需要重选`],
+            fix_ids: ['switch_input'],
+            display_id: d.display_id,
+            manual: ['也可以用显示器 OSD 菜单手动选输入源'],
+          });
+        }
+      }
+      if (!causes.length && !healthyNote) {
+        scene = 'other';
+        healthyNote = '体检未发现异常。你描述的问题没有在系统层面留下可检测的痕迹。';
+        advice = ['重新插拔视频线（显示器和电脑两端都要）', '换一条视频线或换一个接口再试', '告诉我更具体的时机（比如「拔掉扩展坞之后」「开机十分钟内」）有助于缩小范围'];
+      }
+      return {
+        scene,
+        conclusion: causes.length ? `找到 ${causes.length} 个可能原因` : '体检未发现异常',
+        causes,
+        healthy_note: healthyNote,
+        advice,
+        show_report: true,
+      } as T;
+    }
+    case 'troubleshoot_llm_payload':
+      return JSON.stringify(
+        {
+          question: String((args as { text?: string })?.text ?? ''),
+          platform: healthReport.platform,
+          os_version: healthReport.os_version,
+          app_version: healthReport.app_version,
+          displays: healthReport.displays.map((d) => ({
+            name: d.name,
+            current_resolution: d.current_resolution,
+            current_hz: d.current_hz,
+            connected: d.connected,
+            checks: d.checks.map((c) => ({ id: c.id, severity: c.severity, title: c.title, evidence: c.evidence })),
+          })),
+          note: '（浏览器预览样例：真实环境发送前同样可展开核对，不含序列号）',
+        },
+        null,
+        2,
+      ) as T;
+    case 'agent_llm_chat':
+      return '（浏览器预览）基于体检报告的联网分析回复：你的便携副屏当前 1920x1080@60，原生 2560x1600@120——文字发虚来自非原生分辨率，刷新率上不去则优先怀疑线材带宽。' as T;
     default:
       if (cmd in results) return results[cmd] as T;
       // 未模拟的命令一律成功返回，保证界面可走通

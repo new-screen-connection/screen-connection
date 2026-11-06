@@ -3,6 +3,7 @@ mod platform;
 mod icc_profile;
 pub mod kvm;
 pub mod migrate;
+pub mod troubleshoot;
 
 use platform::DisplayInfo;
 
@@ -654,6 +655,36 @@ async fn migrate_preview(payload: String, password: String) -> Result<migrate::M
 #[tauri::command]
 async fn migrate_import(payload: String, password: String) -> Result<migrate::MigrateImportReport, String> {
     tauri::async_runtime::spawn_blocking(move || migrate::migrate_import_impl(&payload, &password))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+// ===== 排障助手（P2-1）：本地规则引擎优先，LLM 仅在用户同意后调用 =====
+
+/// 排障诊断：本地意图识别 + 跑体检 + 生成原因卡片（第一、二层，完全离线）
+#[tauri::command]
+async fn troubleshoot_diag(text: String) -> Result<troubleshoot::DiagReply, String> {
+    tauri::async_runtime::spawn_blocking(move || troubleshoot::troubleshoot_diag_impl(&text))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 展示「将要发送的内容」：返回脱敏后的完整 JSON（所见即所发），不发送任何请求
+#[tauri::command]
+async fn troubleshoot_llm_payload(text: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let report = platform::health_report_impl()?;
+        let payload = troubleshoot::build_llm_payload(&text, &report);
+        serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 联网分析（第三层）：仅在用户点「同意发送」后由前端调用；api_key 存用户本机
+#[tauri::command]
+async fn agent_llm_chat(text: String, api_key: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || troubleshoot::agent_llm_chat_impl(&text, &api_key))
         .await
         .map_err(|e| format!("后台任务失败：{}", e))?
 }
@@ -2182,6 +2213,9 @@ pub fn run() {
             migrate_export,
             migrate_preview,
             migrate_import,
+            troubleshoot_diag,
+            troubleshoot_llm_payload,
+            agent_llm_chat,
             health_get_config,
             health_set_config,
             get_notify_payload,
