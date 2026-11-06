@@ -1049,6 +1049,117 @@ input[type='range']:disabled {
   color: var(--faint);
 }
 
+/* ---------- 便携屏一线通（P1-4） ---------- */
+
+.portable-item + .portable-item {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--border-soft);
+}
+
+.portable-name {
+  margin: 0 0 4px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.portable-conclusion {
+  margin: 0 0 8px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.portable-evidence {
+  margin: 0 0 10px;
+  padding-left: 16px;
+  font-size: 11.5px;
+  font-family: var(--mono);
+  color: var(--faint);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.portable-advice {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.portable-advice-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.portable-advice-item:hover {
+  border-color: var(--accent);
+}
+
+.portable-advice-item.done {
+  background: var(--accent-dim);
+  border-color: transparent;
+}
+
+.portable-dot {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  border: 1.6px solid var(--faint);
+  border-radius: 50%;
+  position: relative;
+}
+
+.portable-advice-item.done .portable-dot {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.portable-advice-item.done .portable-dot::after {
+  content: '';
+  position: absolute;
+  left: 3px;
+  top: 0.5px;
+  width: 3px;
+  height: 6.5px;
+  border: solid #fff;
+  border-width: 0 1.6px 1.6px 0;
+  transform: rotate(45deg);
+}
+
+.portable-advice-text {
+  flex: 1;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.portable-advice-item.done .portable-advice-text {
+  color: var(--faint);
+  text-decoration: line-through;
+}
+
+.portable-done-tag {
+  flex: none;
+  font-size: 11px;
+  color: var(--accent);
+}
+
+.portable-boundary {
+  margin: 12px 0 0;
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
 /* ---------- 体检报告导出（P0-3） ---------- */
 
 .export-wrap {

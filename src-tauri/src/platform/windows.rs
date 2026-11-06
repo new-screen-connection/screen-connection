@@ -922,6 +922,45 @@ public class SGCore {
     return TryVCP(dev, code, false, 0, 5, out cur) ? cur.ToString() : "ERR";
   }
 
+  /// 读 VCP 当前值与面板上报上限，返回 "cur|max"，失败返回 ERR。
+  /// P1-4 便携屏功耗诊断专用：evidence 需要同时给当前亮度与面板最大亮度数值。
+  /// 独立实现、不复用 TryVCP——避免改动高频热路径（DDCProbe/DDCRead/DDCWrite）的签名与行为。
+  public static string DDCReadCurMax(string dev, byte code) {
+    var curBox = new uint[1];
+    var maxBox = new uint[1];
+    var okBox = new bool[1];
+    try {
+      EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (h, hdc, rc, lp) => {
+        var mi = new SGMONITORINFO();
+        mi.cb = Marshal.SizeOf(typeof(SGMONITORINFO));
+        if (!GetMonitorInfo(h, ref mi)) return true;
+        if (!mi.szDevice.Equals(dev, StringComparison.OrdinalIgnoreCase)) return true;
+        uint n;
+        if (!GetNumberOfPhysicalMonitorsFromHMONITOR(h, out n) || n == 0) return true;
+        var arr = new SGPHYS_MON[n];
+        if (!GetPhysicalMonitorsFromHMONITOR(h, n, arr)) return true;
+        try {
+          foreach (var pm in arr) {
+            if (pm.h == IntPtr.Zero) continue;
+            uint curVal = 0, maxVal = 0;
+            bool ok = false;
+            for (int t = 0; t < 5 && !ok; t++) {
+              ok = GetVCPFeatureAndVCPFeatureReply(pm.h, code, IntPtr.Zero, ref curVal, ref maxVal);
+              if (!ok && t + 1 < 5) System.Threading.Thread.Sleep(80);
+            }
+            if (ok) { curBox[0] = curVal; maxBox[0] = maxVal; okBox[0] = true; break; }
+          }
+        } finally {
+          try { DestroyPhysicalMonitors(n, arr); } catch { }
+        }
+        return true;
+      }, IntPtr.Zero);
+    } catch {
+      return "ERR";
+    }
+    return okBox[0] ? curBox[0] + "|" + maxBox[0] : "ERR";
+  }
+
   /// 写 VCP 值，返回 OK / ERR
   public static string DDCWrite(string dev, byte code, uint val) {
     uint cur;
@@ -3316,6 +3355,22 @@ pub fn display_serials() -> Vec<(String, String)> {
         .collect()
 }
 
+/// 读 VCP 0x10 的 (当前值, 面板上报上限)；失败返回 None（不猜）。
+/// P1-4 便携屏功耗诊断专用，只在判定为便携屏时调用（一次 PS 桥调用，较贵）。
+fn vcp_cur_max(dev: &str) -> Option<(u32, u32)> {
+    let out = ps_core(&format!(
+        "[SGCore]::DDCReadCurMax({}, [byte]0x10)",
+        ps_literal(dev)
+    ))
+    .ok()?;
+    let s = out.trim();
+    if s.is_empty() || s == "ERR" {
+        return None;
+    }
+    let (c, m) = s.split_once('|')?;
+    Some((c.trim().parse().ok()?, m.trim().parse().ok()?))
+}
+
 /// 体检报告：结构化版本的一键检测。
 pub fn health_report_impl() -> Result<HealthReport, String> {
     let ts = ps("Get-Date -Format \"yyyy-MM-dd HH:mm:ss\"")
@@ -3412,6 +3467,33 @@ pub fn health_report_impl() -> Result<HealthReport, String> {
         .collect();
 
     let mut displays: Vec<DisplayHealth> = Vec::new();
+    // 便携屏一线通功耗诊断（P1-4）：EDID 物理尺寸表 + 多屏高刷带宽（复用 P0-2 反推）
+    let edid_size_rows = edid_sizes();
+    let mut portable_sections: Vec<super::PortableSection> = Vec::new();
+    let multi_bandwidth: Option<(f64, Vec<String>)> = {
+        // ≥2 块活动屏刷新率 > 60Hz 且总带宽超过 DP 1.2 上限（17.28 Gbps）才提示
+        let mut rows: Vec<(String, f64)> = Vec::new();
+        for d in ds.iter().filter(|d| d.connected && d.hz.map_or(false, |h| h > 60)) {
+            let p: Vec<&str> = d.resolution.split('x').collect();
+            if p.len() != 2 {
+                continue;
+            }
+            if let (Ok(w), Ok(h), Some(hz)) = (
+                p[0].trim().parse::<u32>(),
+                p[1].trim().parse::<u32>(),
+                d.hz,
+            ) {
+                let bw = super::required_bandwidth_gbps(w, h, hz);
+                rows.push((format!("{}：{}x{}@{}Hz ≈ {:.1} Gbps", d.name, w, h, hz, bw), bw));
+            }
+        }
+        let total: f64 = rows.iter().map(|(_, b)| *b).sum();
+        if rows.len() >= 2 && total > 17.28 {
+            Some((total, rows.into_iter().map(|(s, _)| s).collect()))
+        } else {
+            None
+        }
+    };
     for d in &ds {
         let (cur_w, cur_h) = {
             let p: Vec<&str> = d.resolution.split('x').collect();
@@ -3561,6 +3643,61 @@ pub fn health_report_impl() -> Result<HealthReport, String> {
         };
         let topology = Some(build_topology(d, topo_map.get(&dev_name.to_lowercase()), &gpus));
 
+        // ⑥ 便携屏一线通功耗诊断（P1-4）：诚实边界——只解释"为什么暗/为什么闪"并给接线
+        // 建议，绝不承诺"提升亮度"。判定依据：内建面板排除 + EDID 物理尺寸 < 18 英寸，
+        // 或 EDID 尺寸缺失且分辨率 ≤2K。判定不了就不产生检查项（不猜）。
+        let portable_hit = topo_map
+            .get(&dev_name.to_lowercase())
+            .and_then(|row| {
+                let builtin = matches!(row.0, 7 | 11);
+                let letters = edid_manuf_letters(row.1);
+                let diag = letters.and_then(|l| {
+                    edid_size_rows
+                        .iter()
+                        .find(|(k, ch, cv)| {
+                            *ch > 0 && *cv > 0 && (k.starts_with(&l) || l.starts_with(k.as_str()))
+                        })
+                        .map(|(_, ch, cv)| super::diagonal_inches(*ch as f64, *cv as f64))
+                });
+                // 兜底用原生分辨率，拿不到退当前分辨率
+                super::portable_reason(builtin, diag, native_wh.or(Some((cur_w, cur_h))))
+            });
+        if let Some(reason) = &portable_hit {
+            // VCP 上限只在便携屏上读（一次 PS 桥调用，桌面屏不额外开销）
+            let bri_max = if ddc_readable {
+                vcp_cur_max(&dev_name).map(|(_, m)| m)
+            } else {
+                None
+            };
+            // USB-C 一线通"能判断时"才提示：HDMI/VGA/DVI 是独立线，不算一线通；
+            // DP 呈现与间接输出常见于 C 口 DP Alt Mode / 扩展坞，其余情况不猜
+            let usbc_ev = match topo_map.get(&dev_name.to_lowercase()).map(|r| r.0) {
+                Some(10) => Some("连接类型 = DisplayPort（USB-C 一线通通常呈现为 DP）".to_string()),
+                Some(t @ (12 | 15)) => Some(format!(
+                    "连接类型 = {}（USB-C 一线通/扩展坞常呈现为间接输出）",
+                    map_output_tech(t).unwrap_or("间接输出")
+                )),
+                _ => None,
+            };
+            checks.extend(super::build_portable_checks(
+                reason,
+                d.brightness,
+                bri_max,
+                hdr_on,
+                usbc_ev,
+                multi_bandwidth.clone(),
+            ));
+            portable_sections.push(super::build_portable_section(
+                &d.id,
+                &d.name,
+                reason,
+                d.brightness,
+                bri_max,
+                hdr_on,
+                multi_bandwidth.is_some(),
+            ));
+        }
+
         displays.push(DisplayHealth {
             display_id: d.id.clone(),
             name: d.name.clone(),
@@ -3615,6 +3752,7 @@ pub fn health_report_impl() -> Result<HealthReport, String> {
         app_version: env!("CARGO_PKG_VERSION").into(),
         os_version,
         displays,
+        portable: portable_sections,
         summary: super::HealthSummary {
             errors: 0,
             warnings: 0,

@@ -2088,6 +2088,9 @@ pub fn health_report_impl() -> Result<HealthReport, String> {
         app_version: env!("CARGO_PKG_VERSION").into(),
         os_version,
         displays,
+        // P1-4 便携屏功耗诊断：macOS 暂无 EDID 物理尺寸读取通道，判不了就给空，
+        // 不猜（ HDR 状态同样读取不到）。不做"大概是个便携屏"式的误报。
+        portable: Vec::new(),
         summary: HealthSummary {
             errors: 0,
             warnings: 0,

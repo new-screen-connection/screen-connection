@@ -291,7 +291,215 @@ pub struct HealthReport {
     pub app_version: String,
     pub os_version: String,
     pub displays: Vec<DisplayHealth>,
+    /// 便携屏一线通区域（P1-4）；仅在检测到便携屏时非空，前端据此决定是否渲染该区域
+    pub portable: Vec<PortableSection>,
     pub summary: HealthSummary,
+}
+
+// ---------- 便携屏一线通功耗诊断（P1-4，两平台共用判定与文案） ----------
+//
+// 诚实边界（写死）：软件改不了供电。这一项的价值是"告诉用户为什么暗/为什么闪，以及
+// 该怎么接"，不是"修好它"。绝不做"一键提升亮度""解锁面板上限"这类假承诺。
+
+/// 前端「便携屏」区域的数据（仅检测到便携屏时由后端给出）
+#[derive(Serialize, Clone, Debug)]
+pub struct PortableSection {
+    pub display_id: String,
+    pub name: String,
+    /// 一句结论
+    pub conclusion: String,
+    /// 可执行建议（≤5 条，措辞固定，不许改成承诺式）
+    pub advice: Vec<String>,
+    /// 支撑数据（识别依据、亮度数值），不许只给结论
+    pub evidence: Vec<String>,
+}
+
+/// 建议库（固定 5 条，来自开发提示词包；验收要求不出现"提升/解锁/增强亮度"式承诺）
+pub(crate) const ADVICE_DOCK_POWER: &str = "改用带独立供电的 USB-C 扩展坞";
+pub(crate) const ADVICE_SEPARATE_POWER: &str = "便携屏接专用电源适配器，只用 C 线传视频";
+pub(crate) const ADVICE_TURN_OFF_HDR: &str = "在便携屏上关闭 HDR，改用 SDR + 提高亮度";
+pub(crate) const ADVICE_DROP_60HZ: &str = "把便携屏刷新率降到 60Hz 释放带宽";
+pub(crate) const ADVICE_FULL_CABLE: &str =
+    "换用支持 DP Alt Mode 的全功能 C 线（当前线材可能只有 USB 2.0 数据能力）";
+
+/// EDID 物理尺寸（cm）→ 对角线英寸
+pub(crate) fn diagonal_inches(cm_h: f64, cm_v: f64) -> f64 {
+    (cm_h * cm_h + cm_v * cm_v).sqrt() / 2.54
+}
+
+/// 分辨率是否 ≤2K（最长边 ≤2560 视为 2K 档；1920x1080、2560x1440、2560x1600 都算）
+pub(crate) fn res_at_most_2k(w: u32, h: u32) -> bool {
+    let m = w.max(h);
+    m > 0 && m <= 2560
+}
+
+/// 便携屏判定（只按实测，绝不猜）：
+/// - 内建面板永远不算（一线通只针对外接屏，也避免把笔记本内屏误报成便携屏）；
+/// - EDID 上报了物理尺寸：对角线 < 18 英寸 → 便携屏；≥ 18 英寸 → 明确是桌面屏，不再走兜底；
+/// - EDID 尺寸缺失：分辨率 ≤2K 的外接屏按便携屏对待（桌面显示器几乎都上报尺寸，此兜底极少命中）。
+/// 返回 Some(识别依据)；判定不了返回 None。
+pub(crate) fn portable_reason(
+    builtin: bool,
+    diag_in: Option<f64>,
+    res: Option<(u32, u32)>,
+) -> Option<String> {
+    if builtin {
+        return None;
+    }
+    match diag_in {
+        Some(d) if d >= 18.0 => None,
+        Some(d) if d > 0.0 => {
+            Some(format!("EDID 上报物理尺寸约 {:.1} 英寸（< 18 英寸）", d))
+        }
+        _ => match res {
+            Some((w, h)) if res_at_most_2k(w, h) => Some(format!(
+                "EDID 未上报物理尺寸，按外接屏 + 分辨率 {}x{}（≤2K）判为便携屏",
+                w, h
+            )),
+            _ => None,
+        },
+    }
+}
+
+/// 便携屏功耗诊断四项（P1-4）。全部只解释机制 + 给接线建议。
+/// 入参均为实测值；拿不到的传 None，对应检查不产生（不猜）。
+/// - bri_cur/bri_max：DDC VCP 0x10 读回的当前亮度与面板上报上限
+/// - hdr_on：HDR 开关状态（读不到传 None）
+/// - usbc_evidence：能判断 USB-C 一线通时给依据文本，判断不了传 None
+/// - multi：多屏同时高刷时给 (总带宽 Gbps, 各屏明细行)，否则 None
+pub(crate) fn build_portable_checks(
+    reason: &str,
+    bri_cur: Option<u32>,
+    bri_max: Option<u32>,
+    hdr_on: Option<bool>,
+    usbc_evidence: Option<String>,
+    multi: Option<(f64, Vec<String>)>,
+) -> Vec<HealthCheck> {
+    let mut v = Vec::new();
+
+    // ① portable_power_budget：亮度已到 100 仍偏暗 → 供电可能不足，驱动板在限制背光
+    if let Some(cur) = bri_cur {
+        if cur >= 100 {
+            let mut ev = vec![format!("当前亮度 = {}（已到上限）", cur)];
+            match bri_max {
+                Some(m) if m > cur => ev.push(format!(
+                    "面板 VCP 0x10 上报范围 0–{}：软件的 100 只在其标尺的 {:.0}%",
+                    m,
+                    cur as f64 / m as f64 * 100.0
+                )),
+                Some(m) => ev.push(format!("面板 VCP 0x10 上报范围 0–{}", m)),
+                None => ev.push("面板 VCP 上限读取不到，按软件标尺 0–100 判断".to_string()),
+            }
+            ev.push(format!("识别依据：{}", reason));
+            v.push(HealthCheck {
+                id: "portable_power_budget".into(),
+                severity: Severity::Warn,
+                title: "亮度已到上限，屏幕仍偏暗（供电可能不足）".into(),
+                detail: "亮度调到最大仍然偏暗，常见于一线通供电不足：背光功率上不去，驱动板主动压低亮度来保证供电稳定。这是供电问题，软件改不了，建议改接线方式。".into(),
+                evidence: ev,
+                fix_ids: vec![],
+            });
+        }
+    }
+
+    // ② usbc_single_cable：能判断一线通时才发（判断不了不猜）
+    if let Some(usbc) = usbc_evidence {
+        v.push(HealthCheck {
+            id: "usbc_single_cable".into(),
+            severity: Severity::Info,
+            title: "USB-C 一线通同时供电与传视频".into(),
+            detail: "一根 C 线同时取电和传视频时，开启 HDR 或高刷会挤占背光功率，出现亮度下降或闪屏。".into(),
+            evidence: vec![usbc],
+            fix_ids: vec![],
+        });
+    }
+
+    // ③ hdr_on_portable：便携屏开 HDR
+    if hdr_on == Some(true) {
+        v.push(HealthCheck {
+            id: "hdr_on_portable".into(),
+            severity: Severity::Warn,
+            title: "便携屏开启 HDR，亮度可能不升反降".into(),
+            detail: "便携屏开 HDR 常导致亮度不升反降：HDR 提高背光瞬态功耗，供电不足的驱动板会压低背光来保供电。建议在便携屏上关闭 HDR。".into(),
+            evidence: vec!["HDR = 开".into()],
+            fix_ids: vec![],
+        });
+    }
+
+    // ④ multi_display_bandwidth：多屏同时高刷，复用 P0-2 的带宽反推
+    if let Some((total, lines)) = multi {
+        let mut ev = lines;
+        ev.push(format!("总带宽 ≈ {:.1} Gbps（超过 DP 1.2 上限 17.28）", total));
+        v.push(HealthCheck {
+            id: "multi_display_bandwidth".into(),
+            severity: Severity::Warn,
+            title: "多屏同时高刷，总带宽接近链路上限".into(),
+            detail: "多块屏同时高刷时总带宽超过 DP 1.2 上限，接在扩展坞或单条链路上会互相挤占，可能出现掉帧或闪烁。把非主力屏降到 60Hz 释放带宽。".into(),
+            evidence: ev,
+            fix_ids: vec![],
+        });
+    }
+
+    v
+}
+
+/// 组装前端「便携屏」区域数据：一句结论 + 建议清单（去重、≤5 条）+ 支撑数据
+pub(crate) fn build_portable_section(
+    display_id: &str,
+    name: &str,
+    reason: &str,
+    bri_cur: Option<u32>,
+    bri_max: Option<u32>,
+    hdr_on: Option<bool>,
+    high_multi: bool,
+) -> PortableSection {
+    let conclusion = if hdr_on == Some(true) {
+        "这块屏按便携屏识别，且 HDR 正开着——亮度上不去多半与 HDR 挤占供电有关。".to_string()
+    } else if bri_cur.map_or(false, |b| b >= 100) {
+        "这块屏按便携屏识别：亮度已到上限仍偏暗，多半是一线通供电不足限制了背光。".to_string()
+    } else {
+        "这块屏按外接便携屏识别：一线通供电时，亮度与高刷能力会受供电限制。".to_string()
+    };
+
+    let mut advice = Vec::new();
+    if hdr_on == Some(true) {
+        advice.push(ADVICE_TURN_OFF_HDR.to_string());
+    }
+    if high_multi {
+        advice.push(ADVICE_DROP_60HZ.to_string());
+    }
+    advice.push(ADVICE_SEPARATE_POWER.to_string());
+    if bri_cur.map_or(false, |b| b >= 100) {
+        advice.push(ADVICE_DOCK_POWER.to_string());
+    }
+    advice.push(ADVICE_FULL_CABLE.to_string());
+    let mut seen: Vec<String> = Vec::new();
+    advice.retain(|a| {
+        if seen.contains(a) {
+            false
+        } else {
+            seen.push(a.clone());
+            true
+        }
+    });
+
+    let mut evidence = vec![format!("识别依据：{}", reason)];
+    match (bri_cur, bri_max) {
+        (Some(c), Some(m)) => evidence.push(format!("当前亮度 {}（面板上报上限 {}）", c, m)),
+        (Some(c), None) => evidence.push(format!("当前亮度 {}（面板上限未读取到）", c)),
+        _ => {}
+    }
+    if hdr_on == Some(true) {
+        evidence.push("HDR = 开".into());
+    }
+
+    PortableSection {
+        display_id: display_id.to_string(),
+        name: name.to_string(),
+        conclusion,
+        advice,
+        evidence,
+    }
 }
 
 impl HealthReport {
@@ -1215,6 +1423,7 @@ mod markdown_tests {
                     fix_ids: vec!["reopen_ddc_channel".into()],
                 }],
             }],
+            portable: vec![],
             summary: HealthSummary {
                 errors: 0,
                 warnings: 1,
@@ -1252,6 +1461,117 @@ mod markdown_tests {
         assert_eq!(md_cell(&line), "a \\| b");
         // 换行不能破坏表格行
         assert_eq!(md_cell("x\ny"), "x y");
+    }
+}
+
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+
+    /// P1-4 验收：文案不得出现承诺性措辞
+    const FORBIDDEN: [&str; 3] = ["提升亮度", "解锁", "增强亮度"];
+
+    #[test]
+    fn diagonal_inches_math() {
+        // 34.5cm × 19.4cm ≈ 15.6 英寸便携屏
+        let d = diagonal_inches(34.5, 19.4);
+        assert!((d - 15.6).abs() < 0.1, "got {}", d);
+        // 59.8cm × 33.6cm ≈ 27 英寸桌面屏（16:9）
+        let d = diagonal_inches(59.8, 33.6);
+        assert!((d - 27.0).abs() < 0.2, "got {}", d);
+    }
+
+    #[test]
+    fn res_at_most_2k_boundaries() {
+        assert!(res_at_most_2k(1920, 1080));
+        assert!(res_at_most_2k(2560, 1440));
+        assert!(res_at_most_2k(2560, 1600)); // 16:10 竖边超出但主边 2560
+        assert!(res_at_most_2k(1440, 2560)); // 竖屏
+        assert!(!res_at_most_2k(2561, 1440));
+        assert!(!res_at_most_2k(3840, 2160));
+        assert!(!res_at_most_2k(0, 0));
+    }
+
+    #[test]
+    fn portable_reason_by_edid_size() {
+        // 内建面板永远不算
+        assert_eq!(portable_reason(true, Some(15.6), Some((1920, 1080))), None);
+        // 15.6 英寸外接便携屏
+        let r = portable_reason(false, Some(15.6), Some((1920, 1080))).unwrap();
+        assert!(r.contains("15.6") && r.contains("英寸"));
+        // 17.9 英寸临界值仍算便携
+        assert!(portable_reason(false, Some(17.9), None).is_some());
+        // 27 英寸桌面屏：有 EDID 尺寸就不走兜底，绝不误报
+        assert_eq!(portable_reason(false, Some(27.0), Some((1920, 1080))), None);
+        // EDID 尺寸缺失：≤2K 外接屏判为便携
+        let r = portable_reason(false, None, Some((1920, 1080))).unwrap();
+        assert!(r.contains("≤2K"));
+        // EDID 尺寸缺失：4K 外接屏不判
+        assert_eq!(portable_reason(false, None, Some((3840, 2160))), None);
+        // 什么都没有：不猜
+        assert_eq!(portable_reason(false, None, None), None);
+    }
+
+    #[test]
+    fn power_budget_only_at_max_brightness() {
+        // 亮度 80：不产生
+        let c = build_portable_checks("EDID 15.6 英寸", Some(80), Some(100), None, None, None);
+        assert!(!c.iter().any(|x| x.id == "portable_power_budget"));
+        // 亮度 100：产生，evidence 同时给当前亮度与最大亮度
+        let c = build_portable_checks("EDID 15.6 英寸", Some(100), Some(100), None, None, None);
+        let p = c.iter().find(|x| x.id == "portable_power_budget").unwrap();
+        assert_eq!(p.severity, Severity::Warn);
+        assert!(p.detail.contains("供电不足"));
+        assert!(p.evidence.iter().any(|e| e.contains("100")));
+        // 面板标尺 0–255：软件 100 只在其 39%，如实标注
+        let c = build_portable_checks("EDID 15.6 英寸", Some(100), Some(255), None, None, None);
+        let p = c.iter().find(|x| x.id == "portable_power_budget").unwrap();
+        assert!(p.evidence.iter().any(|e| e.contains("0–255") && e.contains("39%")));
+    }
+
+    #[test]
+    fn usbc_and_hdr_checks() {
+        // 能判断 USB-C 才发
+        let c = build_portable_checks("r", Some(60), None, None, Some("连接类型 = DisplayPort".into()), None);
+        assert!(c.iter().any(|x| x.id == "usbc_single_cable"));
+        let c = build_portable_checks("r", Some(60), None, None, None, None);
+        assert!(!c.iter().any(|x| x.id == "usbc_single_cable"));
+        // HDR 开 → warn；HDR 关/未知 → 不发
+        let c = build_portable_checks("r", Some(60), None, Some(true), None, None);
+        assert!(c.iter().any(|x| x.id == "hdr_on_portable"));
+        let c = build_portable_checks("r", Some(60), None, Some(false), None, None);
+        assert!(!c.iter().any(|x| x.id == "hdr_on_portable"));
+    }
+
+    #[test]
+    fn multi_bandwidth_check() {
+        let lines = vec!["A：2560x1440@144Hz ≈ 13.8 Gbps".to_string(), "B：1920x1080@120Hz ≈ 6.4 Gbps".to_string()];
+        let c = build_portable_checks("r", Some(60), None, None, None, Some((20.2, lines)));
+        let m = c.iter().find(|x| x.id == "multi_display_bandwidth").unwrap();
+        assert_eq!(m.severity, Severity::Warn);
+        assert!(m.evidence.iter().any(|e| e.contains("20.2")));
+        let c = build_portable_checks("r", Some(60), None, None, None, None);
+        assert!(!c.iter().any(|x| x.id == "multi_display_bandwidth"));
+    }
+
+    #[test]
+    fn section_advice_dedup_and_cap() {
+        let s = build_portable_section("d1", "便携屏 16", "EDID 16.1 英寸", Some(100), Some(100), Some(true), true);
+        // ≤5 条 + 无重复
+        assert!(s.advice.len() <= 5, "advice 过多：{:?}", s.advice);
+        let uniq: std::collections::HashSet<&String> = s.advice.iter().collect();
+        assert_eq!(uniq.len(), s.advice.len());
+        // HDR 开 → 关 HDR 建议排第一
+        assert_eq!(s.advice[0], ADVICE_TURN_OFF_HDR);
+        // 结论 + 边界数据都来自实测
+        assert!(s.conclusion.contains("HDR"));
+        assert!(s.evidence.iter().any(|e| e.contains("识别依据")));
+        // 建议文案无承诺性措辞
+        for a in &s.advice {
+            for f in FORBIDDEN {
+                assert!(!a.contains(f), "建议文案含承诺性措辞「{}」：{}", f, a);
+            }
+        }
     }
 }
 

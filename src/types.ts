@@ -120,6 +120,18 @@ export interface HealthSummary {
   headline: string;
 }
 
+/** 便携屏一线通区域（P1-4；仅在检测到便携屏时由后端给出，否则为空数组） */
+export interface PortableSection {
+  display_id: string;
+  name: string;
+  /** 一句结论 */
+  conclusion: string;
+  /** 可执行建议（≤5 条；勾选标记只存本地，不参与诊断逻辑） */
+  advice: string[];
+  /** 支撑数据（识别依据、亮度数值） */
+  evidence: string[];
+}
+
 /** 完整体检报告 */
 export interface HealthReport {
   generated_at: string;
@@ -127,6 +139,8 @@ export interface HealthReport {
   app_version: string;
   os_version: string;
   displays: DisplayHealth[];
+  /** 便携屏一线通区域；普通桌面屏场景为空，体检页不渲染该区域 */
+  portable: PortableSection[];
   summary: HealthSummary;
 }
 

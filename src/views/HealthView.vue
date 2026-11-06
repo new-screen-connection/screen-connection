@@ -12,6 +12,42 @@ const loaded = ref(false);
 const expanded = ref<Set<string>>(new Set());
 const menuOpen = ref(false);
 
+// ---------- 便携屏建议勾选（P1-4）：标记状态只存本地，不参与诊断逻辑 ----------
+
+const PORTABLE_DONE_KEY = 'sc_portable_done_v1';
+
+function loadAdviceDone(): Record<string, boolean> {
+  try {
+    const raw = localStorage.getItem(PORTABLE_DONE_KEY);
+    return raw ? (JSON.parse(raw) as Record<string, boolean>) : {};
+  } catch {
+    return {};
+  }
+}
+
+const adviceDone = ref<Record<string, boolean>>(loadAdviceDone());
+
+function adviceKey(displayId: string, advice: string): string {
+  return `${displayId}::${advice}`;
+}
+
+function isAdviceDone(displayId: string, advice: string): boolean {
+  return adviceDone.value[adviceKey(displayId, advice)] === true;
+}
+
+function toggleAdvice(displayId: string, advice: string): void {
+  const key = adviceKey(displayId, advice);
+  const next = { ...adviceDone.value };
+  if (next[key]) delete next[key];
+  else next[key] = true;
+  adviceDone.value = next;
+  try {
+    localStorage.setItem(PORTABLE_DONE_KEY, JSON.stringify(next));
+  } catch {
+    // 存不进 localStorage 就只在本会话生效，不影响功能
+  }
+}
+
 /** 拓扑跳的固定中文名（label 是各跳的具体值，kind 才是位置名） */
 const HOP_NAMES: Record<HopKind, string> = {
   gpu: '显卡',
@@ -242,6 +278,32 @@ async function runRepair(displayId: string, checkId: string, fix: string, value?
           {{ report.os_version }} · 应用 v{{ report.app_version }} · {{ report.displays.length }} 台显示器（含未活动的 {{ report.displays.filter((d) => !d.connected).length }} 台）
         </p>
       </template>
+    </Card>
+
+    <!-- 便携屏一线通区域（P1-4）：仅检测到便携屏时出现 -->
+    <Card v-if="report?.portable?.length" title="便携屏" icon="battery">
+      <div v-for="p in report.portable" :key="p.display_id" class="portable-item">
+        <p class="portable-name">{{ p.name }}</p>
+        <p class="portable-conclusion">{{ p.conclusion }}</p>
+        <ul class="portable-evidence">
+          <li v-for="(ev, i) in p.evidence" :key="i">{{ ev }}</li>
+        </ul>
+        <div class="portable-advice">
+          <button
+            v-for="a in p.advice"
+            :key="a"
+            class="portable-advice-item"
+            :class="{ done: isAdviceDone(p.display_id, a) }"
+            :title="isAdviceDone(p.display_id, a) ? '点击取消「已处理」标记' : '点击标记为已处理'"
+            @click="toggleAdvice(p.display_id, a)"
+          >
+            <span class="portable-dot"></span>
+            <span class="portable-advice-text">{{ a }}</span>
+            <span v-if="isAdviceDone(p.display_id, a)" class="portable-done-tag">已处理</span>
+          </button>
+        </div>
+      </div>
+      <p class="portable-boundary">本应用无法改变显示器供电，以上为接线与设置建议。</p>
     </Card>
 
     <Card

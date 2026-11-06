@@ -2,7 +2,7 @@
  * 浏览器预览用的模拟后端。
  * 在 Tauri WebView 内不生效；`npm run dev` 直接在浏览器打开时可预览全部界面与交互。
  */
-import type { AudioEndpoint, BatteryInfo, DisplayInfo, HealthReport, Topology } from '../types';
+import type { AudioEndpoint, BatteryInfo, DisplayInfo, HealthReport, PortableSection, Topology } from '../types';
 import type { ApplyReport, AutoConfig, KvmPeer, MigrateBundle, Profile } from '../types';
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -237,6 +237,28 @@ const healthReport: HealthReport = {
           ],
           fix_ids: ['rescan_displays'],
         },
+        {
+          id: 'portable_power_budget',
+          severity: 'warn',
+          title: '亮度已到上限，屏幕仍偏暗（供电可能不足）',
+          detail:
+            '亮度调到最大仍然偏暗，常见于一线通供电不足：背光功率上不去，驱动板主动压低亮度来保证供电稳定。这是供电问题，软件改不了，建议改接线方式。',
+          evidence: [
+            '当前亮度 = 100（已到上限）',
+            '面板 VCP 0x10 上报范围 0–100',
+            '识别依据：EDID 上报物理尺寸约 16.0 英寸（< 18 英寸）',
+          ],
+          fix_ids: [],
+        },
+        {
+          id: 'usbc_single_cable',
+          severity: 'info',
+          title: 'USB-C 一线通同时供电与传视频',
+          detail:
+            '一根 C 线同时取电和传视频时，开启 HDR 或高刷会挤占背光功率，出现亮度下降或闪屏。',
+          evidence: ['连接类型 = DisplayPort（USB-C 一线通通常呈现为 DP）'],
+          fix_ids: [],
+        },
       ],
     },
     {
@@ -264,6 +286,22 @@ const healthReport: HealthReport = {
       ],
     },
   ],
+  portable: [
+    {
+      display_id: 'mock-health-2',
+      name: '16 英寸便携副屏',
+      conclusion: '这块屏按便携屏识别：亮度已到上限仍偏暗，多半是一线通供电不足限制了背光。',
+      advice: [
+        '便携屏接专用电源适配器，只用 C 线传视频',
+        '改用带独立供电的 USB-C 扩展坞',
+        '换用支持 DP Alt Mode 的全功能 C 线（当前线材可能只有 USB 2.0 数据能力）',
+      ],
+      evidence: [
+        '识别依据：EDID 上报物理尺寸约 16.0 英寸（< 18 英寸）',
+        '当前亮度 100（面板上报上限 100）',
+      ],
+    },
+  ] satisfies PortableSection[],
   summary: { errors: 1, warnings: 1, infos: 2, headline: '2 块屏已连接，其中 1 项需要处理' },
 };
 
