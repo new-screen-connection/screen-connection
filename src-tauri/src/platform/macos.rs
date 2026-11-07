@@ -406,12 +406,14 @@ pub fn set_audio_device(id: &str) -> Result<(), String> {
     }
 }
 
-pub fn set_system_volume_sel(value: u32) -> Result<(), String> {
-    set_system_volume(value)
+pub fn set_system_volume_sel(value: u32) -> Result<Option<String>, String> {
+    set_system_volume(value)?;
+    Ok(None)
 }
 
-pub fn set_system_mute_sel(on: bool) -> Result<(), String> {
-    set_system_mute(on)
+pub fn set_system_mute_sel(on: bool) -> Result<Option<String>, String> {
+    set_system_mute(on)?;
+    Ok(None)
 }
 
 pub fn get_batteries() -> Result<Vec<BatteryInfo>, String> {
