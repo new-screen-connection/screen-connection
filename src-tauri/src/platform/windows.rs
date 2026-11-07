@@ -3013,9 +3013,32 @@ pub fn restore_secondary() -> Result<(), String> {
 // 因此「一次黑掉所有屏」走 Windows 系统级指令（对所有屏生效，含小米），
 // 而单台精细待机/唤醒走 DDC（实测副屏 MTI 支持 VCP 0xD6）。
 
+/// 等待键鼠输入空闲：连续 quiet_ms 内没有任何输入才返回；最多等 max_wait_ms 兜底。
+/// 用途：用户点「全部待机」时鼠标往往还在动（刚点完按钮），若立刻广播关屏指令，
+/// 这点抖动会把刚进入待机的屏瞬间唤醒（表现为「点了没反应 / 马上又亮」，实测踩过）。
+/// 等输入真正停下之后再广播，屏才会稳定保持待机；之后晃鼠标/敲键盘即原生唤醒。
+fn wait_input_idle(quiet_ms: u64, max_wait_ms: u64) {
+    let start = std::time::Instant::now();
+    loop {
+        let t0 = last_input_tick();
+        std::thread::sleep(std::time::Duration::from_millis(quiet_ms));
+        let t1 = last_input_tick();
+        if t0 != 0 && t1 == t0 {
+            return; // quiet_ms 内无新输入 → 输入已空闲
+        }
+        if start.elapsed().as_millis() as u64 >= max_wait_ms {
+            return; // 超时兜底：用户一直在操作时最多等 max_wait_ms 就执行
+        }
+    }
+}
+
 /// 系统级关闭所有显示器：一次让全部屏进入待机。
 /// 这是唯一能影响到无 DDC 显示器（本机小米）的软件手段。
+/// 行为约定（用户要求）：点击后两块屏幕全部待机；之后晃动鼠标 / 敲键盘即亮屏
+/// （待机是显示器电源状态，任何输入事件都会被系统原生唤醒，无需软件参与）。
 pub fn screen_off() -> Result<(), String> {
+    // 先等输入空闲再广播（最多 2 秒）：避免点击瞬间的鼠标抖动把屏立刻唤醒
+    wait_input_idle(700, 2000);
     let r = screen_off_inner();
     if r.is_ok() {
         // 记录「是**我们主动**关的屏」并同时记下此刻的输入时刻。

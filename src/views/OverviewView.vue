@@ -31,7 +31,7 @@ const openPanel = (): void => {
 };
 
 const screenOff = (): void => {
-  void act(() => invoke('screen_off'), '已待机（动一下鼠标或按键盘即可唤醒）');
+  void act(() => invoke('screen_off'), '两块屏幕即将待机，晃动鼠标或敲键盘即可唤醒');
 };
 
 const screenWake = (): void => {
