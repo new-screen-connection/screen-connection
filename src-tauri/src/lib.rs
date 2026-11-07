@@ -68,12 +68,42 @@ async fn get_display_modes(display_id: String) -> Result<Vec<platform::DisplayMo
         .map_err(|e| format!("后台任务失败：{}", e))?
 }
 
+/// 显示模式 / 缩放变化后强制重设主窗口尺寸并居中主屏。
+/// WebView2 的毛病：屏幕分辨率或 DPI 缩放变了之后，窗口物理尺寸与页面渲染
+/// 缩放不同步 —— 内容按旧 DPI 排版，右半边被裁掉（实测：铺满双屏「先对齐两屏
+/// 清晰度」改了分辨率，回来主窗口内容就溢出，用户截图反馈）。凡是会改显示
+/// 模式/缩放的命令结束后都调一次，把窗口拉回默认 780x760（屏幕太小则夹进屏内）。
+fn normalize_main_window(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    let Some(w) = app.get_webview_window("main") else {
+        return;
+    };
+    let Ok(Some(mon)) = w.primary_monitor() else {
+        return;
+    };
+    let pos = mon.position();
+    let size = mon.size();
+    let scale = mon.scale_factor();
+    // 默认逻辑尺寸 780x760（与 tauri.conf.json 一致），按当前 DPI 折算物理像素
+    let mut ww = (780.0 * scale) as i32;
+    let mut wh = (760.0 * scale) as i32;
+    // 目标屏比默认窗口还小（如竖屏便携屏当主屏）时夹进屏内，保住最小 420x520
+    ww = ww.min(size.width as i32 - 24).max(420);
+    wh = wh.min(size.height as i32 - 24).max(520);
+    let _ = w.set_size(tauri::PhysicalSize::new(ww.max(1) as u32, wh.max(1) as u32));
+    let x = pos.x + ((size.width as i32 - ww) / 2).max(0);
+    let y = pos.y + ((size.height as i32 - wh) / 2).max(0);
+    let _ = w.set_position(tauri::PhysicalPosition::new(x, y));
+}
+
 /// 切换单屏分辨率/刷新率，并回读验证；不匹配时恢复原显示配置。
 #[tauri::command]
-async fn set_display_mode(display_id: String, mode: u32) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || platform::set_display_mode(&display_id, mode))
+async fn set_display_mode(app: tauri::AppHandle, display_id: String, mode: u32) -> Result<String, String> {
+    let r = tauri::async_runtime::spawn_blocking(move || platform::set_display_mode(&display_id, mode))
         .await
-        .map_err(|e| format!("后台任务失败：{}", e))?
+        .map_err(|e| format!("后台任务失败：{}", e))?;
+    normalize_main_window(&app);
+    r
 }
 
 /// 执行 Screenguard 原生实现的 macOS 显示操作。
@@ -162,25 +192,31 @@ fn relaunch_as_admin(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn match_ppi() -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(platform::match_ppi)
+async fn match_ppi(app: tauri::AppHandle) -> Result<(), String> {
+    let r = tauri::async_runtime::spawn_blocking(platform::match_ppi)
         .await
-        .map_err(|e| format!("后台任务失败：{}", e))?
+        .map_err(|e| format!("后台任务失败：{}", e))?;
+    normalize_main_window(&app);
+    r
 }
 
 #[tauri::command]
-async fn rotate_secondary() -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(platform::rotate_secondary)
+async fn rotate_secondary(app: tauri::AppHandle) -> Result<(), String> {
+    let r = tauri::async_runtime::spawn_blocking(platform::rotate_secondary)
         .await
-        .map_err(|e| format!("后台任务失败：{}", e))?
+        .map_err(|e| format!("后台任务失败：{}", e))?;
+    normalize_main_window(&app);
+    r
 }
 
 /// 恢复副屏为竖屏
 #[tauri::command]
-async fn restore_secondary() -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(platform::restore_secondary)
+async fn restore_secondary(app: tauri::AppHandle) -> Result<(), String> {
+    let r = tauri::async_runtime::spawn_blocking(platform::restore_secondary)
         .await
-        .map_err(|e| format!("后台任务失败：{}", e))?
+        .map_err(|e| format!("后台任务失败：{}", e))?;
+    normalize_main_window(&app);
+    r
 }
 
 // ---------- 屏幕电源控制（方案A：纯本地） ----------
@@ -303,17 +339,20 @@ async fn hdr_set(on: bool) -> Result<String, String> {
 
 /// 双屏铺满：把当前前台窗口铺满所有屏（不限播放器）
 #[tauri::command]
-async fn span_foreground(mode: Option<u32>) -> Result<String, String> {
+async fn span_foreground(app: tauri::AppHandle, mode: Option<u32>) -> Result<String, String> {
     // 默认 mode=1「以主屏为基准」：本机两块屏分辨率不同，用包围盒会把主屏底部裁掉
     let m = mode.unwrap_or(1);
-    tauri::async_runtime::spawn_blocking(move || platform::span_foreground(m))
+    let r = tauri::async_runtime::spawn_blocking(move || platform::span_foreground(m))
         .await
-        .map_err(|e| format!("后台任务失败：{}", e))?
+        .map_err(|e| format!("后台任务失败：{}", e))?;
+    // mode=2 会先改两屏分辨率；成败都要把主窗口拉回正常尺寸（内容溢出修复）
+    normalize_main_window(&app);
+    r
 }
 
 /// 还原上一次被铺满的窗口
 #[tauri::command]
-async fn restore_foreground() -> Result<(), String> {
+async fn restore_foreground(app: tauri::AppHandle) -> Result<(), String> {
     let window_restore = tauri::async_runtime::spawn_blocking(platform::restore_foreground)
         .await
         .map_err(|e| format!("后台任务失败：{}", e))?;
@@ -322,7 +361,10 @@ async fn restore_foreground() -> Result<(), String> {
     // in its recovery record and restores them conditionally inside restore_foreground.
     // An unconditional second restore here could consume an unrelated pending alignment backup.
     #[cfg(target_os = "macos")]
-    return window_restore;
+    {
+        normalize_main_window(&app);
+        return window_restore;
+    }
 
     // Windows' foreground restore only restores the app window; screen alignment is a
     // separate operation and must be rolled back alongside it.
@@ -331,12 +373,15 @@ async fn restore_foreground() -> Result<(), String> {
         let display_restore = tauri::async_runtime::spawn_blocking(platform::align_restore_modes)
             .await
             .map_err(|e| format!("后台任务失败：{}", e))?;
-        match (window_restore, display_restore) {
+        let r = match (window_restore, display_restore) {
             (Ok(()), Ok(_)) => Ok(()),
             (Err(window), Err(display)) => Err(format!("窗口还原失败：{}；显示器还原失败：{}", window, display)),
             (Err(window), Ok(_)) => Err(window),
             (Ok(()), Err(display)) => Err(display),
-        }
+        };
+        // 还原把显示模式改回去 → 主窗口同样要重新归一化
+        normalize_main_window(&app);
+        r
     }
 }
 
@@ -354,17 +399,21 @@ fn hotkey_label() -> String {
 
 /// 跨屏缩放对齐：真正写入逐屏缩放档（先备份）
 #[tauri::command]
-async fn match_dpi_apply() -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(platform::match_dpi_apply)
+async fn match_dpi_apply(app: tauri::AppHandle) -> Result<String, String> {
+    let r = tauri::async_runtime::spawn_blocking(platform::match_dpi_apply)
         .await
-        .map_err(|e| format!("后台任务失败：{}", e))?
+        .map_err(|e| format!("后台任务失败：{}", e))?;
+    normalize_main_window(&app);
+    r
 }
 
 #[tauri::command]
-async fn match_dpi_restore() -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(platform::match_dpi_restore)
+async fn match_dpi_restore(app: tauri::AppHandle) -> Result<String, String> {
+    let r = tauri::async_runtime::spawn_blocking(platform::match_dpi_restore)
         .await
-        .map_err(|e| format!("后台任务失败：{}", e))?
+        .map_err(|e| format!("后台任务失败：{}", e))?;
+    normalize_main_window(&app);
+    r
 }
 
 // ---------- v0.3.3：窗口选择 / 音频端点选择 / 一键恢复默认 ----------
@@ -379,11 +428,13 @@ async fn list_windows() -> Result<String, String> {
 
 /// 铺满指定窗口（按 hwnd，用户从列表里挑）
 #[tauri::command]
-async fn span_window(hwnd: i64, mode: Option<u32>) -> Result<String, String> {
+async fn span_window(app: tauri::AppHandle, hwnd: i64, mode: Option<u32>) -> Result<String, String> {
     let m = mode.unwrap_or(1);
-    tauri::async_runtime::spawn_blocking(move || platform::span_window(hwnd, m))
+    let r = tauri::async_runtime::spawn_blocking(move || platform::span_window(hwnd, m))
         .await
-        .map_err(|e| format!("后台任务失败：{}", e))?
+        .map_err(|e| format!("后台任务失败：{}", e))?;
+    normalize_main_window(&app);
+    r
 }
 
 /// 所有活动的音频输出端点（含是否可调音量），供「系统控制」里选设备
@@ -507,10 +558,13 @@ async fn profile_capture(name: String) -> Result<platform::Profile, String> {
 
 /// 应用一个档：失败可回滚，逐步回读核验
 #[tauri::command]
-async fn profile_apply(id: String) -> Result<platform::ApplyReport, String> {
-    tauri::async_runtime::spawn_blocking(move || platform::profile_apply_impl(&id))
+async fn profile_apply(app: tauri::AppHandle, id: String) -> Result<platform::ApplyReport, String> {
+    let r = tauri::async_runtime::spawn_blocking(move || platform::profile_apply_impl(&id))
         .await
-        .map_err(|e| format!("后台任务失败：{}", e))?
+        .map_err(|e| format!("后台任务失败：{}", e))?;
+    // 档位可能整体改写各屏模式/缩放 → 主窗口重新归一化
+    normalize_main_window(&app);
+    r
 }
 
 /// 更新档位：改名 / 重捕获 targets（「更新为当前状态」）/ 开关自动触发标记 / 改匹配条件

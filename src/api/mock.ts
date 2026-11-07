@@ -619,8 +619,7 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       return 1 as T;
     case 'set_display_power':
       return undefined as T;
-    case 'hdr_set':
-      return '已把全部屏幕 HDR 切换' as T;
+    // hdr_set 已在前面的 hdr_states 分支附近定义（带状态联动），此处不再重复
     case 'set_system_mute':
       return undefined as T;
     case 'adb_status':
