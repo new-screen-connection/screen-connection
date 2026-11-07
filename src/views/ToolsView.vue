@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue';
-import { invoke, listenEvent } from '../api/tauri';
+import { invoke, listenEvent, isTauri } from '../api/tauri';
 import { act, store } from '../store';
 import { CMD, REPAIR_LABELS } from '../types';
 import type { RepairOutcome, UpdateInfo } from '../types';
@@ -65,13 +65,27 @@ const openLogs = (): void => {
 const exportSettings = (): void => {
   void act(async () => {
     const json = String(await invoke<string>('export_user_settings_json'));
+    // B3：真机环境走系统「另存为」对话框，由用户选保存位置；
+    // 浏览器预览（无 Tauri 对话框）时回退到原静默下载。
+    if (isTauri()) {
+      const { save } = await import('@tauri-apps/plugin-dialog');
+      const path = await save({
+        title: '导出设置',
+        defaultPath: 'screen-connection-settings.json',
+        filters: [{ name: 'JSON 设置文件', extensions: ['json'] }],
+      });
+      if (!path) return ''; // 用户取消了另存为
+      await invoke('write_text_file', { path, contents: json });
+      return path;
+    }
     const blob = new Blob([json], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = 'screen-connection-settings.json';
     a.click();
     URL.revokeObjectURL(a.href);
-  }, '设置已导出');
+    return '';
+  }, (p) => (p ? `设置已导出到 ${p}` : '设置已导出'));
 };
 
 const pickImport = (): void => {

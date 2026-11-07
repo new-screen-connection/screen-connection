@@ -32,6 +32,7 @@ ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 # 有 1~2s 竞态窗口 —— 快速双击时多个实例同时存活（托盘积压），命中守卫时
 # 新实例静默退出又像「闪退」。本插件的回调负责唤出已有主窗口。
 tauri-plugin-single-instance = "2"
+tauri-plugin-dialog = "2.8.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "=0.10.1"

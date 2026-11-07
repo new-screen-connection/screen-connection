@@ -75,6 +75,9 @@ async fn get_display_modes(display_id: String) -> Result<Vec<platform::DisplayMo
 /// 缩放不同步 —— 内容按旧 DPI 排版，右半边被裁掉（实测：铺满双屏「先对齐两屏
 /// 清晰度」改了分辨率，回来主窗口内容就溢出，用户截图反馈）。凡是会改显示
 /// 模式/缩放的命令结束后都调一次，把窗口拉回默认 780x760（屏幕太小则夹进屏内）。
+/// B8 收敛式：尺寸已经对就不再动；位置不强制定位居中（保留用户摆放的位置），
+/// 只有窗口跑出主屏可视区才拉回屏内 —— 每次都无条件 set_size+居中会与 DPI
+/// 迟到传播互搏，多条归一化序列并行时窗口被反复搬动 = 桌面上跳动。
 fn normalize_main_window(app: &tauri::AppHandle) {
     use tauri::Manager;
     let Some(w) = app.get_webview_window("main") else {
@@ -92,10 +95,24 @@ fn normalize_main_window(app: &tauri::AppHandle) {
     // 目标屏比默认窗口还小（如竖屏便携屏当主屏）时夹进屏内，保住最小 420x520
     ww = ww.min(size.width as i32 - 24).max(420);
     wh = wh.min(size.height as i32 - 24).max(520);
-    let _ = w.set_size(tauri::PhysicalSize::new(ww.max(1) as u32, wh.max(1) as u32));
-    let x = pos.x + ((size.width as i32 - ww) / 2).max(0);
-    let y = pos.y + ((size.height as i32 - wh) / 2).max(0);
-    let _ = w.set_position(tauri::PhysicalPosition::new(x, y));
+    let cur = w.outer_size().unwrap_or_default();
+    // 尺寸一致（±2px 容差）就跳过，不再打扰窗口
+    if (cur.width as i32 - ww).abs() > 2 || (cur.height as i32 - wh).abs() > 2 {
+        let _ = w.set_size(tauri::PhysicalSize::new(ww.max(1) as u32, wh.max(1) as u32));
+    }
+    // 位置：仅当窗口基本不在主屏可视区时才拉回（居中），否则保留用户摆的位置
+    let cw = cur.width as i32;
+    let ch = cur.height as i32;
+    if cw > 0 && ch > 0 {
+        let p = w.outer_position().unwrap_or_default();
+        let in_x = p.x + cw > pos.x + 40 && p.x < pos.x + size.width as i32 - 40;
+        let in_y = p.y + ch > pos.y + 40 && p.y < pos.y + size.height as i32 - 40;
+        if !(in_x && in_y) {
+            let x = pos.x + ((size.width as i32 - ww) / 2).max(0);
+            let y = pos.y + ((size.height as i32 - wh) / 2).max(0);
+            let _ = w.set_position(tauri::PhysicalPosition::new(x, y));
+        }
+    }
 }
 
 /// 立即归一化 + 延迟复归一化。
@@ -103,12 +120,19 @@ fn normalize_main_window(app: &tauri::AppHandle) {
 /// 在之后几百毫秒里陆续传播到 WebView2 —— 只在命令返回瞬间归一化一次，会被
 /// 随后到达的 DPI 传播按旧缩放重新排版覆盖掉（用户反馈：还原窗口后主窗口
 /// 仍然错乱）。因此再补 3 次延迟归一化，等传播彻底结束后收口。
+/// B8 序列去重：多条序列并行时互相覆盖（旧序列按旧 DPI 搬窗口）——每条序列
+/// 带代号，一旦有新序列进来，旧序列立即退出，只有最新一条在跑。
+static NORM_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn normalize_main_window_settled(app: &tauri::AppHandle) {
     normalize_main_window(app);
+    let gen = NORM_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let app2 = app.clone();
     std::thread::spawn(move || {
         for ms in [250u64, 700, 1600, 3000] {
             std::thread::sleep(std::time::Duration::from_millis(ms));
+            if NORM_GEN.load(std::sync::atomic::Ordering::Relaxed) != gen {
+                return; // 更新的归一化序列已接管，本序列退出，不再搬窗口
+            }
             normalize_main_window(&app2);
         }
     });
@@ -949,11 +973,47 @@ fn open_main(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// B9：两条退出路径（应用内「退出软件」+ 托盘「退出（自动还原）」）统一走这里。
+/// 秒响应：先隐藏所有窗口、移除托盘图标，用户点击的瞬间就看到「已退出」；
+/// 还原挪到独立线程，12 秒硬超时兜底强退 —— 此前还原（重型 PowerShell、逐屏
+/// DDC 探测）跑在主线程同步命令里，任何一步卡住进程就永远退不出去、托盘残留。
+fn quit_with_restore(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    // 1) 秒响应：藏窗口 + 收托盘图标
+    for label in ["main", "panel"] {
+        if let Some(w) = app.get_webview_window(label) {
+            let _ = w.hide();
+        }
+    }
+    if let Some(tray) = app.tray_by_id("main") {
+        let _ = tray.set_visible(false);
+    }
+    // 2) 后台还原 + 超时兜底退出
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        let worker = std::thread::spawn(revert_before_exit);
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(12);
+        while !worker.is_finished() {
+            if start.elapsed() >= timeout {
+                break; // 还原卡死：放弃剩余步骤，保底退出
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        handle.exit(0);
+    });
+}
+
 /// 菜单栏面板：退出（窗口操作，留在主线程）
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
-    revert_before_exit();
-    app.exit(0);
+    quit_with_restore(&app);
+}
+
+/// B3：把文本写到用户通过「另存为」对话框选定的路径（导出设置用）
+#[tauri::command]
+fn write_text_file(path: String, contents: String) -> Result<(), String> {
+    std::fs::write(&path, contents.as_bytes()).map_err(|e| format!("写入文件失败：{}", e))
 }
 
 /// 退出前把「软件层面」的改动还原成基线（用户要求：退出软件后自动恢复原样）。
@@ -2190,6 +2250,8 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_main_window(app);
         }))
+        // B3：导出设置用的系统「另存为」对话框
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -2246,9 +2308,8 @@ pub fn run() {
                         let _ = platform::restore_defaults();
                     }
                     "quit" => {
-                        // 退出前把软件层面的改动还原（用户要求：退出后恢复原样）
-                        revert_before_exit();
-                        app_handle.exit(0)
+                        // B9：与应用内退出同一套逻辑（秒响应 + 后台还原 + 超时兜底）
+                        quit_with_restore(app_handle)
                     }
                     _ => {}
                 })
@@ -2263,6 +2324,17 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            // B8：启动归一化收口 —— 提权重启（--elevated）等场景下启动瞬间读到的
+            // DPI 缩放可能还没定型，主窗口会停在错误宽度；启动 600ms 后跑一次
+            // 归一化序列，把窗口尺寸收到正确值（收敛式：已正确则不动）。
+            {
+                let h = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(600));
+                    normalize_main_window_settled(&h);
+                });
+            }
 
             // Windows Event Log based health monitor (disconnect alerts + optional repair).
             #[cfg(target_os = "windows")]
@@ -2315,6 +2387,7 @@ pub fn run() {
             update_check,
             update_download,
             update_install,
+            write_text_file,
             open_external_page,
             get_autostart,
             set_autostart,

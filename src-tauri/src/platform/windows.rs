@@ -4489,13 +4489,47 @@ fn rollback_span_alignment(aligned: bool) -> String {
     }
     match align_restore_modes() {
         Ok(s) => format!("；显示布局已回滚：{}", s),
-        Err(e) => format!("；显示布局回滚失败：{}", e),
+        // B7：回滚失败不再把底层技术细节直接甩给用户，给出可操作的指引
+        Err(e) => format!(
+            "；注意：两屏清晰度未能自动恢复原样（{}）。请到「布局」页手动把两块屏改回原来的分辨率",
+            e
+        ),
+    }
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn GetForegroundWindow() -> *mut std::ffi::c_void;
+    fn GetWindowThreadProcessId(hwnd: *mut std::ffi::c_void, pid: *mut u32) -> u32;
+}
+
+/// B1 入口闸门：当前前台窗口若是本进程自己的窗口，返回 Some(提示)。
+/// 必须在一切分辨率/对齐操作**之前**调用 —— 此前该检测在 C# SpanForeground 里，
+/// mode=2 时 align_apply 已先改了两屏分辨率，被拦后再回滚，回滚一失败
+/// 主窗口就留在超宽的残局（实测踩过）。
+fn foreground_is_self() -> Option<&'static str> {
+    unsafe {
+        let h = GetForegroundWindow();
+        if h.is_null() {
+            return None; // 没有前台窗口：交给 C# 报「没有前台窗口」
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(h, &mut pid);
+        if pid == std::process::id() {
+            Some("当前前台是屏幕连接助手自己的窗口，已直接阻止铺满（铺满自己会导致窗口错乱）。请先切到要铺满的视频/播放器窗口，或用「选择窗口」挑一个别的窗口")
+        } else {
+            None
+        }
     }
 }
 
 /// 把当前前台窗口铺满所有屏（浏览器里的抖音全屏、播放器、任意窗口都可以）
 /// mode: 0 = 铺满整块桌面包围盒；1 = 以主屏为基准（高度取主屏，避免主屏底部被裁）
 pub fn span_foreground(mode: u32) -> Result<String, String> {
+    // B1：入口第一步就拦截自身窗口 —— 任何分辨率操作都还没发生，零副作用
+    if let Some(msg) = foreground_is_self() {
+        return Err(msg.to_string());
+    }
     mark_change(); // 用户主动改的显示配置：自动修复 120 秒内不要插手
     // mode=2：**先把两块屏的清晰度自动对齐**（竖向像素高度一致），再按包围盒铺满 ——
     // 这样两块屏都会被完整覆盖，副屏底下/中间不会留下一块没铺到的画面。

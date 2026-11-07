@@ -156,7 +156,7 @@ onMounted(async () => {
               class="input kvm-code-input"
               inputmode="numeric"
               maxlength="6"
-              placeholder="000000"
+              placeholder="输入 6 位配对码"
               @keyup.enter="joinPairing"
             />
             <button class="btn primary" :disabled="store.busy || busyPairing || joinCode.length !== 6" @click="joinPairing">

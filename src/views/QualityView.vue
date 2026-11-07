@@ -99,7 +99,10 @@ onMounted(async () => {
     invoke<{ id: string; name: string; volume: number; mute: boolean; adjustable: boolean; selected: boolean; is_default: boolean }[]>('audio_endpoints').catch(() => []),
   ]);
   gamma.value = Number(ga) || 100;
-  const sel = ep.find((e) => e.selected) ?? ep.find((e) => e.is_default);
+  // B6：滑块 set_system_volume 控制的是「系统默认端点」，回显必须读同一个端点。
+  // 旧逻辑优先找 selected（应用此前选中的端点，可能是副屏 HDMI 音频），
+  // 导致切页回来滑块显示那个端点的旧音量（如 67），而系统默认音量其实是 100。
+  const sel = ep.find((e) => e.is_default) ?? ep.find((e) => e.selected);
   if (sel) {
     audioName.value = sel.name;
     systemVolume.value = sel.volume;
