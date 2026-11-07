@@ -24,6 +24,8 @@ const systemVolume = ref(0);
 const systemMute = ref(false);
 const volumeAdjustable = ref(true);
 const audioName = ref('');
+// B13：默认端点为固定音量时自动回退到的端点名（与后端 set_system_volume_sel 的回退逻辑一致）
+const audioFallbackFrom = ref('');
 const hdrLabel = ref('HDR 读取中');
 const hdrOn = ref(false);
 const mitv = ref(false);
@@ -73,13 +75,23 @@ const resetGamma = (): void => {
 
 const mute = (): void => {
   void act(async () => {
-    await invoke('set_system_volume', { value: systemMute.value ? systemVolume.value : 0 });
+    const fallbackTo = String(
+      await invoke<string>('set_system_volume', { value: systemMute.value ? systemVolume.value : 0 }),
+    );
+    if (fallbackTo) audioName.value = fallbackTo; // B13：回退端点同步显示
     systemMute.value = !systemMute.value;
   }, () => (systemMute.value ? '已取消静音' : '已静音'));
 };
 
 const commitSystemVolume = (): void => {
-  void act(() => invoke('set_system_volume', { value: systemVolume.value }), `系统音量已调整到 ${systemVolume.value}%`);
+  void act(async () => {
+    const fallbackTo = String(await invoke<string>('set_system_volume', { value: systemVolume.value }));
+    if (fallbackTo) {
+      audioName.value = fallbackTo; // B13：选定端点拒绝写入，实际控制的是回退端点
+      audioFallbackFrom.value = audioFallbackFrom.value || '原设备';
+    }
+    return `系统音量已调整到 ${systemVolume.value}%`;
+  }, (r) => String(r));
 };
 
 const commitMitvVolume = (): void => {
@@ -99,10 +111,19 @@ onMounted(async () => {
     invoke<{ id: string; name: string; volume: number; mute: boolean; adjustable: boolean; selected: boolean; is_default: boolean }[]>('audio_endpoints').catch(() => []),
   ]);
   gamma.value = Number(ga) || 100;
-  // B6：滑块 set_system_volume 控制的是「系统默认端点」，回显必须读同一个端点。
-  // 旧逻辑优先找 selected（应用此前选中的端点，可能是副屏 HDMI 音频），
-  // 导致切页回来滑块显示那个端点的旧音量（如 67），而系统默认音量其实是 100。
-  const sel = ep.find((e) => e.is_default) ?? ep.find((e) => e.selected);
+  // B6+B13：回显端点必须和控制目标一致。控制端（set_system_volume_sel）语义：
+  // ① 应用显式选中的端点优先；② 否则系统默认端点（可调时）；
+  // ③ 默认端点为固定音量（如 NVIDIA DigitalOutput）→ 后端会回退到第一个
+  //    可调端点，前端显示同步回退并标注，避免「滑块显示 A、控制 B」错位。
+  const picked = ep.find((e) => e.selected);
+  const def = ep.find((e) => e.is_default);
+  const alt = ep.find((e) => e.adjustable);
+  let sel = picked ?? def;
+  audioFallbackFrom.value = '';
+  if ((!picked && def && !def.adjustable) || (!picked && !def && !alt)) {
+    sel = alt ?? def; // 默认端点固定音量：显示第一个可调端点
+    if (alt && def) audioFallbackFrom.value = def.name;
+  }
   if (sel) {
     audioName.value = sel.name;
     systemVolume.value = sel.volume;
@@ -174,6 +195,9 @@ onUnmounted(() => {
         <input type="range" min="0" max="100" v-model.number="systemVolume" :disabled="!volumeAdjustable" @change="commitSystemVolume" />
         <span class="val">{{ systemVolume }}%</span>
       </div>
+      <p v-if="audioFallbackFrom" class="status-line">
+        默认设备「{{ audioFallbackFrom }}」为固定音量，当前控制「{{ audioName }}」。
+      </p>
       <p v-if="!volumeAdjustable" class="status-line">当前端点为固定音量设备，请用显示器 DDC 音量滑块控制。</p>
       <div class="slider-row" v-if="mitv">
         <label>小米音量</label>

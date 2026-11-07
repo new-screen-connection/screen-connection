@@ -1322,13 +1322,22 @@ public class SGCore {
   /// 关联 ICC 到指定显示设备 → OK / ERR:<原因>
   /// 关键：写入后**另开 DC** 回读校验才算成功
   /// （Windows 权限不足时 SetICMProfileW 照样返回 TRUE，但关联不会落到设备上）
+  /// B11：GetICMProfileW 有的驱动返回全路径、有的只返回文件名 ——
+  /// 两种形式都要认可，否则关联实际成功也被误判为「未生效」。
+  /// 注意：CORE_CS 禁单引号（PowerShell 单引号包裹会截断），路径处理全用双引号字符串。
   public static string IccSet(string dev, string profile) {
     IntPtr hdc = CreateDCW("DISPLAY", dev, null, IntPtr.Zero);
     if (hdc == IntPtr.Zero) return "ERR:无法打开显示设备";
     try { SetICMProfileW(hdc, profile); } finally { DeleteDC(hdc); }
     string now = IccReadFresh(dev);
-    if (now != null && string.Equals(now, profile, StringComparison.OrdinalIgnoreCase)) return "OK";
-    return "ERR:未生效(回读=" + (now == null ? "读取失败" : now) + ")";
+    if (now == null) return "ERR:未生效(回读=读取失败)";
+    if (string.Equals(now.Trim(), profile.Trim(), StringComparison.OrdinalIgnoreCase)) return "OK";
+    try {
+      string wantName = System.IO.Path.GetFileName(profile.Trim());
+      string gotName = System.IO.Path.GetFileName(now.Trim());
+      if (wantName.Length > 0 && string.Equals(gotName, wantName, StringComparison.OrdinalIgnoreCase)) return "OK";
+    } catch (Exception) { }
+    return "ERR:未生效(回读=" + now.Trim() + ")";
   }
 
   /// 安装 ICC 到系统色彩目录（Windows 只认该目录下的配置；实测非管理员可用）
@@ -1740,7 +1749,9 @@ public class SGAudio {
     try {
       var en = (SGIMMEnum)(object)new SGMMEnumerator();
       SGIMMColl coll;
-      if (en.EnumAudioEndpoints(0, 1, out coll) != 0 || coll == null) return DefaultDev();
+      // mask 与 AudioList 一致用 0x0F（全部状态）：只枚举 ACTIVE(0x1) 会漏掉
+      // 处于未激活/禁用态的端点，导致按 id 匹配不上
+      if (en.EnumAudioEndpoints(0, 15, out coll) != 0 || coll == null) return null;
       int cnt; coll.GetCount(out cnt);
       for (int i = 0; i < cnt; i++) {
         SGIMMDev d;
@@ -1750,14 +1761,18 @@ public class SGAudio {
         if (did == id) return d;
       }
     } catch { }
-    return DefaultDev();
+    // B13 深层修复：此前这里静默回退 DefaultDev —— 任何 id 不匹配都会把音量
+    // 悄悄写到系统默认设备上（实测：选中扬声器/耳机设音量，实际全都写到了
+    // 默认的 DigitalOutput），这是「音量显示 A 控制 B」系列错位的总根源。
+    // 改为返回 null，由 AudioSetDev 显式报错，让上层（Rust 回退逻辑）接管。
+    return null;
   }
 
   /// 设定指定输出端点的音量（id 为空则用系统默认端点）
   public static string AudioSetDev(string id, uint v) {
     try {
       SGIMMDev dev = DevById(id);
-      if (dev == null) return "ERR:没有可用的输出设备";
+      if (dev == null) return "ERR:没有可用的输出设备(收到id=" + (id == null ? "null" : id) + ")";
       SGEndVol vol = VolOf(dev);
       if (vol == null) return "ERR:端点激活失败";
       if (v > 100) v = 100;
@@ -2719,6 +2734,26 @@ fn associate_all(profile: &str) -> Result<(), String> {
             Err(e) => errs.push(format!("{} {}", d, e)),
         }
     }
+    // B11：逐台结果落日志（%APPDATA%\Screenguard\logs\color-associate.log），
+    // 错误横幅窄、长明细会被截断 —— 排障时以日志为准。
+    {
+        use std::io::Write;
+        let log = diag_log_dir().join("color-associate.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log) {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = writeln!(
+                f,
+                "[epoch={ts}] ok={ok}/{} elevated={} profile={} errs={}",
+                devs.len(),
+                is_elevated(),
+                profile,
+                errs.join(" | ")
+            );
+        }
+    }
     if ok > 0 {
         return Ok(());
     }
@@ -2728,10 +2763,10 @@ fn associate_all(profile: &str) -> Result<(), String> {
         "Windows 变更显示器色彩配置需要管理员权限：请右键本程序选「以管理员身份运行」".to_string()
     };
     Err(format!(
-        "色彩关联未生效（{} 台设备全部失败）→ {}{}",
+        "色彩关联未生效（{} 台设备全部失败）→ {}；逐台失败原因已记录到 %APPDATA%\\Screenguard\\logs\\color-associate.log{}",
         devs.len(),
         hint,
-        if errs.is_empty() { String::new() } else { format!("（{}）", errs.join("；")) }
+        if errs.is_empty() { String::new() } else { format!("（首台：{}）", errs[0]) }
     ))
 }
 
@@ -2739,11 +2774,24 @@ fn associate_all(profile: &str) -> Result<(), String> {
 /// 关联可随时改回、无破坏性；失败会给出真实原因，不再静默假装成功。
 pub fn apply_color_space(space: &str) -> Result<(), String> {
     mark_change(); // 用户主动改的显示配置：自动修复 120 秒内不要插手
-    let profile = icc_path(space)?;
+    let mut profile = icc_path(space)?;
     // 先安装进系统色彩目录（Windows 只认该目录下的配置）；sRGB 为系统自带，装不上可忽略
     if let Err(e) = icc_install(&profile) {
         if !profile.starts_with(SYSTEM_COLOR_DIR) {
             return Err(format!("无法安装色彩配置：{}", e));
+        }
+    }
+    // B11 关键修复：SetICMProfileW 只对**系统色彩目录里**的配置可靠生效。
+    // 参考 ICC 装好后落在 LOCALAPPDATA（InstallColorProfileW 会以同名文件拷入
+    // 系统色彩目录），此前拿 LOCALAPPDATA 原路径去关联 → 即使管理员权限、
+    // SetICMProfileW 也可能静默不落地，回读校验必然失败（用户实测「2 台全部失败」）。
+    // 因此安装成功后一律改用系统色彩目录里的同名文件路径做关联。
+    if !profile.starts_with(SYSTEM_COLOR_DIR) {
+        if let Some(name) = std::path::Path::new(&profile).file_name() {
+            let sys = std::path::Path::new(SYSTEM_COLOR_DIR).join(name);
+            if sys.exists() {
+                profile = sys.to_string_lossy().to_string();
+            }
         }
     }
     associate_all(&profile)
@@ -5201,25 +5249,54 @@ pub fn device_name() -> String {
         .unwrap_or_else(|| "Windows 主机".to_string())
 }
 
-/// 设置音量：优先作用于「用户选定的端点」，没选就作用于系统默认端点
-pub fn set_system_volume_sel(v: u32) -> Result<(), String> {
+/// 设置音量：优先作用于「用户选定的端点」，没选就作用于系统默认端点。
+/// B13：目标端点拒绝写入（驱动拒绝/固定音量，如本机 Realtek 扬声器、NVIDIA
+/// DigitalOutput）时，自动回退到第一个可写入的输出端点，别让滑块直接废掉。
+/// 返回 Ok(None)=写到选定/默认端点；Ok(Some(端点名))=回退到了该端点（前端同步显示）。
+pub fn set_system_volume_sel(v: u32) -> Result<Option<String>, String> {
     let id = app_state().audio_dev;
-    audio_set_on(&id, v)
+    match audio_set_on(&id, v) {
+        Ok(()) => Ok(None),
+        Err(_) => {
+            let eps = audio_endpoints()?;
+            let alt = eps
+                .iter()
+                .find(|x| x.adjustable && x.id != id)
+                .ok_or_else(|| "没有可写入音量的音频输出设备".to_string())?;
+            audio_set_on(&alt.id, v)?;
+            Ok(Some(alt.name.clone()))
+        }
+    }
 }
 
-/// 静音：同样遵循用户选定的端点
-pub fn set_system_mute_sel(on: bool) -> Result<(), String> {
+/// 静音：同样遵循用户选定的端点；目标端点拒绝时同样回退
+pub fn set_system_mute_sel(on: bool) -> Result<Option<String>, String> {
+    let mute_dev = |id: &str| -> Result<(), String> {
+        let out = ps_core(&format!(
+            "[SGAudio]::AudioMuteDev('{}', [uint32]{})",
+            id.replace('\'', ""),
+            if on { 1 } else { 0 }
+        ))?;
+        let t = out.trim();
+        if t == "OK" {
+            Ok(())
+        } else {
+            Err(t.trim_start_matches("ERR:").to_string())
+        }
+    };
     let id = app_state().audio_dev;
-    let out = ps_core(&format!(
-        "[SGAudio]::AudioMuteDev('{}', [uint32]{})",
-        id.replace('\'', ""),
-        if on { 1 } else { 0 }
-    ))?;
-    let t = out.trim();
-    if t == "OK" {
-        Ok(())
-    } else {
-        Err(t.trim_start_matches("ERR:").to_string())
+    match mute_dev(&id) {
+        Ok(()) => Ok(None),
+        Err(_) => {
+            let eps = audio_endpoints()?;
+            match eps.iter().find(|x| x.adjustable && x.id != id) {
+                Some(alt) => {
+                    mute_dev(&alt.id)?;
+                    Ok(Some(alt.name.clone()))
+                }
+                None => Err("没有可写入音量的音频输出设备".to_string()),
+            }
+        }
     }
 }
 

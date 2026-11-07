@@ -199,20 +199,23 @@ async fn get_system_audio() -> Result<platform::SystemAudio, String> {
         .map_err(|e| format!("后台任务失败：{}", e))?
 }
 
-/// 设置系统默认输出设备音量 0-100（托盘滑块同源；笔记本喇叭/耳机/HDMI 音频都走这里）
+/// 设置系统音量 0-100（托盘滑块同源）。
+/// 返回空串=写到选定/默认端点；非空=回退到了该端点名（B13，前端同步显示）。
 #[tauri::command]
-async fn set_system_volume(value: u32) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || platform::set_system_volume_sel(value))
+async fn set_system_volume(value: u32) -> Result<String, String> {
+    let r = tauri::async_runtime::spawn_blocking(move || platform::set_system_volume_sel(value))
         .await
-        .map_err(|e| format!("后台任务失败：{}", e))?
+        .map_err(|e| format!("后台任务失败：{}", e))??;
+    Ok(r.unwrap_or_default())
 }
 
-/// 系统静音开关
+/// 系统静音开关（返回值语义同 set_system_volume）
 #[tauri::command]
-async fn set_system_mute(on: bool) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || platform::set_system_mute_sel(on))
+async fn set_system_mute(on: bool) -> Result<String, String> {
+    let r = tauri::async_runtime::spawn_blocking(move || platform::set_system_mute_sel(on))
         .await
-        .map_err(|e| format!("后台任务失败：{}", e))?
+        .map_err(|e| format!("后台任务失败：{}", e))??;
+    Ok(r.unwrap_or_default())
 }
 
 /// 电池设备列表（带电池的连接设备：笔记本内电池 / USB·无线键鼠 / 蓝牙）
