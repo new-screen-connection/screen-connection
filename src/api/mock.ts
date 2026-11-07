@@ -308,6 +308,7 @@ const healthReport: HealthReport = {
 const state = {
   gamma: 100,
   powerLink: false,
+  hdrOn: false, // 浏览器预览样例：与真实后端 H|dev|sup|en 格式联动的开关状态
   hotkey: 'Ctrl+Alt+D',
   version: 'v0.2.0',
   platform: 'windows',
@@ -347,7 +348,10 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       state.gamma = Number(args?.pct);
       return `总亮度已调整到 ${state.gamma}%` as T;
     case 'hdr_states':
-      return '1:off;2:off' as T;
+      return `H|\\\\.\\DISPLAY1|1|${state.hdrOn ? 1 : 0}` as T;
+    case 'hdr_set':
+      state.hdrOn = Boolean(args?.on);
+      return '1 台 HDR 已切换生效' as T;
     case 'apply_color_space':
       return `已把全部屏幕对齐到 ${args?.space ?? 'sRGB'}` as T;
     case 'get_power_link_preference':

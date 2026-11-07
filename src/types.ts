@@ -472,6 +472,7 @@ export const CMD = {
   healthSetConfig: 'health_set_config',
   healthSupported: 'health_supported',
   getState: 'get_state',
+  relaunchAsAdmin: 'relaunch_as_admin',
 } as const;
 
 export type CmdName = (typeof CMD)[keyof typeof CMD];

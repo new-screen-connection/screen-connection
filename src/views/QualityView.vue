@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue';
+import { onMounted, onUnmounted, ref } from 'vue';
 import type { DisplayInfo } from '../types';
 import { invoke } from '../api/tauri';
-import { act, store } from '../store';
+import { parseHdrStates } from '../api/hdr';
+import { act, offerAdminRelaunch, store } from '../store';
 import Card from '../components/Card.vue';
 import Icon from '../components/Icon.vue';
 
@@ -32,11 +33,13 @@ const applyColor = (): void => {
   void act(
     () => invoke('apply_color_space', { space: colorSpace.value }),
     `已把全部屏幕对齐到 ${colorSpace.value}`,
-  );
+  ).then(offerAdminRelaunch);
 };
 
 const matchMac = (): void => {
-  void act(() => invoke('display_action', { action: 'match-mac', displayId: '', targetId: null, value: null }), '已对齐 Mac 内建屏色彩（Display P3）');
+  void act(() => invoke('display_action', { action: 'match-mac', displayId: '', targetId: null, value: null }), '已对齐 Mac 内建屏色彩（Display P3）').then(
+    offerAdminRelaunch,
+  );
 };
 
 const syncBrightness = (): void => {
@@ -53,9 +56,10 @@ const syncBrightness = (): void => {
 
 const toggleHdr = (): void => {
   void act(async () => {
-    await invoke('hdr_set', { on: !hdrOn.value });
-    hdrOn.value = !hdrOn.value;
-  }, () => `HDR 已${hdrOn.value ? '开启' : '关闭'}`);
+    const msg = await invoke<string>('hdr_set', { on: !hdrOn.value });
+    await refreshHdr(); // 回读真实状态：API 说成功 != 屏幕真的切了（错误 87 案例）
+    return msg;
+  }, (r) => String(r));
 };
 
 const commitGamma = (): void => {
@@ -82,6 +86,13 @@ const commitMitvVolume = (): void => {
   void act(() => invoke('mitv_volume_set', { target: mitvVolume.value }), `小米屏音量已调整到 ${mitvVolume.value}%`);
 };
 
+const refreshHdr = async (): Promise<void> => {
+  const raw = String(await invoke<string>('hdr_states').catch(() => ''));
+  const { supported, on } = parseHdrStates(raw);
+  hdrOn.value = on > 0;
+  hdrLabel.value = !raw || supported === 0 ? 'HDR 不可用' : on > 0 ? `HDR 已开启（${on}/${supported} 台）` : 'HDR 未开启';
+};
+
 onMounted(async () => {
   const [ga, ep] = await Promise.all([
     invoke<string>('gamma_get').catch(() => '100'),
@@ -96,12 +107,21 @@ onMounted(async () => {
     volumeAdjustable.value = sel.adjustable;
   }
   const raw = String(await invoke<string>('hdr_states').catch(() => ''));
-  hdrOn.value = /1:on/i.test(raw) || /on/.test(raw.split(';')[0] ?? '');
-  hdrLabel.value = raw ? (hdrOn.value ? 'HDR 已开启' : 'HDR 未开启') : 'HDR 不可用';
+  const { supported, on } = parseHdrStates(raw);
+  hdrOn.value = on > 0;
+  hdrLabel.value = !raw || supported === 0 ? 'HDR 不可用' : on > 0 ? `HDR 已开启（${on}/${supported} 台）` : 'HDR 未开启';
   mitv.value = Boolean(await invoke<boolean>('mitv_available').catch(() => false));
   if (mitv.value) {
     mitvVolume.value = Number(await invoke<number>('mitv_volume_get').catch(() => 0));
   }
+
+  // 用户可能在 Windows 设置里开关 HDR（本程序对部分机型只能读不能写），
+  // 窗口重新获得焦点（从设置页切回来）时重读一次状态，按钮别再显示旧状态。
+  window.addEventListener('focus', refreshHdr);
+});
+
+onUnmounted(() => {
+  window.removeEventListener('focus', refreshHdr);
 });
 </script>
 

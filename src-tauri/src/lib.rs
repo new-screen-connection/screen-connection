@@ -151,6 +151,16 @@ async fn match_mac() -> Result<(), String> {
         .map_err(|e| format!("后台任务失败：{}", e))?
 }
 
+/// 以管理员身份重启（Windows）：UAC 同意后启动带 --elevated 的新实例，本实例随即退出。
+/// 注意这里**不做**退出还原：用户提权重启就是为了改显示设置，
+/// 且还原 ICC 需要的权限正是当前缺的，尝试只会产生一串无意义的警告。
+#[tauri::command]
+fn relaunch_as_admin(app: tauri::AppHandle) -> Result<(), String> {
+    platform::relaunch_as_admin()?;
+    app.exit(0);
+    Ok(())
+}
+
 #[tauri::command]
 async fn match_ppi() -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(platform::match_ppi)
@@ -2039,9 +2049,21 @@ pub fn run() {
 
             // 单实例自检：若已有更早启动的实例在跑，本实例直接退出，防双托盘
             // （macOS 用于避免 launchd bootstrap 双开；Windows 用于避免双击图标开出多个托盘）
+            // 例外：「以管理员身份重启」产生的新实例带 --elevated 参数 —— 它的 PID
+            // 几乎必然比旧实例大，会被上面的守卫误杀；所以先等旧实例退出再继续。
             #[cfg(any(target_os = "macos", target_os = "windows"))]
-            if platform::another_instance_running() {
-                std::process::exit(0);
+            {
+                let elevated = std::env::args().any(|a| a == "--elevated");
+                if elevated {
+                    for _ in 0..50 {
+                        if !platform::another_instance_running() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                } else if platform::another_instance_running() {
+                    std::process::exit(0);
+                }
             }
 
             // 右键菜单
@@ -2176,6 +2198,7 @@ pub fn run() {
             get_batteries,
             apply_color_space,
             match_mac,
+            relaunch_as_admin,
             match_ppi,
             rotate_secondary,
             restore_secondary,

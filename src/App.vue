@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue';
-import { store } from './store';
+import { store, setStatus, dismissError, offerAdminRelaunch } from './store';
 import { invoke, isTauri, listenEvent } from './api/tauri';
 import { currentTheme, initTheme, toggleTheme, type ThemeMode } from './theme';
 import Icon from './components/Icon.vue';
@@ -29,6 +29,12 @@ type ViewKey = keyof typeof views;
 const current = ref<ViewKey>('overview');
 
 const platformLabel = ref('检测中');
+
+// CDP 自动化验证钩子（仅 dev 构建生效）：测试脚本需要能直接触发错误横幅、
+// 读取状态；生产构建不暴露任何东西。
+if (import.meta.env.DEV) {
+  (window as unknown as Record<string, unknown>).__sc = { store, setStatus, dismissError, offerAdminRelaunch };
+}
 
 // 白天 / 夜晚模式
 initTheme();
@@ -110,5 +116,16 @@ onMounted(async () => {
         <span class="version-tag">{{ store.version || 'v0.1.0' }}</span>
       </span>
     </footer>
+
+    <!-- 错误横幅：状态栏一行会被截断，长错误（含操作指引）在这里完整展示 -->
+    <div v-if="store.errorOpen && !store.statusOk" class="error-banner" role="alert">
+      <div class="error-banner-text">{{ store.status }}</div>
+      <div class="error-banner-actions">
+        <button v-if="store.action" class="eb-btn eb-primary" @click="store.action.run()">
+          {{ store.action.label }}
+        </button>
+        <button class="eb-btn" @click="dismissError">知道了</button>
+      </div>
+    </div>
   </div>
 </template>

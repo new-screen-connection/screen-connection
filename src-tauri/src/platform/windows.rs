@@ -2678,6 +2678,26 @@ fn is_elevated() -> bool {
         .unwrap_or(false)
 }
 
+/// 以管理员身份重启本程序：弹 UAC，用户同意后启动带 --elevated 参数的新实例
+/// （调用方随后退出当前实例）。为什么带参数：防双开守卫是「PID 小者留下」，
+/// 提权新实例的 PID 几乎必然更大，若不等旧实例退场就会被守卫当场杀掉；
+/// 新实例见到 --elevated 会先等旧实例退出再继续（见 lib.rs setup）。
+pub fn relaunch_as_admin() -> Result<(), String> {
+    if is_elevated() {
+        return Err("当前已经是管理员权限运行，无需重启".to_string());
+    }
+    let exe = current_exe_path()?;
+    let script = format!(
+        "$ErrorActionPreference='Stop'; Start-Process -FilePath {} -ArgumentList '--elevated' -Verb RunAs | Out-Null; 'OK'",
+        ps_literal(&exe)
+    );
+    // run_cmd 以 stdout 为准；UAC 被取消时 Start-Process 抛异常、stdout 为空 → Err
+    match run_cmd(PS, &["-NoProfile", "-Command", &script]) {
+        Ok(o) if o.trim() == "OK" => Ok(()),
+        _ => Err("未获得管理员授权（UAC 被取消或被系统策略阻止），程序未重启".to_string()),
+    }
+}
+
 /// 把指定 ICC 关联到所有显示屏；至少一台成功即算成功，全部失败则给出可操作的原因
 fn associate_all(profile: &str) -> Result<(), String> {
     let devs = display_devs()?;

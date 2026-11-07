@@ -6,6 +6,7 @@
  */
 import { computed, nextTick, onMounted, ref } from 'vue';
 import { invoke, isTauri, listenEvent, errText } from '../api/tauri';
+import { parseHdrStates } from '../api/hdr';
 import { sendVCP } from '../api/vcp';
 import { currentTheme, toggleTheme, type ThemeMode } from '../theme';
 import type { DisplayInfo, SystemAudio } from '../types';
@@ -163,7 +164,7 @@ async function toggleHdr(): Promise<void> {
 async function refreshHdr(): Promise<void> {
   try {
     const s = await invoke<string>('hdr_states');
-    hdrOn.value = /:on/i.test(s) || /:1/.test(s);
+    hdrOn.value = parseHdrStates(s).on > 0;
   } catch {
     hdrOn.value = false;
   }

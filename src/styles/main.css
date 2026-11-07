@@ -242,6 +242,70 @@ body {
   flex: none;
 }
 
+/* ---------- 错误横幅：完整展示长错误（状态栏单行会被截断） ---------- */
+
+.error-banner {
+  position: fixed;
+  left: 16px;
+  right: 16px;
+  bottom: 42px;
+  z-index: 60;
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--err);
+  border-radius: 10px;
+  background: var(--panel);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  animation: eb-in 0.18s ease-out;
+}
+
+@keyframes eb-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.error-banner-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--err);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.error-banner-actions {
+  flex: none;
+  display: flex;
+  gap: 8px;
+}
+
+.eb-btn {
+  padding: 5px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.eb-btn:hover {
+  border-color: var(--muted);
+  color: var(--text);
+}
+.eb-primary {
+  border-color: var(--err);
+  color: var(--err);
+  font-weight: 600;
+}
+.eb-primary:hover {
+  color: var(--text, var(--err));
+}
+
 .version-tag {
   font-family: var(--mono);
   font-size: 11px;

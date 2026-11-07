@@ -7,6 +7,7 @@
  * 命令未实现或浏览器预览时回落到本地模拟（mock.ts 的 troubleshoot_diag）。
  */
 import { invoke, isTauri } from './tauri';
+import { parseHdrStates } from './hdr';
 import { CMD, type DiagReply } from '../types';
 
 export interface ChatMsg {
@@ -117,7 +118,7 @@ async function ruleEngine(text: string): Promise<string> {
   }
   if (/HDR/.test(t.toUpperCase())) {
     const s = await invoke<string>('hdr_states');
-    const on = /:on/i.test(s);
+    const on = parseHdrStates(s).on > 0;
     await invoke('hdr_set', { on: !on });
     return on ? '已关闭全部屏幕 HDR。' : '已开启全部屏幕 HDR。';
   }

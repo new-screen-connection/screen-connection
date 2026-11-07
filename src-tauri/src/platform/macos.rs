@@ -2282,6 +2282,11 @@ pub fn match_mac() -> Result<(), String> {
     apply_profile_to_screens(external_screens, "p3").map(|_| ())
 }
 
+/// macOS 上色彩/亮度走 ColorSync 与 DDC，均不需要管理员权限，无提权重启需求。
+pub fn relaunch_as_admin() -> Result<(), String> {
+    Err("macOS 无需管理员权限，此操作不适用".to_string())
+}
+
 /// 用 displayplacer 完整设置两块屏的布局（主屏保持现状，只动副屏的 res/方向）
 fn apply_sec_layout(main: &Screen, sec: &Screen, sec_res: &str, sec_deg: u32) -> Result<(), String> {
     let (main_w, main_h) = main.layout_resolution();
