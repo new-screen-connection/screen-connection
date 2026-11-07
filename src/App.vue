@@ -2,6 +2,7 @@
 import { onMounted, ref } from 'vue';
 import { store, setStatus, dismissError, offerAdminRelaunch } from './store';
 import { invoke, isTauri, listenEvent } from './api/tauri';
+import { startWindowGuard } from './api/windowGuard';
 import { currentTheme, initTheme, toggleTheme, type ThemeMode } from './theme';
 import Icon from './components/Icon.vue';
 import appIcon from './assets/app-icon.png';
@@ -47,6 +48,9 @@ onMounted(async () => {
   store.platform = await invoke<string>('get_platform');
   platformLabel.value =
     store.platform === 'darwin' ? 'macOS' : store.platform === 'windows' ? 'Windows' : store.platform || '未知平台';
+
+  // B15 视口守卫：任何操作把主窗口写宽/写错后数秒内自愈
+  if (isTauri()) startWindowGuard();
 
   // 电源联动状态事件（后端推送）
   await listenEvent('power-link-status', (payload) => {

@@ -6126,6 +6126,67 @@ pub fn set_mode(dev: &str, w: u32, h: u32, hz: u32, apply: bool) -> Result<Strin
     Ok(format!("{}x{}@{}", w, h, hz))
 }
 
+/// 枚举某屏驱动支持的全部模式（含刷新率）：缓冲布局与 cur_mode 一致。
+fn enum_modes_full(dev: &str) -> Vec<(u32, u32, u32)> {
+    let name = dev_name_ptr(dev);
+    let mut out = Vec::new();
+    let mut i: u32 = 0;
+    loop {
+        let mut b = [0u8; 220];
+        b[68] = 220;
+        if unsafe { EnumDisplaySettingsW(name.as_ptr(), i, b.as_mut_ptr()) } == 0 {
+            break;
+        }
+        let w = u32::from_le_bytes([b[172], b[173], b[174], b[175]]);
+        let h = u32::from_le_bytes([b[176], b[177], b[178], b[179]]);
+        let f = u32::from_le_bytes([b[184], b[185], b[186], b[187]]);
+        if w > 0 && h > 0 && f > 0 {
+            out.push((w, h, f));
+        }
+        i += 1;
+        if i > 4000 {
+            break;
+        }
+    }
+    out
+}
+
+/// 还原显示模式（B15）：原档被驱动拒绝时不再直接报错——实测对齐切走后再还原
+/// 3840x2160@160 会 3/3 报「-2 驱动不支持」，导致用户每次还原都看到失败横幅。
+/// 回退顺序：① 稍候 600ms 重试原档；② 同分辨率下从高到低试其他刷新率；
+/// ③ 当前分辨率已是目标值（刷新率不同）视为已还原（如实注明实际刷新率）。
+fn restore_mode_with_fallback(dev: &str, w: u32, h: u32, hz: u32) -> Result<String, String> {
+    if let Ok(s) = set_mode(dev, w, h, hz, true) {
+        return Ok(s);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    if let Ok(s) = set_mode(dev, w, h, hz, true) {
+        return Ok(format!("{s}（首次被拒，重试成功）"));
+    }
+    let mut alts: Vec<u32> = enum_modes_full(dev)
+        .into_iter()
+        .filter(|(mw, mh, f)| *mw == w && *mh == h && *f != hz)
+        .map(|(_, _, f)| f)
+        .collect();
+    alts.sort_unstable_by(|a, b| b.cmp(a));
+    alts.dedup();
+    let mut last_err = String::new();
+    for f in &alts {
+        match set_mode(dev, w, h, *f, true) {
+            Ok(s) => return Ok(format!("{s}（原 {}Hz 被驱动拒，回落）", hz)),
+            Err(e) => last_err = e,
+        }
+    }
+    let cur = cur_mode(dev);
+    if cur.0 == w && cur.1 == h {
+        return Ok(format!(
+            "{}x{}@{}（原 {}Hz 暂不可用，当前已是目标分辨率）",
+            w, h, cur.2, hz
+        ));
+    }
+    Err(format!("{}x{}@{} 驱动不支持（{}）", w, h, hz, last_err))
+}
+
 /// 读某块屏当前模式
 fn cur_mode(dev: &str) -> (u32, u32, u32) {
     let name = dev_name_ptr(dev);
@@ -6221,6 +6282,8 @@ pub fn align_restore_modes() -> Result<String, String> {
     }
     let mut done = Vec::new();
     let mut errors = Vec::new();
+    // 还原暂未成功的屏：等位置应用（注册表重置）后再复核，不急着报错
+    let mut pending_check: Vec<(String, u32, u32, u32, String)> = Vec::new();
     for e in st.base_mode.iter() {
         let p: Vec<&str> = e.split('|').collect();
         if p.len() >= 3 {
@@ -6234,9 +6297,9 @@ pub fn align_restore_modes() -> Result<String, String> {
                     done.push(format!("{} 已是原模式 {}x{}@{}，未重设", dev, w, h, hz));
                     continue;
                 }
-                match set_mode(dev, w, h, hz, true) {
+                match restore_mode_with_fallback(dev, w, h, hz) {
                     Ok(s) => done.push(format!("{} → {}", dev, s)),
-                    Err(e2) => errors.push(format!("{} 分辨率还原失败：{}", dev, e2)),
+                    Err(e2) => pending_check.push((dev.to_string(), w, h, hz, e2)),
                 }
             }
         }
@@ -6281,6 +6344,23 @@ pub fn align_restore_modes() -> Result<String, String> {
             done.push("屏幕位置本来已是原布局，未重设".to_string());
         } else if changed && errors.is_empty() {
             done.push("屏幕位置已恢复到原布局".to_string());
+        }
+    }
+    // B15 复核：直接 set_mode 还原被驱动拒（实测 4K 全档位 -2）时，位置应用的
+    // ChangeDisplaySettingsExW(NULL) 会按注册表重置整条显示链路，常常才是真正
+    // 把分辨率带回去的那一步。此刻再读当前模式：分辨率已到位就转为成功备注。
+    if !pending_check.is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        for (dev, w, h, hz, err) in pending_check {
+            let cur = cur_mode(&dev);
+            if cur.0 == w && cur.1 == h {
+                done.push(format!(
+                    "{} → {}x{}@{}（直接还原被驱动拒，随布局重置恢复）",
+                    dev, w, h, cur.2
+                ));
+            } else {
+                errors.push(format!("{} 分辨率还原失败：{}", dev, err));
+            }
         }
     }
     if !errors.is_empty() {

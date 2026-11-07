@@ -78,6 +78,23 @@ async fn get_display_modes(display_id: String) -> Result<Vec<platform::DisplayMo
 /// B8 收敛式：尺寸已经对就不再动；位置不强制定位居中（保留用户摆放的位置），
 /// 只有窗口跑出主屏可视区才拉回屏内 —— 每次都无条件 set_size+居中会与 DPI
 /// 迟到传播互搏，多条归一化序列并行时窗口被反复搬动 = 桌面上跳动。
+/// 归一化目标物理尺寸：780x760 逻辑按当前 DPI 折算，目标屏太小则夹进屏内。
+/// normalize_main_window 与视口守卫（window_geometry/resync_main_window）共用，
+/// 保证两处期望值永远一致。
+fn norm_target_phys(w: &tauri::WebviewWindow, scale: f64) -> (i32, i32) {
+    let (sw, sh) = match w.primary_monitor() {
+        Ok(Some(m)) => (m.size().width as i32, m.size().height as i32),
+        _ => (0, 0),
+    };
+    let mut ww = (780.0 * scale) as i32;
+    let mut wh = (760.0 * scale) as i32;
+    if sw > 0 {
+        ww = ww.min(sw - 24).max(420);
+        wh = wh.min(sh - 24).max(520);
+    }
+    (ww, wh)
+}
+
 fn normalize_main_window(app: &tauri::AppHandle) {
     use tauri::Manager;
     let Some(w) = app.get_webview_window("main") else {
@@ -99,12 +116,7 @@ fn normalize_main_window(app: &tauri::AppHandle) {
         eprintln!("[norm] SKIP scale mismatch mon={scale:.2} win={win_scale:.2}");
         return;
     }
-    // 默认逻辑尺寸 780x760（与 tauri.conf.json 一致），按当前 DPI 折算物理像素
-    let mut ww = (780.0 * scale) as i32;
-    let mut wh = (760.0 * scale) as i32;
-    // 目标屏比默认窗口还小（如竖屏便携屏当主屏）时夹进屏内，保住最小 420x520
-    ww = ww.min(size.width as i32 - 24).max(420);
-    wh = wh.min(size.height as i32 - 24).max(520);
+    let (ww, wh) = norm_target_phys(&w, scale);
     // B12 度量口径修正：set_size 设的是内容（客户区）尺寸，必须和 inner_size
     // 比；旧代码拿 outer_size（含边框标题栏，比内容大 16~56px）比，永远差一截
     // → 每次归一化都误判「尺寸不对」无条件 set_size，把 DPI 抖动放大成可见跳动。
@@ -142,7 +154,10 @@ fn normalize_main_window_settled(app: &tauri::AppHandle) {
     let gen = NORM_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let app2 = app.clone();
     std::thread::spawn(move || {
-        for ms in [250u64, 700, 1600, 3000, 5000] {
+        // B15：收口点延长到 12s —— 还原路径（对齐回滚）在本机 KVM 链路上实测
+        // DPI/显示模式传播可超过 5s，旧序列跑完后再没人纠正窗口，宽态定格。
+        // 多出的轮次在已收敛时是纯读比较（零动作），代价可忽略。
+        for ms in [250u64, 700, 1600, 3000, 5000, 8000, 12000] {
             std::thread::sleep(std::time::Duration::from_millis(ms));
             if NORM_GEN.load(std::sync::atomic::Ordering::Relaxed) != gen {
                 return; // 更新的归一化序列已接管，本序列退出，不再搬窗口
@@ -150,6 +165,82 @@ fn normalize_main_window_settled(app: &tauri::AppHandle) {
             normalize_main_window(&app2);
         }
     });
+}
+
+/// 主窗口几何快照（B15 视口守卫用）。
+/// 前端拿 expect_css_w 与自己的 window.innerWidth 比较：
+///   一致 → 窗口正常；偏差 >8px → 要么物理尺寸被写错，要么 WebView2 的
+///   devicePixelRatio 与宿主失同步（内容「变宽/溢出」的直接来源），调 resync_main_window 修。
+/// 缩放交叉校验不过（显示模式抖动中）时返回 suspicious=true，守卫本轮跳过，
+/// 避免把 DPI 传播的合法过渡态当成异常去搬窗口。
+#[tauri::command]
+fn window_geometry(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    use tauri::Manager;
+    let Some(w) = app.get_webview_window("main") else {
+        return Err("主窗口不存在".into());
+    };
+    let inner = w.inner_size().map_err(|e| e.to_string())?;
+    let scale = w.scale_factor().map_err(|e| e.to_string())?;
+    let mon_scale = w
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .map(|m| m.scale_factor())
+        .unwrap_or(scale);
+    let (tw, th) = norm_target_phys(&w, scale);
+    let maximized = w.is_maximized().unwrap_or(false);
+    Ok(serde_json::json!({
+        "phys_w": inner.width,
+        "phys_h": inner.height,
+        "scale": scale,
+        "expect_css_w": tw as f64 / scale,
+        "expect_css_h": th as f64 / scale,
+        "suspicious": (mon_scale - scale).abs() > 0.01,
+        "maximized": maximized,
+    }))
+}
+
+/// 视口守卫的修复端（B15）。前端检测到 CSS 视口漂移后带实测值调用：
+/// ① 物理尺寸与期望差 >4px → 按期望 set_size（与 normalize 同口径）；
+/// ② 物理尺寸正确但 CSS 漂移 → WebView2 渲染缩放失同步，做一次 ±2 物理像素
+///    的尺寸抖动强制重排（WM_SIZE 让合成器按宿主 DPI 重查）；
+/// ③ attempt>=3（连抖两轮都没修好）→ 返回 reload，让前端自恢复——重载后
+///    渲染器进程按宿主 DPI 重新取值，是失同步的最终解。
+#[tauri::command]
+async fn resync_main_window(
+    app: tauri::AppHandle,
+    css_width: f64,
+    attempt: Option<u32>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri::Manager;
+        let Some(w) = app.get_webview_window("main") else {
+            return Err("主窗口不存在".into());
+        };
+        let scale = w.scale_factor().map_err(|e| e.to_string())?;
+        let inner = w.inner_size().map_err(|e| e.to_string())?;
+        let (tw, th) = norm_target_phys(&w, scale);
+        if (inner.width as i32 - tw).abs() > 4 || (inner.height as i32 - th).abs() > 4 {
+            eprintln!("[guard] RESIZE phys={}x{} → {tw}x{th}", inner.width, inner.height);
+            let _ = w.set_size(tauri::PhysicalSize::new(tw.max(1) as u32, th.max(1) as u32));
+            return Ok("resized".to_string());
+        }
+        let expect_css = tw as f64 / scale;
+        if (css_width - expect_css).abs() <= 8.0 {
+            return Ok("ok".to_string());
+        }
+        if attempt.unwrap_or(0) >= 3 {
+            eprintln!("[guard] RELOAD css={css_width} expect={expect_css}");
+            return Ok("reload".to_string());
+        }
+        eprintln!("[guard] NUDGE#{attempt:?} css={css_width} expect={expect_css} phys={}x{}", inner.width, inner.height);
+        let _ = w.set_size(tauri::PhysicalSize::new(inner.width + 2, inner.height));
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let _ = w.set_size(tauri::PhysicalSize::new(inner.width, inner.height));
+        Ok("nudged".to_string())
+    })
+    .await
+    .map_err(|e| format!("后台任务失败：{}", e))?
 }
 
 /// 切换单屏分辨率/刷新率，并回读验证；不匹配时恢复原显示配置。
@@ -2414,6 +2505,8 @@ pub fn run() {
             get_display_modes,
             set_display_mode,
             display_action,
+            window_geometry,
+            resync_main_window,
             set_brightness,
             set_volume,
             get_system_audio,
