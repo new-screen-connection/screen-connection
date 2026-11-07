@@ -1199,13 +1199,19 @@ fn set_power_link_preference(app: tauri::AppHandle, enabled: bool) -> Result<(),
     Ok(())
 }
 
-/// 从主窗口打开菜单栏控制面板，供主窗口里的电源联动开关显示运行状态。
+/// 从主窗口打开/收起菜单栏控制面板（开关式：已可见则收起）。
+/// 返回 "shown"（本次打开）或 "hidden"（本次收起），供前端提示。
 #[tauri::command]
-fn open_control_panel(app: tauri::AppHandle, power_link_enabled: bool) -> Result<(), String> {
+fn open_control_panel(app: tauri::AppHandle, power_link_enabled: bool) -> Result<String, String> {
     use tauri::Manager;
     let w = app
         .get_webview_window("panel")
         .ok_or_else(|| "控制面板窗口不可用".to_string())?;
+    // 已在显示 → 本次点击是「收起」
+    if w.is_visible().map_err(|e| format!("查询控制面板状态失败：{}", e))? {
+        w.hide().map_err(|e| format!("收起控制面板失败：{}", e))?;
+        return Ok("hidden".to_string());
+    }
     if let Ok(Some(mon)) = w.primary_monitor() {
         let pos = mon.position();
         let size = mon.size();
@@ -1229,7 +1235,7 @@ fn open_control_panel(app: tauri::AppHandle, power_link_enabled: bool) -> Result
         power_link_enabled
     ))
     .map_err(|e| format!("同步菜单栏电源联动状态失败：{}", e))?;
-    Ok(())
+    Ok("shown".to_string())
 }
 
 // ================= 显示器健康：自动修复 + 右下角气泡提醒 =================

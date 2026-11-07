@@ -25,8 +25,8 @@ const loadDisplays = async (): Promise<void> => {
 
 const openPanel = (): void => {
   void act(
-    () => invoke('open_control_panel', { powerLinkEnabled: powerLink.value }),
-    '已打开快捷控制面板',
+    async () => invoke<string>('open_control_panel', { powerLinkEnabled: powerLink.value }),
+    (r) => (r === 'hidden' ? '已收起快捷控制面板' : '已打开快捷控制面板'),
   );
 };
 
