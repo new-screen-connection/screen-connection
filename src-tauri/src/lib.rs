@@ -96,13 +96,29 @@ fn normalize_main_window(app: &tauri::AppHandle) {
     let _ = w.set_position(tauri::PhysicalPosition::new(x, y));
 }
 
+/// 立即归一化 + 延迟复归一化。
+/// Windows 改显示模式/DPI 后，变更以 WM_DPICHANGED / WM_DISPLAYCHANGE 的形式
+/// 在之后几百毫秒里陆续传播到 WebView2 —— 只在命令返回瞬间归一化一次，会被
+/// 随后到达的 DPI 传播按旧缩放重新排版覆盖掉（用户反馈：还原窗口后主窗口
+/// 仍然错乱）。因此再补 3 次延迟归一化，等传播彻底结束后收口。
+fn normalize_main_window_settled(app: &tauri::AppHandle) {
+    normalize_main_window(app);
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        for ms in [250u64, 700, 1600] {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            normalize_main_window(&app2);
+        }
+    });
+}
+
 /// 切换单屏分辨率/刷新率，并回读验证；不匹配时恢复原显示配置。
 #[tauri::command]
 async fn set_display_mode(app: tauri::AppHandle, display_id: String, mode: u32) -> Result<String, String> {
     let r = tauri::async_runtime::spawn_blocking(move || platform::set_display_mode(&display_id, mode))
         .await
         .map_err(|e| format!("后台任务失败：{}", e))?;
-    normalize_main_window(&app);
+    normalize_main_window_settled(&app);
     r
 }
 
@@ -196,7 +212,7 @@ async fn match_ppi(app: tauri::AppHandle) -> Result<(), String> {
     let r = tauri::async_runtime::spawn_blocking(platform::match_ppi)
         .await
         .map_err(|e| format!("后台任务失败：{}", e))?;
-    normalize_main_window(&app);
+    normalize_main_window_settled(&app);
     r
 }
 
@@ -205,7 +221,7 @@ async fn rotate_secondary(app: tauri::AppHandle) -> Result<(), String> {
     let r = tauri::async_runtime::spawn_blocking(platform::rotate_secondary)
         .await
         .map_err(|e| format!("后台任务失败：{}", e))?;
-    normalize_main_window(&app);
+    normalize_main_window_settled(&app);
     r
 }
 
@@ -215,7 +231,7 @@ async fn restore_secondary(app: tauri::AppHandle) -> Result<(), String> {
     let r = tauri::async_runtime::spawn_blocking(platform::restore_secondary)
         .await
         .map_err(|e| format!("后台任务失败：{}", e))?;
-    normalize_main_window(&app);
+    normalize_main_window_settled(&app);
     r
 }
 
@@ -346,7 +362,7 @@ async fn span_foreground(app: tauri::AppHandle, mode: Option<u32>) -> Result<Str
         .await
         .map_err(|e| format!("后台任务失败：{}", e))?;
     // mode=2 会先改两屏分辨率；成败都要把主窗口拉回正常尺寸（内容溢出修复）
-    normalize_main_window(&app);
+    normalize_main_window_settled(&app);
     r
 }
 
@@ -362,7 +378,7 @@ async fn restore_foreground(app: tauri::AppHandle) -> Result<(), String> {
     // An unconditional second restore here could consume an unrelated pending alignment backup.
     #[cfg(target_os = "macos")]
     {
-        normalize_main_window(&app);
+        normalize_main_window_settled(&app);
         return window_restore;
     }
 
@@ -380,7 +396,7 @@ async fn restore_foreground(app: tauri::AppHandle) -> Result<(), String> {
             (Ok(()), Err(display)) => Err(display),
         };
         // 还原把显示模式改回去 → 主窗口同样要重新归一化
-        normalize_main_window(&app);
+        normalize_main_window_settled(&app);
         r
     }
 }
@@ -403,7 +419,7 @@ async fn match_dpi_apply(app: tauri::AppHandle) -> Result<String, String> {
     let r = tauri::async_runtime::spawn_blocking(platform::match_dpi_apply)
         .await
         .map_err(|e| format!("后台任务失败：{}", e))?;
-    normalize_main_window(&app);
+    normalize_main_window_settled(&app);
     r
 }
 
@@ -412,7 +428,7 @@ async fn match_dpi_restore(app: tauri::AppHandle) -> Result<String, String> {
     let r = tauri::async_runtime::spawn_blocking(platform::match_dpi_restore)
         .await
         .map_err(|e| format!("后台任务失败：{}", e))?;
-    normalize_main_window(&app);
+    normalize_main_window_settled(&app);
     r
 }
 
@@ -433,7 +449,7 @@ async fn span_window(app: tauri::AppHandle, hwnd: i64, mode: Option<u32>) -> Res
     let r = tauri::async_runtime::spawn_blocking(move || platform::span_window(hwnd, m))
         .await
         .map_err(|e| format!("后台任务失败：{}", e))?;
-    normalize_main_window(&app);
+    normalize_main_window_settled(&app);
     r
 }
 
@@ -455,12 +471,13 @@ async fn set_audio_device(id: String) -> Result<(), String> {
 
 /// 一键恢复默认：把所有「软件层面」的改动还原成基线快照
 #[tauri::command]
-async fn restore_defaults() -> Result<String, String> {
+async fn restore_defaults(app: tauri::AppHandle) -> Result<String, String> {
     let r = tauri::async_runtime::spawn_blocking(platform::restore_defaults)
         .await
         .map_err(|e| format!("后台任务失败：{}", e))?;
     // 分辨率也回到原始（用户要求：一键恢复默认要能恢复所有软件层改动）
     let _ = tauri::async_runtime::spawn_blocking(platform::align_restore_modes).await;
+    normalize_main_window_settled(&app);
     r
 }
 
@@ -563,7 +580,7 @@ async fn profile_apply(app: tauri::AppHandle, id: String) -> Result<platform::Ap
         .await
         .map_err(|e| format!("后台任务失败：{}", e))?;
     // 档位可能整体改写各屏模式/缩放 → 主窗口重新归一化
-    normalize_main_window(&app);
+    normalize_main_window_settled(&app);
     r
 }
 
@@ -781,18 +798,22 @@ fn set_screen_inches(manuf: String, inches: f64) -> Result<(), String> {
 
 /// 应用「双屏对齐」：自动挑可行的模式组合并切换（应用前自动记录原始分辨率）
 #[tauri::command]
-async fn align_apply() -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(platform::align_apply)
+async fn align_apply(app: tauri::AppHandle) -> Result<String, String> {
+    let r = tauri::async_runtime::spawn_blocking(platform::align_apply)
         .await
-        .map_err(|e| format!("后台任务失败：{}", e))?
+        .map_err(|e| format!("后台任务失败：{}", e))?;
+    normalize_main_window_settled(&app);
+    r
 }
 
 /// 还原两块屏的原始分辨率（4K）
 #[tauri::command]
-async fn align_restore() -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(platform::align_restore_modes)
+async fn align_restore(app: tauri::AppHandle) -> Result<String, String> {
+    let r = tauri::async_runtime::spawn_blocking(platform::align_restore_modes)
         .await
-        .map_err(|e| format!("后台任务失败：{}", e))?
+        .map_err(|e| format!("后台任务失败：{}", e))?;
+    normalize_main_window_settled(&app);
+    r
 }
 
 /// 小米显示器（REDMI G Pro 27U）当前音量：走它自己的 MiTV 接口（DDC 不通）
