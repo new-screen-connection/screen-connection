@@ -176,7 +176,7 @@ public class SGCore {
   [DllImport("gdi32.dll", CharSet = CharSet.Unicode)] static extern IntPtr CreateDCW(string drv, string dev, string port, IntPtr pdm);
   [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr hdc);
   [DllImport("gdi32.dll", CharSet = CharSet.Unicode)] static extern bool GetICMProfileW(IntPtr hdc, ref uint size, StringBuilder name);
-  [DllImport("gdi32.dll", CharSet = CharSet.Unicode)] static extern bool SetICMProfileW(IntPtr hdc, string file);
+  [DllImport("gdi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool SetICMProfileW(IntPtr hdc, string file);
   [DllImport("mscms.dll", CharSet = CharSet.Unicode)] static extern bool InstallColorProfileW(IntPtr h, string prof);
 
   // DisplayConfig（CCD）：活动路径与设备名查询（与 PnP/WMI 监视器状态无关）。
@@ -1319,24 +1319,36 @@ public class SGCore {
     return p == null ? "ERR:无法打开显示设备或 GetICMProfile 无返回" : ("OK:" + p);
   }
 
-  /// 关联 ICC 到指定显示设备 → OK / ERR:<原因>
+  /// 关联 ICC 到指定显示设备 → OK / OK:already（本就关联着目标配置，无需写）/ ERR:<原因>
   /// 关键：写入后**另开 DC** 回读校验才算成功
   /// （Windows 权限不足时 SetICMProfileW 照样返回 TRUE，但关联不会落到设备上）
   /// B11：GetICMProfileW 有的驱动返回全路径、有的只返回文件名 ——
   /// 两种形式都要认可，否则关联实际成功也被误判为「未生效」。
+  /// B16：捕获 SetICMProfileW 的返回值与 Win32 错误码（此前被丢弃，失败原因全被吞掉）；
+  /// 目标配置已经关联时短路返回，不产生「假成功」也不打扰色彩服务。
   /// 注意：CORE_CS 禁单引号（PowerShell 单引号包裹会截断），路径处理全用双引号字符串。
+  static bool SameProfile(string a, string b) {
+    try {
+      if (string.Equals(a.Trim(), b.Trim(), StringComparison.OrdinalIgnoreCase)) return true;
+      string na = System.IO.Path.GetFileName(a.Trim());
+      string nb = System.IO.Path.GetFileName(b.Trim());
+      return na.Length > 0 && string.Equals(na, nb, StringComparison.OrdinalIgnoreCase);
+    } catch (Exception) { return false; }
+  }
+
   public static string IccSet(string dev, string profile) {
+    string before = IccReadFresh(dev);
+    if (before != null && SameProfile(before, profile)) return "OK:already";
     IntPtr hdc = CreateDCW("DISPLAY", dev, null, IntPtr.Zero);
     if (hdc == IntPtr.Zero) return "ERR:无法打开显示设备";
-    try { SetICMProfileW(hdc, profile); } finally { DeleteDC(hdc); }
+    bool setOk = false;
+    int setErr = 0;
+    try { setOk = SetICMProfileW(hdc, profile); if (!setOk) setErr = Marshal.GetLastWin32Error(); }
+    finally { DeleteDC(hdc); }
     string now = IccReadFresh(dev);
-    if (now == null) return "ERR:未生效(回读=读取失败)";
-    if (string.Equals(now.Trim(), profile.Trim(), StringComparison.OrdinalIgnoreCase)) return "OK";
-    try {
-      string wantName = System.IO.Path.GetFileName(profile.Trim());
-      string gotName = System.IO.Path.GetFileName(now.Trim());
-      if (wantName.Length > 0 && string.Equals(gotName, wantName, StringComparison.OrdinalIgnoreCase)) return "OK";
-    } catch (Exception) { }
+    if (now == null) return "ERR:未生效(回读=读取失败,setok=" + setOk + ",err=" + setErr + ")";
+    if (SameProfile(now, profile)) return "OK";
+    if (!setOk) return "ERR:关联被系统拒绝(Win32 err=" + setErr + ")(回读=" + now.Trim() + ")";
     return "ERR:未生效(回读=" + now.Trim() + ")";
   }
 
@@ -2687,7 +2699,8 @@ fn icc_set(dev: &str, profile: &str) -> Result<(), String> {
         ps_literal(profile)
     ))?;
     let t = out.trim();
-    if t == "OK" {
+    // B16：IccSet 短路路径返回 OK:already（目标配置本就关联着），与 OK 同样算成功
+    if t.starts_with("OK") {
         Ok(())
     } else if let Some(e) = t.strip_prefix("ERR:") {
         Err(e.to_string())
