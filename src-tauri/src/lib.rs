@@ -89,15 +89,29 @@ fn normalize_main_window(app: &tauri::AppHandle) {
     let pos = mon.position();
     let size = mon.size();
     let scale = mon.scale_factor();
+    let win_scale = w.scale_factor().unwrap_or(scale);
+    // B12 交叉校验：主屏报告的缩放与窗口自身 DPI 上下文不一致 = 显示模式/DPI
+    // 正在抖动（实测：对齐改分辨率瞬间 mon_scale=1.00 而 win_scale=1.50，还原
+    // 时反向错位）。此时算出的目标尺寸是过渡值，set_size 会把窗口写死成错误
+    // 宽度（用户看到的「一点功能就变宽」）——本轮直接放弃，交给序列后续轮次
+    // 等传播结束再收口。
+    if (scale - win_scale).abs() > 0.01 {
+        eprintln!("[norm] SKIP scale mismatch mon={scale:.2} win={win_scale:.2}");
+        return;
+    }
     // 默认逻辑尺寸 780x760（与 tauri.conf.json 一致），按当前 DPI 折算物理像素
     let mut ww = (780.0 * scale) as i32;
     let mut wh = (760.0 * scale) as i32;
     // 目标屏比默认窗口还小（如竖屏便携屏当主屏）时夹进屏内，保住最小 420x520
     ww = ww.min(size.width as i32 - 24).max(420);
     wh = wh.min(size.height as i32 - 24).max(520);
-    let cur = w.outer_size().unwrap_or_default();
+    // B12 度量口径修正：set_size 设的是内容（客户区）尺寸，必须和 inner_size
+    // 比；旧代码拿 outer_size（含边框标题栏，比内容大 16~56px）比，永远差一截
+    // → 每次归一化都误判「尺寸不对」无条件 set_size，把 DPI 抖动放大成可见跳动。
+    let cur = w.inner_size().unwrap_or_default();
     // 尺寸一致（±2px 容差）就跳过，不再打扰窗口
     if (cur.width as i32 - ww).abs() > 2 || (cur.height as i32 - wh).abs() > 2 {
+        eprintln!("[norm] SET_SIZE {ww}x{wh} (was {}x{})", cur.width, cur.height);
         let _ = w.set_size(tauri::PhysicalSize::new(ww.max(1) as u32, wh.max(1) as u32));
     }
     // 位置：仅当窗口基本不在主屏可视区时才拉回（居中），否则保留用户摆的位置
@@ -128,7 +142,7 @@ fn normalize_main_window_settled(app: &tauri::AppHandle) {
     let gen = NORM_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let app2 = app.clone();
     std::thread::spawn(move || {
-        for ms in [250u64, 700, 1600, 3000] {
+        for ms in [250u64, 700, 1600, 3000, 5000] {
             std::thread::sleep(std::time::Duration::from_millis(ms));
             if NORM_GEN.load(std::sync::atomic::Ordering::Relaxed) != gen {
                 return; // 更新的归一化序列已接管，本序列退出，不再搬窗口
@@ -384,12 +398,14 @@ async fn hdr_set(on: bool) -> Result<String, String> {
 async fn span_foreground(app: tauri::AppHandle, mode: Option<u32>) -> Result<String, String> {
     // 默认 mode=1「以主屏为基准」：本机两块屏分辨率不同，用包围盒会把主屏底部裁掉
     let m = mode.unwrap_or(1);
-    let r = tauri::async_runtime::spawn_blocking(move || platform::span_foreground(m))
-        .await
-        .map_err(|e| format!("后台任务失败：{}", e))?;
-    // mode=2 会先改两屏分辨率；成败都要把主窗口拉回正常尺寸（内容溢出修复）
-    normalize_main_window_settled(&app);
-    r
+    let r = tauri::async_runtime::spawn_blocking(move || platform::span_foreground(m)).await;
+    // B10 零副作用：铺满被拒（前台是本应用自己等）时一个像素都不动；
+    // 只有真正执行了铺满（可能改了分辨率，mode=2）才归一化收口
+    match r {
+        Ok(Ok(_)) => normalize_main_window_settled(&app),
+        _ => {}
+    }
+    r.map_err(|e| format!("后台任务失败：{}", e))?
 }
 
 /// 还原上一次被铺满的窗口

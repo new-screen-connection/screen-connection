@@ -166,9 +166,12 @@ onMounted(async () => {
           <p class="muted" v-if="devices && devices.discovered.length > 0">
             局域网发现：{{ devices.discovered.map((d) => d.name).join('、') }}
           </p>
-          <p class="muted" v-else>对方设备需要运行本应用，配对码在生成端显示</p>
         </div>
       </div>
+
+      <p class="muted kvm-pair-hint">
+        对方设备需要运行本应用，配对码在生成端显示；配对信息只存在本机（对端设备名、密钥指纹、上次地址），不上传任何服务器。
+      </p>
 
       <div v-if="devices && devices.peers.length > 0" class="kvm-peers">
         <div class="kvm-peer" v-for="p in devices.peers" :key="p.id">
@@ -196,7 +199,6 @@ onMounted(async () => {
           </template>
         </div>
       </div>
-      <p class="muted" v-else>配对信息只存在本机（对端设备名、密钥指纹、上次地址），不上传任何服务器。</p>
     </Card>
   </div>
 </template>

@@ -1703,6 +1703,11 @@ input[type='range']:disabled {
   display: flex;
   gap: 8px;
 }
+.kvm-pair-hint {
+  margin: 12px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+}
 .kvm-code {
   margin: 10px 0 4px;
   padding: 10px 16px;
