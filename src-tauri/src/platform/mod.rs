@@ -1779,14 +1779,45 @@ pub fn set_display_mode(_display_id: &str, _mode: u32) -> Result<String, String>
     Err("当前平台暂不支持切换显示模式".to_string())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+pub fn display_action(
+    action: &str,
+    _display_id: &str,
+    _target_id: Option<&str>,
+    value: Option<&str>,
+) -> Result<String, String> {
+    match action {
+        // Windows 端显示器信息由 get_displays 实时枚举；确认可调用后
+        // 由前端重拉显示器列表更新卡片数据
+        "refresh" => Ok("OK".to_string()),
+        // 布局页「保存显示器尺寸」：value = "厂商代码|对角线英寸"，复用既有存储
+        "align-save-size" => {
+            let raw = value.ok_or("缺少显示器尺寸参数")?;
+            let (manuf, inches) = raw
+                .split_once('|')
+                .ok_or("显示器尺寸参数格式应为 厂商代码|英寸")?;
+            let inches: f64 = inches
+                .trim()
+                .parse()
+                .map_err(|_| "对角线英寸必须是数字")?;
+            if !(2.0..1000.0).contains(&inches) {
+                return Err("对角线英寸超出合理范围".to_string());
+            }
+            set_screen_inches(manuf.trim(), inches)?;
+            Ok("OK".to_string())
+        }
+        _ => Err("此显示控制目前仅支持 macOS".to_string()),
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn display_action(
     _action: &str,
     _display_id: &str,
     _target_id: Option<&str>,
     _value: Option<&str>,
 ) -> Result<String, String> {
-    Err("此显示控制目前仅支持 macOS".to_string())
+    Err("当前平台暂不支持显示控制".to_string())
 }
 
 // ---------- 屏幕电源控制 ----------

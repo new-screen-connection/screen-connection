@@ -103,7 +103,7 @@ onMounted(async () => {
       <div v-if="loading" class="empty">正在读取显示器…</div>
       <div v-else-if="displays.length === 0" class="empty">未检测到显示器</div>
       <div v-else class="display-grid">
-        <DisplayCard v-for="d in displays" :key="d.id" :display="d" />
+        <DisplayCard v-for="d in displays" :key="d.id" :display="d" @refreshed="loadDisplays" />
       </div>
     </Card>
 

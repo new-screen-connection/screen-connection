@@ -1774,6 +1774,13 @@ fn spawn_windows_power_link_watch(app: tauri::AppHandle) {
                 continue;
             }
 
+            // 屏幕处于「我们主动待机」（快捷键/总览按钮关屏）期间跳过联动：
+            // 待机中 DDC 读数会失败或抖动，联动可能误判状态变化、在用户唤醒的
+            // 过程中抢发关屏命令，跟快捷键与手动唤醒打架。
+            if platform::standby_state() {
+                continue;
+            }
+
             let mut online = platform::display_snapshot();
             online.sort();
             online.dedup();

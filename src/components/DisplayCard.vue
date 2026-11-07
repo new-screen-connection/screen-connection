@@ -8,6 +8,7 @@ import Icon from './Icon.vue';
 import SliderRow from './SliderRow.vue';
 
 const props = defineProps<{ display: DisplayInfo }>();
+const emit = defineEmits<{ refreshed: [] }>();
 
 const brightness = ref(props.display.brightness ?? 50);
 const volume = ref(props.display.volume ?? 0);
@@ -32,6 +33,7 @@ function pushVolume(): void {
 async function refreshInfo(): Promise<void> {
   try {
     await invoke('display_action', { action: 'refresh', displayId: props.display.id });
+    emit('refreshed');
     setStatus(`已刷新「${props.display.name}」`);
   } catch (e) {
     setStatus(errText(e), false);

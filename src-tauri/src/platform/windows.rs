@@ -4601,11 +4601,13 @@ fn last_input_tick() -> u32 {
 
 /// 热键动作：切换全部屏幕待机 / 唤醒
 fn hotkey_toggle() {
+    // off_at != 0 → 屏处于我们主动关掉的状态 → 本次按 = 唤醒。
+    // 不能再用「off_at 之后有无新输入」判断：快捷键按键本身也是输入事件，
+    // WM_HOTKEY 派发到这里时 last_input_tick 必然 > off_at，旧逻辑永远判成
+    // 「屏幕已亮 → 该关」，快捷键只能熄屏、永远无法唤醒（实测踩过）。
+    // 「用户是否已用鼠标自行唤醒」由 standby_state()（自动修复轮询）负责清标记。
     let off_at = *asleep_tick().lock().unwrap();
-    let li = last_input_tick();
-    // off_at != 0 且此后没有新输入 → 屏仍处于我们关掉的状态 → 唤醒
-    let should_wake = off_at != 0 && (li == 0 || li <= off_at);
-    if should_wake {
+    if off_at != 0 {
         let _ = screen_wake();
         *asleep_tick().lock().unwrap() = 0;
     } else {
