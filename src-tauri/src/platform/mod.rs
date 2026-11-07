@@ -1,7 +1,21 @@
 use serde::Serialize;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+
+/// 电源联动开关（进程级共享）：Ctrl+Alt+L 全局快捷键只有在该开关打开时才会
+/// 让屏幕待机/唤醒 —— 否则用户没开联动，按快捷键屏幕却黑了（用户反馈）。
+/// lib.rs 在读写 power-link-enabled 偏好时同步到这里。
+static POWER_LINK_ON: AtomicBool = AtomicBool::new(false);
+
+pub fn set_power_link_on(on: bool) {
+    POWER_LINK_ON.store(on, Ordering::Relaxed);
+}
+
+pub fn power_link_on() -> bool {
+    POWER_LINK_ON.load(Ordering::Relaxed)
+}
 
 /// 显示器的跨平台结构化描述
 #[derive(Serialize, Clone, Debug)]

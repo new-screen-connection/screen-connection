@@ -376,6 +376,20 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       return batteries as T;
     case 'list_windows':
       return windows.join('\n') as T;
+    case 'update_check':
+      return {
+        current: '0.4.0',
+        latest: '0.4.0',
+        hasUpdate: false,
+        notes: '',
+        assetName: '',
+        assetUrl: '',
+        assetSize: 0,
+      } as T;
+    case 'update_download':
+      return 'mock-setup.exe' as T;
+    case 'update_install':
+      return undefined as T;
     case 'span_window':
     case 'span_foreground':
       return '已铺满：PotPlayer - movie.mkv（模式：自动对齐两屏清晰度）' as T;

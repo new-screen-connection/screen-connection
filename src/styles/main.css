@@ -544,6 +544,7 @@ body {
 
 select,
 input[type='text'],
+input[type='password'],
 input:not([type]) {
   width: 100%;
   padding: 7px 10px;
@@ -555,6 +556,61 @@ input:not([type]) {
   font-size: 12.5px;
   outline: none;
   transition: border-color 0.15s;
+}
+
+/* 文件选择框：原生控件是白底，整体套主题色，内部按钮也染成主题样式 */
+input[type='file'] {
+  width: 100%;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+}
+input[type='file']::file-selector-button {
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+input[type='file']::file-selector-button:hover {
+  border-color: var(--accent);
+}
+
+/* ---------- 应用内更新进度条 ---------- */
+
+.update-progress-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.update-progress-bar {
+  flex: 1;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.update-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 4px;
+  transition: width 0.3s;
+}
+
+.update-progress-text {
+  font-size: 12px;
+  font-family: var(--mono);
+  color: var(--text);
+  min-width: 40px;
+  text-align: right;
 }
 
 select:focus,

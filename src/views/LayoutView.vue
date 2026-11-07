@@ -292,8 +292,12 @@ async function refreshWindows(): Promise<void> {
 
 const spanSelected = (): void => {
   if (!spanTarget.value) return;
+  // 列表行格式 "W|hwnd|宽x高|标题" —— 后端 hwnd 参数是 i64，必须把数字抠出来，
+  // 整串传过去会被 Tauri 拒掉（invalid args 'hwnd': invalid type: string）
+  const hwnd = Number(spanTarget.value.split('|')[1]);
+  if (!Number.isFinite(hwnd) || hwnd <= 0) return;
   void act(
-    () => invoke<string>('span_window', { hwnd: spanTarget.value, mode: spanMode.value }),
+    () => invoke<string>('span_window', { hwnd, mode: spanMode.value }),
     (r) => r || '已铺满选中窗口',
   );
 };

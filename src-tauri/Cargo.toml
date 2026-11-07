@@ -28,6 +28,10 @@ base64 = "0.22"
 # 排障助手第三层（可选联网分析，默认关闭）走 HTTPS 需要 TLS 客户端；
 # ureq 是同步阻塞的最小实现，不引 tokio 全家桶，且只在用户明确同意后才被调用
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+# 单实例：命名互斥量（瞬时、无竞态）。旧的「PID 谁小谁留」+ PowerShell 查询
+# 有 1~2s 竞态窗口 —— 快速双击时多个实例同时存活（托盘积压），命中守卫时
+# 新实例静默退出又像「闪退」。本插件的回调负责唤出已有主窗口。
+tauri-plugin-single-instance = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "=0.10.1"

@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue';
-import { invoke } from '../api/tauri';
+import { invoke, listenEvent } from '../api/tauri';
 import { act, store } from '../store';
 import { CMD, REPAIR_LABELS } from '../types';
-import type { RepairOutcome } from '../types';
+import type { RepairOutcome, UpdateInfo } from '../types';
 import Card from '../components/Card.vue';
 import Icon from '../components/Icon.vue';
 
@@ -16,6 +16,12 @@ const fileInput = ref<HTMLInputElement | null>(null);
 // 联网分析（P2-1）：默认关闭；key 只存本机 localStorage，不随设置导出
 const llmEnabled = ref(localStorage.getItem('sc_llm_enabled') === '1');
 const llmKey = ref(localStorage.getItem('sc_llm_key') ?? '');
+
+// 应用内更新（v0.4.1）：不再跳转 GitHub 网页
+const updateInfo = ref<UpdateInfo>();
+const updateStatus = ref('');
+const downloading = ref(false);
+const updateProgress = ref(0);
 
 function toggleLlm(on: boolean): void {
   llmEnabled.value = on;
@@ -103,7 +109,33 @@ const openPrivacy = (): void => {
 };
 
 const checkUpdate = (): void => {
-  void act(() => invoke('open_external_page', { page: 'releases' }), '已在浏览器打开版本发布页');
+  void act(async () => {
+    updateInfo.value = undefined;
+    const info = await invoke<UpdateInfo>(CMD.updateCheck);
+    updateInfo.value = info;
+    if (!info.hasUpdate) {
+      updateStatus.value = `已是最新版本（v${info.current}）`;
+    } else {
+      updateStatus.value = '';
+    }
+  }, '正在检查更新…');
+};
+
+/** 应用内下载安装：进度走 update-progress 事件，完成后一键启动安装程序 */
+const runUpdate = (): void => {
+  const info = updateInfo.value;
+  if (!info) return;
+  void act(async () => {
+    downloading.value = true;
+    updateProgress.value = 0;
+    const path = await invoke<string>(CMD.updateDownload, {
+      url: info.assetUrl,
+      size: info.assetSize,
+    });
+    downloading.value = false;
+    await invoke(CMD.updateInstall, { path });
+    updateStatus.value = '安装程序已启动，应用即将退出并开始升级…';
+  }, '正在下载更新…');
 };
 
 onMounted(async () => {
@@ -114,6 +146,13 @@ onMounted(async () => {
     /* 状态缺失不阻塞 */
   }
   autostart.value = Boolean(await invoke<boolean>('get_autostart').catch(() => false));
+  // 下载进度事件 → 进度条
+  await listenEvent('update-progress', (payload: unknown) => {
+    const p = payload as { downloaded: number; total: number } | null;
+    if (!p) return;
+    const total = p.total || updateInfo.value?.assetSize || 0;
+    updateProgress.value = total > 0 ? Math.min(100, Math.round((p.downloaded / total) * 100)) : 0;
+  });
 });
 </script>
 
@@ -149,10 +188,10 @@ onMounted(async () => {
       <p v-if="backupStatus" class="status-line">{{ backupStatus }}</p>
     </Card>
 
-    <Card title="联网分析（默认关闭）" icon="wrench">
+    <Card title="AI 助手（默认关闭）" icon="wrench">
       <label class="check-row">
         <input type="checkbox" :checked="llmEnabled" @change="toggleLlm(($event.target as HTMLInputElement).checked)" />
-        <span>允许排障助手联网分析（本地体检无法定位时才询问，发送前先展示完整内容，你确认后才发）</span>
+        <span>允许排障助手使用 AI 联网分析（本地体检无法定位时才询问，发送前先展示完整内容，你确认后才发）</span>
       </label>
       <div v-if="llmEnabled" class="llm-key-row">
         <input
@@ -172,8 +211,25 @@ onMounted(async () => {
         <span style="font-family: var(--mono); font-size: 12px; color: var(--muted)">
           当前版本 {{ store.version || 'v0.1.0' }}
         </span>
-        <button class="btn" :disabled="store.busy" @click="checkUpdate">检查更新</button>
+        <button class="btn" :disabled="store.busy || downloading" @click="checkUpdate">检查更新</button>
       </div>
+      <p v-if="updateStatus" class="status-line">{{ updateStatus }}</p>
+      <template v-if="updateInfo?.hasUpdate">
+        <p class="status-line">
+          发现新版本 <b>v{{ updateInfo.latest }}</b>
+          （安装包 {{ (updateInfo.assetSize / 1024 / 1024).toFixed(0) }} MiB）
+        </p>
+        <pre v-if="updateInfo.notes" class="output" style="max-height: 140px; overflow: auto">{{ updateInfo.notes }}</pre>
+        <div v-if="downloading" class="update-progress-row">
+          <div class="update-progress-bar"><div class="update-progress-fill" :style="{ width: updateProgress + '%' }"></div></div>
+          <span class="update-progress-text">{{ updateProgress }}%</span>
+        </div>
+        <div class="btn-grid" style="margin-top: 10px">
+          <button class="btn primary" :disabled="downloading" @click="runUpdate">
+            {{ downloading ? '下载中…' : '下载并安装' }}
+          </button>
+        </div>
+      </template>
     </Card>
 
     <Card title="恢复与隐私" icon="shield">

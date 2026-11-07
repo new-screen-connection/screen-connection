@@ -37,11 +37,21 @@ fn current_exe_path() -> Result<String, String> {
 }
 
 pub fn autostart_enabled() -> bool {
-    std::process::Command::new("reg")
-        .args(["query", RUN_KEY, "/v", RUN_NAME])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW：否则每次启动软件查注册表时都会闪一个终端黑框（用户反馈）
+        std::process::Command::new("reg")
+            .args(["query", RUN_KEY, "/v", RUN_NAME])
+            .creation_flags(0x08000000)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
 }
 
 pub fn set_autostart(enabled: bool) -> Result<(), String> {
@@ -4615,7 +4625,11 @@ pub fn hotkey_start() -> Result<String, String> {
         while GetMessageW(&mut m, std::ptr::null_mut(), 0, 0) > 0 {
             if m.message == WM_HOTKEY {
                 if m.wparam == id as usize {
-                    hotkey_toggle();
+                    // 只有电源联动开启时快捷键才生效：联动关闭时按 Ctrl+Alt+L
+                    // 不做任何事（用户要求：没开联动不该把屏幕按灭）
+                    if crate::platform::power_link_on() {
+                        hotkey_toggle();
+                    }
                 } else if m.wparam == id2 as usize {
                     // 铺满之后的窗口可能盖住界面上的「还原」按钮，
                     // 所以必须有一个不依赖界面的还原入口

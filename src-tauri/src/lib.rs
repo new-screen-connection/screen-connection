@@ -1,4 +1,6 @@
 mod platform;
+
+pub mod updater;
 #[cfg(any(target_os = "windows", test))]
 mod icc_profile;
 pub mod kvm;
@@ -105,7 +107,7 @@ fn normalize_main_window_settled(app: &tauri::AppHandle) {
     normalize_main_window(app);
     let app2 = app.clone();
     std::thread::spawn(move || {
-        for ms in [250u64, 700, 1600] {
+        for ms in [250u64, 700, 1600, 3000] {
             std::thread::sleep(std::time::Duration::from_millis(ms));
             normalize_main_window(&app2);
         }
@@ -479,6 +481,41 @@ async fn restore_defaults(app: tauri::AppHandle) -> Result<String, String> {
     let _ = tauri::async_runtime::spawn_blocking(platform::align_restore_modes).await;
     normalize_main_window_settled(&app);
     r
+}
+
+/// 应用内更新：检查 GitHub 最新版本（不再跳转网页，用户要求）
+#[tauri::command]
+async fn update_check(app: tauri::AppHandle) -> Result<updater::UpdateInfo, String> {
+    let current = app.package_info().version.to_string();
+    tauri::async_runtime::spawn_blocking(move || updater::update_check_impl(current))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 应用内更新：流式下载安装包（每 2MiB 发一次 update-progress 事件）
+#[tauri::command]
+async fn update_download(
+    app: tauri::AppHandle,
+    url: String,
+    size: u64,
+) -> Result<String, String> {
+    let h = app.clone();
+    tauri::async_runtime::spawn_blocking(move || updater::update_download_impl(h, url, size))
+        .await
+        .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// 应用内更新：启动安装程序并退出本应用（先做退出还原）
+#[tauri::command]
+fn update_install(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    updater::update_install_impl(&path)?;
+    let a = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        revert_before_exit();
+        a.exit(0);
+    });
+    Ok(())
 }
 
 /// 应用状态（是否退出还原 / 选定的音频端点 / 基线摘要）
@@ -956,8 +993,16 @@ fn get_power_link_preference(app: tauri::AppHandle) -> Result<bool, String> {
         .map_err(|e| format!("无法读取应用数据目录：{}", e))?
         .join("power-link-enabled");
     match std::fs::read_to_string(path) {
-        Ok(value) => Ok(value.trim() == "1"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Ok(value) => {
+            let on = value.trim() == "1";
+            // 同步到进程级开关：全局快捷键 Ctrl+Alt+L 依赖它做门控
+            platform::set_power_link_on(on);
+            Ok(on)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            platform::set_power_link_on(false);
+            Ok(false)
+        }
         Err(error) => Err(format!("读取电源联动偏好失败：{}", error)),
     }
 }
@@ -976,6 +1021,8 @@ fn set_power_link_preference(app: tauri::AppHandle, enabled: bool) -> Result<(),
         if enabled { "1" } else { "0" },
     )
     .map_err(|e| format!("保存电源联动偏好失败：{}", e))?;
+    // 同步到进程级开关：全局快捷键 Ctrl+Alt+L 依赖它做门控
+    platform::set_power_link_on(enabled);
     if let Some(main) = app.get_webview_window("main") {
         let _ = main.eval(&format!("window.applyPowerLinkUiState({})", enabled));
     }
@@ -2116,30 +2163,30 @@ fn spawn_auto_watch(app: tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 「以管理员身份重启」的新实例带 --elevated 参数：旧实例会自行退出，
+    // 这里先等它退干净，再进入 single-instance 插件的互斥量检查 —— 顺序
+    // 不能反，否则提权新实例会被互斥量拒之门外（回调反而唤出旧窗口）。
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if std::env::args().any(|a| a == "--elevated") {
+        for _ in 0..50 {
+            if !platform::another_instance_running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
     tauri::Builder::default()
+        // 单实例必须最先注册：第二次启动 exe 时，本实例立刻退出，由
+        // 已运行实例的回调唤出主窗口（用户要求：双击图标 = 打开主窗口，
+        // 不再静默退出像「闪退」、也不在托盘积压一堆实例）。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
             use tauri::Manager;
-
-            // 单实例自检：若已有更早启动的实例在跑，本实例直接退出，防双托盘
-            // （macOS 用于避免 launchd bootstrap 双开；Windows 用于避免双击图标开出多个托盘）
-            // 例外：「以管理员身份重启」产生的新实例带 --elevated 参数 —— 它的 PID
-            // 几乎必然比旧实例大，会被上面的守卫误杀；所以先等旧实例退出再继续。
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            {
-                let elevated = std::env::args().any(|a| a == "--elevated");
-                if elevated {
-                    for _ in 0..50 {
-                        if !platform::another_instance_running() {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                } else if platform::another_instance_running() {
-                    std::process::exit(0);
-                }
-            }
 
             // 右键菜单
             let open_main = MenuItem::with_id(app, "open_main", "打开主窗口", true, None::<&str>)?;
@@ -2258,6 +2305,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_platform,
             get_version,
+            update_check,
+            update_download,
+            update_install,
             open_external_page,
             get_autostart,
             set_autostart,

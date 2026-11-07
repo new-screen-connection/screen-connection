@@ -618,13 +618,15 @@ fn log_llm_used() {
 /// `api_key` 由前端传入（存在用户本机，不入库不上报）。失败返回可读错误。
 pub fn agent_llm_chat_impl(text: &str, api_key: &str) -> Result<String, String> {
     if api_key.trim().is_empty() {
-        return Err("未配置 API Key：请在「工具 → 联网分析」里填写".to_string());
+        return Err("未配置 API Key：请在「工具 → AI 助手」里勾选并填写".to_string());
     }
     let report = health_report_impl()?;
     let payload = build_llm_payload(text, &report);
 
     let body = serde_json::json!({
-        "model": "deepseek-chat",
+        // 2026-11 实测：deepseek-chat 已下线（models 列表只剩 deepseek-flash /
+        // deepseek-v4-pro），旧模型名会得到 internal_error
+        "model": "deepseek-flash",
         "messages": [
             {
                 "role": "system",
@@ -636,7 +638,9 @@ pub fn agent_llm_chat_impl(text: &str, api_key: &str) -> Result<String, String> 
             }
         ],
         "temperature": 0.3,
-        "max_tokens": 500,
+        // deepseek-flash 是带思维链的模型（reasoning_content 先耗 token），
+        // 500 会被思考吃光导致 content 为空；给到 2000 才有正文
+        "max_tokens": 2000,
         "stream": false
     });
 

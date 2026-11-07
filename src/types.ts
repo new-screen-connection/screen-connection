@@ -378,9 +378,23 @@ export interface DiagReply {
   show_report: boolean;
 }
 
+/** 应用内更新：GitHub Latest Release 检查结果 */
+export interface UpdateInfo {
+  current: string;
+  latest: string;
+  hasUpdate: boolean;
+  notes: string;
+  assetName: string;
+  assetUrl: string;
+  assetSize: number;
+}
+
 export const CMD = {
   getPlatform: 'get_platform',
   getVersion: 'get_version',
+  updateCheck: 'update_check',
+  updateDownload: 'update_download',
+  updateInstall: 'update_install',
   getDisplays: 'get_displays',
   getDisplayModes: 'get_display_modes',
   setDisplayMode: 'set_display_mode',
