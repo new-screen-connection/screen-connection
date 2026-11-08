@@ -95,6 +95,90 @@ fn norm_target_phys(w: &tauri::WebviewWindow, scale: f64) -> (i32, i32) {
     (ww, wh)
 }
 
+/// 缩放错位的起始时刻。B17：错位本来是「显示模式变更中的过渡态」，跳过是对的；
+/// 但实测某些驱动/KVM 链路在「对齐→回滚」后会**长期**保持 mon 与 win 缩放不一致，
+/// 此时守卫与归一化会永久 SKIP —— 宽态定格、自愈失效（用户反馈的「点了铺满就变宽
+/// 再也回不去」）。因此错位持续超过 6 秒就认定它不是过渡态，改以窗口自身 DPI 为准
+/// 强制收口；一旦两边一致立即清零。
+static SCALE_MISMATCH_SINCE: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+fn scale_mismatch_persistent(mon_scale: f64, win_scale: f64) -> bool {
+    let mism = (mon_scale - win_scale).abs() > 0.01;
+    let mut g = match SCALE_MISMATCH_SINCE.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    if !mism {
+        *g = None;
+        return false;
+    }
+    match *g {
+        None => {
+            *g = Some(std::time::Instant::now());
+            false
+        }
+        Some(t) => t.elapsed().as_millis() > 6000,
+    }
+}
+
+/// 主窗口几何快照：铺满/还原这类会改显示模式的操作开始前记下，
+/// 失败（含被拦截）时原样写回 —— 用户明确要求「没法铺满时主界面窗口不要变」。
+#[derive(Clone, Copy)]
+struct WinSnap {
+    size: tauri::PhysicalSize<u32>,
+    pos: Option<tauri::PhysicalPosition<i32>>,
+    maximized: bool,
+}
+
+fn snapshot_main_window(app: &tauri::AppHandle) -> Option<WinSnap> {
+    use tauri::Manager;
+    let w = app.get_webview_window("main")?;
+    let size = w.inner_size().ok()?;
+    Some(WinSnap {
+        size,
+        pos: w.outer_position().ok(),
+        maximized: w.is_maximized().unwrap_or(false),
+    })
+}
+
+/// 把主窗口写回快照（最多 3 次、间隔递增）：显示模式的 DPI 传播会在操作返回后
+/// 继续几百毫秒~数秒，一次写回可能被随后到达的 WM_DPICHANGED 覆盖掉。
+fn restore_main_window(app: &tauri::AppHandle, snap: Option<WinSnap>) {
+    let Some(snap) = snap else { return };
+    use tauri::Manager;
+    let Some(w) = app.get_webview_window("main") else {
+        return;
+    };
+    if snap.maximized {
+        return; // 最大化是用户意图，不干预
+    }
+    for (i, wait) in [0u64, 1200, 3500].iter().enumerate() {
+        if *wait > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(*wait));
+        }
+        let cur = w.inner_size().unwrap_or_default();
+        if (cur.width as i64 - snap.size.width as i64).abs() > 1
+            || (cur.height as i64 - snap.size.height as i64).abs() > 1
+        {
+            eprintln!(
+                "[span-guard] RESTORE#{} {}x{} (was {}x{})",
+                i, snap.size.width, snap.size.height, cur.width, cur.height
+            );
+            let _ = w.set_size(snap.size);
+        }
+        if let (Some(p), Ok(cp)) = (snap.pos, w.outer_position()) {
+            if (cp.x - p.x).abs() > 2 || (cp.y - p.y).abs() > 2 {
+                let _ = w.set_position(p);
+            }
+        }
+    }
+}
+
+fn restore_main_window_async(app: tauri::AppHandle, snap: Option<WinSnap>) {
+    std::thread::spawn(move || restore_main_window(&app, snap));
+}
+
 fn normalize_main_window(app: &tauri::AppHandle) {
     use tauri::Manager;
     let Some(w) = app.get_webview_window("main") else {
@@ -112,10 +196,17 @@ fn normalize_main_window(app: &tauri::AppHandle) {
     // 时反向错位）。此时算出的目标尺寸是过渡值，set_size 会把窗口写死成错误
     // 宽度（用户看到的「一点功能就变宽」）——本轮直接放弃，交给序列后续轮次
     // 等传播结束再收口。
+    // B17：但错位若持续 >6s 就不是过渡态了（驱动不广播归位），此时以窗口自身
+    // DPI 为权威强制收口，避免宽态定格。
     if (scale - win_scale).abs() > 0.01 {
-        eprintln!("[norm] SKIP scale mismatch mon={scale:.2} win={win_scale:.2}");
-        return;
+        if !scale_mismatch_persistent(scale, win_scale) {
+            eprintln!("[norm] SKIP scale mismatch mon={scale:.2} win={win_scale:.2}");
+            return;
+        }
+        eprintln!("[norm] FORCE mon={scale:.2} win={win_scale:.2} → 以窗口 DPI 收口");
     }
+    // 错位持续时通常 mon 报的是过渡值，窗口自身的 win_scale 才是当前真实 DPI
+    let scale = win_scale;
     let (ww, wh) = norm_target_phys(&w, scale);
     // B12 度量口径修正：set_size 设的是内容（客户区）尺寸，必须和 inner_size
     // 比；旧代码拿 outer_size（含边框标题栏，比内容大 16~56px）比，永远差一截
@@ -195,7 +286,10 @@ fn window_geometry(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
         "scale": scale,
         "expect_css_w": tw as f64 / scale,
         "expect_css_h": th as f64 / scale,
-        "suspicious": (mon_scale - scale).abs() > 0.01,
+        // B17：错位只在「过渡态」时让守卫让路；持续 >6s 说明归位广播不会再来，
+        // 不再算 suspicious —— 否则守卫会永久跳过，宽态再也修不回来。
+        "suspicious": (mon_scale - scale).abs() > 0.01
+            && !scale_mismatch_persistent(mon_scale, scale),
         "maximized": maximized,
     }))
 }
@@ -492,12 +586,16 @@ async fn hdr_set(on: bool) -> Result<String, String> {
 async fn span_foreground(app: tauri::AppHandle, mode: Option<u32>) -> Result<String, String> {
     // 默认 mode=1「以主屏为基准」：本机两块屏分辨率不同，用包围盒会把主屏底部裁掉
     let m = mode.unwrap_or(1);
+    // B17：模式 2 的自动对齐会改显示模式（全桌面 DPI 1.5↔1.0 往返），窗口会被
+    // 系统按物理像素重排。先把主窗口几何记下来，失败（含被拦截、铺满动画中途
+    // 出错）一律原样写回 —— 用户要求「没法铺满时主界面窗口不要变」。
+    let snap = snapshot_main_window(&app);
     let r = tauri::async_runtime::spawn_blocking(move || platform::span_foreground(m)).await;
     // B10 零副作用：铺满被拒（前台是本应用自己等）时一个像素都不动；
     // 只有真正执行了铺满（可能改了分辨率，mode=2）才归一化收口
-    match r {
+    match &r {
         Ok(Ok(_)) => normalize_main_window_settled(&app),
-        _ => {}
+        _ => restore_main_window_async(app.clone(), snap),
     }
     r.map_err(|e| format!("后台任务失败：{}", e))?
 }
@@ -505,6 +603,8 @@ async fn span_foreground(app: tauri::AppHandle, mode: Option<u32>) -> Result<Str
 /// 还原上一次被铺满的窗口
 #[tauri::command]
 async fn restore_foreground(app: tauri::AppHandle) -> Result<(), String> {
+    // B17：还原路径会回滚显示模式（全桌面 DPI 抖动），失败时同样把主窗口写回原样
+    let snap = snapshot_main_window(&app);
     let window_restore = tauri::async_runtime::spawn_blocking(platform::restore_foreground)
         .await
         .map_err(|e| format!("后台任务失败：{}", e))?;
@@ -532,7 +632,10 @@ async fn restore_foreground(app: tauri::AppHandle) -> Result<(), String> {
             (Ok(()), Err(display)) => Err(display),
         };
         // 还原把显示模式改回去 → 主窗口同样要重新归一化
-        normalize_main_window_settled(&app);
+        match &r {
+            Ok(()) => normalize_main_window_settled(&app),
+            Err(_) => restore_main_window_async(app.clone(), snap),
+        }
         r
     }
 }
@@ -582,10 +685,15 @@ async fn list_windows() -> Result<String, String> {
 #[tauri::command]
 async fn span_window(app: tauri::AppHandle, hwnd: i64, mode: Option<u32>) -> Result<String, String> {
     let m = mode.unwrap_or(1);
+    // B17：同 span_foreground —— mode=2 会先改显示模式，失败一律把主窗口写回原样
+    let snap = snapshot_main_window(&app);
     let r = tauri::async_runtime::spawn_blocking(move || platform::span_window(hwnd, m))
         .await
         .map_err(|e| format!("后台任务失败：{}", e))?;
-    normalize_main_window_settled(&app);
+    match &r {
+        Ok(_) => normalize_main_window_settled(&app),
+        Err(_) => restore_main_window_async(app.clone(), snap),
+    }
     r
 }
 
