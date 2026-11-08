@@ -47,12 +47,16 @@ export function startWindowGuard(): void {
   let attempt = 0;
   let busy = false;
 
-  /** B21：把根容器宽度钉在窗口「真实」CSS 宽度（物理尺寸 ÷ 缩放）上。
-   *  这一步和 innerWidth 无关 —— 就算渲染器的 DPR 没跟上窗口 DPI、布局视口
-   *  被算得偏大，内容也不会越过窗口边缘被裁掉（CSS 兜底，不依赖重载成功）。 */
+  /** B21/B22：把根容器宽度钉在窗口「真实」CSS 宽度上。
+   *  byDpi = 窗口物理宽度 ÷ 缩放，是权威值；但渲染器自己的 innerWidth 可能比它
+   *  更大（DPR 没跟上窗口 DPI）—— 那正是内容越过窗口右边缘被裁掉的情形。
+   *  取两者较小值：任何一侧算错，内容都只会「偏窄地排完」，绝不会被裁。
+   *  下限 0.55×byDpi 防止过渡态里的异常小值把界面挤成一条。 */
   const pinContentWidth = (physW: number, scale: number): void => {
     if (!(physW > 0) || !(scale > 0)) return;
-    const css = Math.round(physW / scale);
+    const byDpi = Math.round(physW / scale);
+    const iw = window.innerWidth;
+    const css = iw > 0 && iw < byDpi && iw > byDpi * 0.55 ? iw : byDpi;
     document.documentElement.style.setProperty('--app-css-w', `${css}px`);
   };
 

@@ -142,6 +142,38 @@ body {
   gap: 6px;
 }
 
+/* B22 手动恢复窗口：侧栏底部（平台名上方）。窗口被写宽或内容被窗口边缘裁掉时，
+   用户点一下即可把窗口收回设计尺寸并重载界面。 */
+.side-restore {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 8px;
+  font-family: inherit;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--muted);
+  background: var(--panel-2);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+}
+
+.side-restore:hover:not(:disabled) {
+  color: var(--accent-strong);
+  background: var(--accent-dim);
+  border-color: var(--accent-dim);
+}
+
+.side-restore:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 .side-tag {
   display: inline-flex;
   align-items: center;

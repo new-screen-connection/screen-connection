@@ -430,19 +430,31 @@ async fn resync_main_window(
         if (css_width - expect_css).abs() <= 8.0 {
             return Ok("ok".to_string());
         }
-        // B21 硬失同步：布局视口比可见宽度大出一大截（实测 >40 CSS px 都是
-        // WebView2 渲染器 DPR 没跟上窗口 DPI），这种状态下再怎么 set_size 都
-        // 修不好 —— 页面会按「宽布局」排版，右边直接被窗口边缘裁掉（用户看到的
-        // 「内容被遮挡」）。直接让前端重载渲染器，重载是最彻底的解法。
-        if (css_width - expect_css).abs() > 40.0 {
-            eprintln!(
-                "[guard] HARD-DESYNC css={css_width:.0} expect={expect_css:.0} → reload"
-            );
-            return Ok("reload".to_string());
-        }
-        if attempt.unwrap_or(0) >= 3 {
+        let hard = (css_width - expect_css).abs() > 40.0;
+        let n = attempt.unwrap_or(0);
+        // B22：升级阶梯。硬失同步（布局视口比可见宽度大一大截）以前是直接重载，
+        // 但实测重载并不总能修好——WebView2 重新加载文档时可能仍沿用缓存的
+        // RasterizationScale / page zoom，重载完照样宽。现在改成：
+        //   前两次抖动重排 → 第 3~4 次「强制重排」（zoom 归 1 + 尺寸先撑大再收回，
+        //   强迫 Windows 发 WM_DPICHANGED、渲染器重算 DPR）→ 再不行才重载。
+        if n >= 4 {
             eprintln!("[guard] RELOAD css={css_width} expect={expect_css}");
             return Ok("reload".to_string());
+        }
+        if hard || n >= 3 {
+            eprintln!(
+                "[guard] FORCE-REPAINT#{n} css={css_width:.0} expect={expect_css:.0} (hard={hard})"
+            );
+            let _ = w.set_zoom(1.0);
+            let _ = w.set_size(tauri::PhysicalSize::new(
+                (tw + 140).max(1) as u32,
+                (th + 90).max(1) as u32,
+            ));
+            std::thread::sleep(std::time::Duration::from_millis(220));
+            let _ = w.set_size(tauri::PhysicalSize::new(tw.max(1) as u32, th.max(1) as u32));
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            let _ = w.as_ref().set_size(tauri::PhysicalSize::new(tw.max(1) as u32, th.max(1) as u32));
+            return Ok("forced".to_string());
         }
         eprintln!("[guard] NUDGE#{attempt:?} css={css_width} expect={expect_css} phys={}x{}", inner.width, inner.height);
         let _ = w.set_size(tauri::PhysicalSize::new(inner.width + 2, inner.height));
@@ -452,6 +464,88 @@ async fn resync_main_window(
     })
     .await
     .map_err(|e| format!("后台任务失败：{}", e))?
+}
+
+/// B22：手动「恢复窗口」——给用户一个自己按的兜底按钮。
+///
+/// 用户实测里出现过两类界面异常：窗口被写成宽态、内容被窗口右边缘裁掉。
+/// 自动守卫在 DPI 反复变化的窗口期不一定每次都能及时收口，所以提供一个
+/// 一键恢复：清掉最大化/全屏 → 窗口尺寸收回设计值 → **把窗口里的 WebView
+/// 控件尺寸也重设一遍**（内容比窗口宽，常见根因就是控件尺寸没跟着窗口走）
+/// → 前端随后重载渲染器，让 DPR 按当前 DPI 重新取值。
+#[tauri::command]
+async fn recover_main_window(app: tauri::AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri::Manager;
+        let Some(w) = app.get_webview_window("main") else {
+            return Err("主窗口不存在".into());
+        };
+        let before = w.inner_size().unwrap_or_default();
+        if w.is_fullscreen().unwrap_or(false) {
+            let _ = w.set_fullscreen(false);
+        }
+        if w.is_maximized().unwrap_or(false) {
+            let _ = w.unmaximize();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(120));
+
+        // 一、窗口收回设计尺寸。先按当前 DPI 折算物理值，再补一次逻辑值 ——
+        // 某些驱动下 scale_factor 还没定型，两次里总有一次是对的。
+        let scale = w.scale_factor().unwrap_or(1.0);
+        let (tw, th) = norm_target_phys(&w, scale);
+        // 关键一步：先把窗口撑大再收回。只做 set_size 到目标值时，如果尺寸本来
+        // 就"看着对"，Windows 不会发 WM_DPICHANGED、WebView2 也不会重算
+        // RasterizationScale —— 渲染器就一直停在错的 DPR 上（内容按更大宽度排版、
+        // 右边被窗口边缘裁掉）。先变一个明显不同的尺寸，再回目标值，能强制
+        // 走一遍完整的 DPI/重排流程。
+        let _ = w.set_size(tauri::PhysicalSize::new(
+            (tw + 160).max(1) as u32,
+            (th + 100).max(1) as u32,
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(260));
+        let _ = w.set_size(tauri::PhysicalSize::new(tw.max(1) as u32, th.max(1) as u32));
+        std::thread::sleep(std::time::Duration::from_millis(180));
+        let _ = w.as_ref().set_size(tauri::PhysicalSize::new(tw.max(1) as u32, th.max(1) as u32));
+        // 页面缩放也可能停在非 1.0（WebView2 在 DPI 切换后把 RasterizationScale 与
+        // 页面 zoom 搞混时，内容会整体放大、右边被窗口边缘吃掉）。显式归 1.0。
+        let _ = w.set_zoom(1.0);
+
+        // 二、位置：窗口整个跑到屏幕外时拉回主屏居中（拖到别的屏上不动它）
+        let on_screen = match (w.outer_position(), w.current_monitor()) {
+            (Ok(p), Ok(Some(m))) => {
+                let s = m.position();
+                let sz = m.size();
+                p.x >= s.x - 40
+                    && p.y >= s.y - 40
+                    && p.x < s.x + sz.width as i32 - 80
+                    && p.y < s.y + sz.height as i32 - 80
+            }
+            _ => true,
+        };
+        if !on_screen {
+            if let Ok(Some(m)) = w.primary_monitor() {
+                let s = m.position();
+                let sz = m.size();
+                let x = s.x + (sz.width as i32 - tw) / 2;
+                let y = s.y + (sz.height as i32 - th) / 2;
+                let _ = w.set_position(tauri::PhysicalPosition::new(x.max(s.x), y.max(s.y)));
+            }
+        }
+
+        // 三、把根容器宽度锚点清掉，交给重载后的守卫按新 DPI 重算
+        let _ = w.eval("document.documentElement.style.removeProperty('--app-css-w')");
+
+        eprintln!(
+            "[recover] 手动恢复：{}x{} → {tw}x{th}（scale {scale}）",
+            before.width, before.height
+        );
+        Ok(format!(
+            "已恢复到设计尺寸 {}x{}（缩放 {:.2}）",
+            tw, th, scale
+        ))
+    })
+    .await
+    .map_err(|e| format!("恢复失败：{}", e))?
 }
 
 /// 切换单屏分辨率/刷新率，并回读验证；不匹配时恢复原显示配置。
@@ -2755,6 +2849,7 @@ pub fn run() {
             display_action,
             window_geometry,
             resync_main_window,
+            recover_main_window,
             set_brightness,
             set_volume,
             get_system_audio,

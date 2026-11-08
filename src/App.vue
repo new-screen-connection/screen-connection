@@ -31,6 +31,23 @@ const current = ref<ViewKey>('overview');
 
 const platformLabel = ref('检测中');
 
+/** B22：手动恢复窗口。后端把窗口收回设计尺寸（含 WebView 控件尺寸），
+ *  随后重载渲染器 —— DPR 失同步只有重载能让它按当前 DPI 重新取值。 */
+const recovering = ref(false);
+async function recoverWindow(): Promise<void> {
+  if (recovering.value) return;
+  recovering.value = true;
+  setStatus('正在恢复窗口…', true);
+  try {
+    const msg = await invoke<string>('recover_main_window');
+    setStatus(msg, true);
+    window.setTimeout(() => location.reload(), 260);
+  } catch (e) {
+    recovering.value = false;
+    setStatus(`恢复窗口失败：${String(e)}`, false);
+  }
+}
+
 // CDP 自动化验证钩子（仅 dev 构建生效）：测试脚本需要能直接触发错误横幅、
 // 读取状态；生产构建不暴露任何东西。
 if (import.meta.env.DEV) {
@@ -91,6 +108,18 @@ onMounted(async () => {
       </nav>
 
       <div class="side-foot">
+        <!-- B22 手动恢复：窗口被写宽/内容被窗口边缘裁掉时，用户自己按一下就能
+             把窗口收回设计尺寸并重新加载渲染器（自动守卫在 DPI 反复变化时不一定
+             每次都来得及，这是留给用户的兜底按钮）。 -->
+        <button
+          class="side-restore"
+          :disabled="recovering"
+          title="窗口变宽、内容被截断时点这里：把窗口收回原尺寸并重新加载界面"
+          @click="recoverWindow"
+        >
+          <Icon name="restore" :size="13" />
+          <span>{{ recovering ? '正在恢复…' : '恢复窗口' }}</span>
+        </button>
         <div class="side-foot-row">
           <span
             class="side-tag"
