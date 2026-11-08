@@ -4569,10 +4569,94 @@ extern "system" {
     fn GetWindowRect(hwnd: *mut std::ffi::c_void, r: *mut [i32; 4]) -> i32;
 }
 
-/// 供命令层提前判定：前台是本应用自己时返回提示文案。
-/// 命令层拿到 Some 就**直接返回**（不做几何快照、不做写回、不做归一化），
-/// 保证「前台是自己」这类点击对主窗口零副作用 —— 用户要求：只提示，窗口不动。
+/// 最近一个「外部」前台窗口（不属于本程序）。
+/// B20（用户设计的流程）：主窗口里的「铺满前台窗口」按钮，一点击前台就是本程序
+/// 自己 —— 直接拒绝等于功能不可用。改为后台记录用户上一个真正的前台窗口，点按钮
+/// 时若前台是自己就铺满「上次使用的那个窗口」；没有可用候选（比如上次用的还是
+/// 本程序自己）才回报提示，并且**不碰分辨率**。
+fn last_external_fg() -> &'static Mutex<isize> {
+    static S: OnceLock<Mutex<isize>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(0))
+}
+
+/// 该句柄是否仍是「可以铺满的外部窗口」：存在、可见、没最小化、不是桌面/任务栏、
+/// 面积足够大（过滤掉提示气泡、托盘溢出等小窗）。
+fn is_span_candidate(h: *mut std::ffi::c_void) -> bool {
+    unsafe {
+        if h.is_null() || IsWindow(h) == 0 || IsWindowVisible(h) == 0 || IsIconic(h) != 0 {
+            return false;
+        }
+        // 桌面 / 任务栏 / 开始菜单之类：铺满它们没有意义，还会把桌面弄乱
+        let mut buf = [0u16; 64];
+        let n = GetClassNameW(h, buf.as_mut_ptr(), buf.len() as i32);
+        if n > 0 {
+            let cls = String::from_utf16_lossy(&buf[..n as usize]).to_lowercase();
+            for bad in ["progman", "workerw", "shell_traywnd", "shell_secondarytraywnd", "windows.ui.core.corewindow"] {
+                if cls == bad {
+                    return false;
+                }
+            }
+        }
+        let mut r = [0i32; 4];
+        if GetWindowRect(h, &mut r) == 0 {
+            return false;
+        }
+        let (w, hh) = (r[2] - r[0], r[3] - r[1]);
+        w >= 320 && hh >= 240
+    }
+}
+
+/// 启动前台窗口跟踪线程（500ms 一次，代价可忽略）。
+pub fn track_foreground_start() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| loop {
+        unsafe {
+            let h = GetForegroundWindow();
+            if !h.is_null() {
+                let mut pid: u32 = 0;
+                GetWindowThreadProcessId(h, &mut pid);
+                if pid != std::process::id() && is_span_candidate(h) {
+                    if let Ok(mut g) = last_external_fg().lock() {
+                        *g = h as isize;
+                    }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    });
+}
+
+/// 取回最近的外部前台窗口（已失效/不可铺满时返回 None）。
+fn last_external_fg_hwnd() -> Option<i64> {
+    let v = *last_external_fg().lock().ok()?;
+    if v == 0 {
+        return None;
+    }
+    let h = v as *mut std::ffi::c_void;
+    if !is_span_candidate(h) {
+        return None;
+    }
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(h, &mut pid) };
+    if pid == std::process::id() {
+        return None;
+    }
+    Some(v as i64)
+}
+
+/// 供命令层提前判定：前台是本应用自己、且**没有**可用的「上次使用窗口」时返回
+/// 提示文案。命令层拿到 Some 就直接返回（不快照、不写回、不归一化、不改分辨率），
+/// 保证「无从铺满」时对屏幕和窗口都是零副作用。
 pub fn foreground_self_block() -> Option<String> {
+    if foreground_is_self().is_none() {
+        return None;
+    }
+    if last_external_fg_hwnd().is_some() {
+        return None; // 有候选：交给 platform::span_foreground 去铺
+    }
     foreground_is_self().map(|s| s.to_string())
 }
 
@@ -4599,13 +4683,19 @@ fn foreground_is_self() -> Option<&'static str> {
 /// 把当前前台窗口铺满所有屏（浏览器里的抖音全屏、播放器、任意窗口都可以）
 /// mode: 0 = 铺满整块桌面包围盒；1 = 以主屏为基准（高度取主屏，避免主屏底部被裁）
 pub fn span_foreground(mode: u32) -> Result<String, String> {
-    // B1/B19：入口第一步就拦截自身窗口 —— 任何分辨率操作都还没发生，零副作用。
-    // 用户明确要求保留这条提示（「红字无所谓」），只要求窗口一个像素都不许动。
-    // 注：B18 曾在此改成「铺满最近一个外部前台窗口」，实测这条路径在 mode=2 下
-    // 会先进 align_apply 改分辨率 → 全桌面 DPI 1.5↔1.0 往返 → 主窗口被写成
-    // 2079/2130/3115 这类错误宽度（用户看到的「屏幕没变但窗口变宽」），已回退。
+    // B1/B19：入口第一步就判定自身窗口 —— 任何分辨率操作都还没发生，零副作用。
+    // B19 曾把这里改成「一律拦截」，B20 按用户设计的流程恢复为「有候选就铺候选」。
+    // 历史坑（务必保留）：B18 的版本没有「候选校验再对齐」的顺序保证，且当时窗口
+    // 尺寸按物理像素判定，mode=2 的自动对齐（改分辨率 → DPI 1.5↔1.0 往返）把主窗口
+    // 写成了 2079/2130/3115 这类错误宽度（用户反馈「屏幕没变但窗口变宽」）。
+    // B20（用户设计的流程）：在主窗口里点按钮，前台必然是自己 —— 此时铺满「上次
+    // 使用的那个窗口」；没有可用候选（上次用的还是本程序自己/窗口已关）才报提示，
+    // 而且这一步发生在 align_apply **之前**：提示路径绝不改分辨率、不碰窗口。
     if let Some(msg) = foreground_is_self() {
-        return Err(msg.to_string());
+        return match last_external_fg_hwnd() {
+            Some(h) => span_window(h, mode),
+            None => Err(msg.to_string()),
+        };
     }
     mark_change(); // 用户主动改的显示配置：自动修复 120 秒内不要插手
     // mode=2：**先把两块屏的清晰度自动对齐**（竖向像素高度一致），再按包围盒铺满 ——

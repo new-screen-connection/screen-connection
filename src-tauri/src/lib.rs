@@ -2678,6 +2678,12 @@ pub fn run() {
             // B18：尺寸看门狗 —— 任何操作把主窗口写宽/写窄，3s 内自动拉回
             spawn_main_size_watchdog(app.handle().clone());
 
+            // B20：记住最近一个外部前台窗口 —— 主窗口里点「铺满前台窗口」时前台
+            // 必然是自己，此时铺满「上次使用的那个窗口」（用户设计的流程）；
+            // 没有候选才弹提示，且提示路径不改分辨率、不动窗口。
+            #[cfg(target_os = "windows")]
+            platform::track_foreground_start();
+
             // Windows Event Log based health monitor (disconnect alerts + optional repair).
             #[cfg(target_os = "windows")]
             spawn_health_watch(app.handle().clone());
