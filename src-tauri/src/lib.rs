@@ -126,7 +126,10 @@ fn scale_mismatch_persistent(mon_scale: f64, win_scale: f64) -> bool {
 /// 失败（含被拦截）时原样写回 —— 用户明确要求「没法铺满时主界面窗口不要变」。
 #[derive(Clone, Copy)]
 struct WinSnap {
-    size: tauri::PhysicalSize<u32>,
+    /// 逻辑（CSS）尺寸。B19：物理值在 DPI 往返期间不可靠 —— 快照 1174 物理写回
+    /// 时若窗口 DPI 已从 1.5 掉到 1.0，就变成 1174 CSS（用户看到的「变宽」）。
+    /// 记逻辑尺寸，写回时再乘当前 DPI，才是「尺寸不变」的真正语义。
+    css: (f64, f64),
     pos: Option<tauri::PhysicalPosition<i32>>,
     maximized: bool,
 }
@@ -135,8 +138,9 @@ fn snapshot_main_window(app: &tauri::AppHandle) -> Option<WinSnap> {
     use tauri::Manager;
     let w = app.get_webview_window("main")?;
     let size = w.inner_size().ok()?;
+    let scale = w.scale_factor().unwrap_or(1.0).max(0.5);
     Some(WinSnap {
-        size,
+        css: (size.width as f64 / scale, size.height as f64 / scale),
         pos: w.outer_position().ok(),
         maximized: w.is_maximized().unwrap_or(false),
     })
@@ -157,15 +161,19 @@ fn restore_main_window(app: &tauri::AppHandle, snap: Option<WinSnap>) {
         if *wait > 0 {
             std::thread::sleep(std::time::Duration::from_millis(*wait));
         }
+        // B19：按逻辑尺寸判定/写回（物理值在 DPI 抖动期间不可靠，见 WinSnap 注释）
+        let scale = w.scale_factor().unwrap_or(1.0).max(0.5);
         let cur = w.inner_size().unwrap_or_default();
-        if (cur.width as i64 - snap.size.width as i64).abs() > 1
-            || (cur.height as i64 - snap.size.height as i64).abs() > 1
-        {
+        let css_w = cur.width as f64 / scale;
+        let css_h = cur.height as f64 / scale;
+        if (css_w - snap.css.0).abs() > 2.0 || (css_h - snap.css.1).abs() > 2.0 {
+            let tw = (snap.css.0 * scale).round().max(1.0) as u32;
+            let th = (snap.css.1 * scale).round().max(1.0) as u32;
             eprintln!(
-                "[span-guard] RESTORE#{} {}x{} (was {}x{})",
-                i, snap.size.width, snap.size.height, cur.width, cur.height
+                "[span-guard] RESTORE#{} css={:.0}x{:.0}→{:.0}x{:.0} (phys {}x{} scale={scale:.2})",
+                i, css_w, css_h, snap.css.0, snap.css.1, cur.width, cur.height
             );
-            let _ = w.set_size(snap.size);
+            let _ = w.set_size(tauri::PhysicalSize::new(tw, th));
         }
         if let (Some(p), Ok(cp)) = (snap.pos, w.outer_position()) {
             if (cp.x - p.x).abs() > 2 || (cp.y - p.y).abs() > 2 {
@@ -223,8 +231,14 @@ fn spawn_main_size_watchdog(app: tauri::AppHandle) {
                 continue;
             };
             let (tw, th) = norm_target_phys(&w, scale);
-            // 容差 16px：窗口边框/取整误差不算异常，只抓真被写宽写窄的情况
-            if (cur.width as i32 - tw).abs() <= 16 && (cur.height as i32 - th).abs() <= 16 {
+            // B19：同样按 CSS 逻辑尺寸判定（理由见 normalize_main_window）。
+            // 物理值在 DPI 往返期间会被放大/缩小，拿它跟目标比会把「尺寸其实正常」
+            // 的窗口反复写一遍，反而写坏。
+            let css_w = cur.width as f64 / scale;
+            let css_h = cur.height as f64 / scale;
+            let ok_w = (css_w - tw as f64 / scale).abs() <= 12.0;
+            let ok_h = (css_h - th as f64 / scale).abs() <= 40.0;
+            if ok_w && ok_h {
                 bad = 0;
                 continue;
             }
@@ -234,8 +248,8 @@ fn spawn_main_size_watchdog(app: tauri::AppHandle) {
             }
             bad = 0;
             eprintln!(
-                "[watch] 窗口被写成 {}x{}（目标 {tw}x{th}）→ 强制归一化",
-                cur.width, cur.height
+                "[watch] 窗口被写成 {}x{}（css {:.0}x{:.0}，目标 {tw}x{th} phys）→ 强制归一化",
+                cur.width, cur.height, css_w, css_h
             );
             normalize_main_window(&app);
         }
@@ -280,9 +294,23 @@ fn normalize_main_window(app: &tauri::AppHandle) {
     // 比；旧代码拿 outer_size（含边框标题栏，比内容大 16~56px）比，永远差一截
     // → 每次归一化都误判「尺寸不对」无条件 set_size，把 DPI 抖动放大成可见跳动。
     let cur = w.inner_size().unwrap_or_default();
-    // 尺寸一致（±2px 容差）就跳过，不再打扰窗口
-    if (cur.width as i32 - ww).abs() > 2 || (cur.height as i32 - wh).abs() > 2 {
-        eprintln!("[norm] SET_SIZE {ww}x{wh} (was {}x{})", cur.width, cur.height);
+    // B19 度量口径：以 **CSS 逻辑尺寸** 为准。DPI 正在抖动时同一块窗口的物理值
+    // 会被放大/缩小，按物理值比对就会反复 set_size，而且每次都在错的缩放下写死
+    // 一个错误的宽度 —— 日志里的 `2079x760` / `2130x760` / `3115x1143` 全是这么
+    // 来的，正是用户看到的「点一下功能窗口就变宽」。布局是否正常只取决于 CSS
+    // 尺寸，物理值只是它的宿主表示，所以先折算再比对；需要纠正时才按当前 scale
+    // 换算成物理值写回去。
+    let css_w = cur.width as f64 / scale;
+    let css_h = cur.height as f64 / scale;
+    let want_w = ww as f64 / scale;
+    let want_h = wh as f64 / scale;
+    // 宽度容差 6 CSS px（真被写坏时偏差都是几百 px）；高度容差 40 CSS px —— 用户
+    // 可以手动拖高窗口，这里只纠正被显示模式写坏的高度，不跟手动调整较劲。
+    if (css_w - want_w).abs() > 6.0 || (css_h - want_h).abs() > 40.0 {
+        eprintln!(
+            "[norm] SET_SIZE {ww}x{wh} css={css_w:.0}x{css_h:.0}→{want_w:.0}x{want_h:.0} (phys was {}x{}, scale={scale:.2})",
+            cur.width, cur.height
+        );
         let _ = w.set_size(tauri::PhysicalSize::new(ww.max(1) as u32, wh.max(1) as u32));
     }
     // 位置：仅当窗口基本不在主屏可视区时才拉回（居中），否则保留用户摆的位置
@@ -383,12 +411,22 @@ async fn resync_main_window(
         let scale = w.scale_factor().map_err(|e| e.to_string())?;
         let inner = w.inner_size().map_err(|e| e.to_string())?;
         let (tw, th) = norm_target_phys(&w, scale);
-        if (inner.width as i32 - tw).abs() > 4 || (inner.height as i32 - th).abs() > 4 {
-            eprintln!("[guard] RESIZE phys={}x{} → {tw}x{th}", inner.width, inner.height);
+        // B19：按 CSS 逻辑尺寸判定（物理值在 DPI 抖动期间会被放大/缩小，拿它比对
+        // 会在错的缩放下写出错误宽度）。宽度 3 CSS px、高度 40 CSS px —— 高度不跟
+        // 用户手动拖高较劲。
+        let css_now_w = inner.width as f64 / scale;
+        let css_now_h = inner.height as f64 / scale;
+        let want_css_w = tw as f64 / scale;
+        let want_css_h = th as f64 / scale;
+        if (css_now_w - want_css_w).abs() > 3.0 || (css_now_h - want_css_h).abs() > 40.0 {
+            eprintln!(
+                "[guard] RESIZE phys={}x{} (css {css_now_w:.0}x{css_now_h:.0}) → {tw}x{th}",
+                inner.width, inner.height
+            );
             let _ = w.set_size(tauri::PhysicalSize::new(tw.max(1) as u32, th.max(1) as u32));
             return Ok("resized".to_string());
         }
-        let expect_css = tw as f64 / scale;
+        let expect_css = want_css_w;
         if (css_width - expect_css).abs() <= 8.0 {
             return Ok("ok".to_string());
         }
@@ -655,6 +693,14 @@ async fn hdr_set(on: bool) -> Result<String, String> {
 async fn span_foreground(app: tauri::AppHandle, mode: Option<u32>) -> Result<String, String> {
     // 默认 mode=1「以主屏为基准」：本机两块屏分辨率不同，用包围盒会把主屏底部裁掉
     let m = mode.unwrap_or(1);
+    // B19：前台是本应用自己 → 纯提示、立刻返回。这里连几何快照/写回/归一化都不做，
+    // 因为用户要求的语义就是「弹个提示、屏幕不变、窗口也一个像素都不许动」。
+    // （上一版在这条路径上改铺满「最近外部窗口」，mode=2 会先改分辨率，DPI 往返
+    //  把主窗口写成 2079/2130/3115 这类错误宽度，就是「屏幕没变但窗口变宽」的真凶。）
+    #[cfg(target_os = "windows")]
+    if let Some(msg) = platform::foreground_self_block() {
+        return Err(msg);
+    }
     // B17：模式 2 的自动对齐会改显示模式（全桌面 DPI 1.5↔1.0 往返），窗口会被
     // 系统按物理像素重排。先把主窗口几何记下来，失败（含被拦截、铺满动画中途
     // 出错）一律原样写回 —— 用户要求「没法铺满时主界面窗口不要变」。
@@ -2631,11 +2677,6 @@ pub fn run() {
 
             // B18：尺寸看门狗 —— 任何操作把主窗口写宽/写窄，3s 内自动拉回
             spawn_main_size_watchdog(app.handle().clone());
-
-            // B18：记住最近一个外部前台窗口，「铺满前台窗口」按钮在主窗口里点击时
-            // （前台必然是自己）改铺满那个窗口，而不是直接报错。
-            #[cfg(target_os = "windows")]
-            platform::track_foreground_start();
 
             // Windows Event Log based health monitor (disconnect alerts + optional repair).
             #[cfg(target_os = "windows")]
