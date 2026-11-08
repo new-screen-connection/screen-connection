@@ -430,6 +430,16 @@ async fn resync_main_window(
         if (css_width - expect_css).abs() <= 8.0 {
             return Ok("ok".to_string());
         }
+        // B21 硬失同步：布局视口比可见宽度大出一大截（实测 >40 CSS px 都是
+        // WebView2 渲染器 DPR 没跟上窗口 DPI），这种状态下再怎么 set_size 都
+        // 修不好 —— 页面会按「宽布局」排版，右边直接被窗口边缘裁掉（用户看到的
+        // 「内容被遮挡」）。直接让前端重载渲染器，重载是最彻底的解法。
+        if (css_width - expect_css).abs() > 40.0 {
+            eprintln!(
+                "[guard] HARD-DESYNC css={css_width:.0} expect={expect_css:.0} → reload"
+            );
+            return Ok("reload".to_string());
+        }
         if attempt.unwrap_or(0) >= 3 {
             eprintln!("[guard] RELOAD css={css_width} expect={expect_css}");
             return Ok("reload".to_string());

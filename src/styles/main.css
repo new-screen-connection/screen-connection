@@ -12,6 +12,16 @@ body,
   height: 100%;
 }
 
+#app {
+  /* B21 内容不被裁：根容器宽度钉在「窗口真实 CSS 宽度」上（物理尺寸 ÷ 缩放，
+     由 window_geometry 每 2s 提供）。渲染器 DPR 一时跟不上窗口 DPI 时，布局
+     视口会比可见宽度大出一截，页面就按「宽布局」排版、右边被窗口边缘直接裁掉
+     （用户看到的「内容被遮挡」）。钉死宽度后，无论分辨率/缩放怎么变，内容都
+     只会在可见区域内排版。 */
+  width: var(--app-css-w, 100%);
+  max-width: 100%;
+}
+
 body {
   font-family: var(--font);
   font-size: 13px;
