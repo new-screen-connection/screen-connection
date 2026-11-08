@@ -175,7 +175,75 @@ fn restore_main_window(app: &tauri::AppHandle, snap: Option<WinSnap>) {
     }
 }
 
+/// 「刚刚发生过显示相关的操作」时间戳。看门狗只在这个窗口期（90s）内接管窗口
+/// 尺寸 —— 显示模式/DPI 传播只会在这段时间里把窗口写坏；平时用户自己拖动改变
+/// 大小属于有意为之，不该每 3 秒被强行拉回。
+static LAST_DISPLAY_EVENT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+fn mark_display_event() {
+    if let Ok(mut g) = LAST_DISPLAY_EVENT.lock() {
+        *g = Some(std::time::Instant::now());
+    }
+}
+
+fn display_event_active() -> bool {
+    LAST_DISPLAY_EVENT
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .map(|t| t.elapsed().as_secs() < 90)
+        .unwrap_or(false)
+}
+
+/// B18 窗口尺寸常驻看门狗（后端侧，1.5s 一轮）。
+/// 铺满/对齐/色彩同步这类操作会在几百毫秒到十几秒里反复触发 DPI 传播，任何
+/// 一次 set_size 都可能被随后的 WM_DPICHANGED 覆盖成错误宽度；前端守卫（B15）
+/// 依赖 JS 定时器与视口读数，视口本身失真时就无从判断。窗口客户区的物理尺寸
+/// 是后端唯一权威事实，这里连续两轮（≈3s）偏离目标就强制归一化 —— 不管是谁、
+/// 什么操作把窗口写宽/写窄，都会被拉回 780x760，且不依赖前端是否还活着。
+fn spawn_main_size_watchdog(app: tauri::AppHandle) {
+    use tauri::Manager;
+    std::thread::spawn(move || {
+        let mut bad = 0u32;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let Some(w) = app.get_webview_window("main") else {
+                continue;
+            };
+            if !w.is_visible().unwrap_or(false)
+                || w.is_maximized().unwrap_or(false)
+                || w.is_fullscreen().unwrap_or(false)
+                || !display_event_active()
+            {
+                bad = 0;
+                continue;
+            }
+            let (Ok(scale), Ok(cur)) = (w.scale_factor(), w.inner_size()) else {
+                continue;
+            };
+            let (tw, th) = norm_target_phys(&w, scale);
+            // 容差 16px：窗口边框/取整误差不算异常，只抓真被写宽写窄的情况
+            if (cur.width as i32 - tw).abs() <= 16 && (cur.height as i32 - th).abs() <= 16 {
+                bad = 0;
+                continue;
+            }
+            bad += 1;
+            if bad < 2 {
+                continue;
+            }
+            bad = 0;
+            eprintln!(
+                "[watch] 窗口被写成 {}x{}（目标 {tw}x{th}）→ 强制归一化",
+                cur.width, cur.height
+            );
+            normalize_main_window(&app);
+        }
+    });
+}
+
 fn restore_main_window_async(app: tauri::AppHandle, snap: Option<WinSnap>) {
+    mark_display_event();
     std::thread::spawn(move || restore_main_window(&app, snap));
 }
 
@@ -241,6 +309,7 @@ fn normalize_main_window(app: &tauri::AppHandle) {
 /// 带代号，一旦有新序列进来，旧序列立即退出，只有最新一条在跑。
 static NORM_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn normalize_main_window_settled(app: &tauri::AppHandle) {
+    mark_display_event();
     normalize_main_window(app);
     let gen = NORM_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let app2 = app.clone();
@@ -2559,6 +2628,14 @@ pub fn run() {
                     normalize_main_window_settled(&h);
                 });
             }
+
+            // B18：尺寸看门狗 —— 任何操作把主窗口写宽/写窄，3s 内自动拉回
+            spawn_main_size_watchdog(app.handle().clone());
+
+            // B18：记住最近一个外部前台窗口，「铺满前台窗口」按钮在主窗口里点击时
+            // （前台必然是自己）改铺满那个窗口，而不是直接报错。
+            #[cfg(target_os = "windows")]
+            platform::track_foreground_start();
 
             // Windows Event Log based health monitor (disconnect alerts + optional repair).
             #[cfg(target_os = "windows")]

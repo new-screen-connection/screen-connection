@@ -4562,6 +4562,89 @@ fn rollback_span_alignment(aligned: bool) -> String {
 extern "system" {
     fn GetForegroundWindow() -> *mut std::ffi::c_void;
     fn GetWindowThreadProcessId(hwnd: *mut std::ffi::c_void, pid: *mut u32) -> u32;
+    fn IsWindow(hwnd: *mut std::ffi::c_void) -> i32;
+    fn IsWindowVisible(hwnd: *mut std::ffi::c_void) -> i32;
+    fn IsIconic(hwnd: *mut std::ffi::c_void) -> i32;
+    fn GetClassNameW(hwnd: *mut std::ffi::c_void, buf: *mut u16, n: i32) -> i32;
+    fn GetWindowRect(hwnd: *mut std::ffi::c_void, r: *mut [i32; 4]) -> i32;
+}
+
+/// 最近一个「外部」前台窗口（不属于本程序）。
+/// B18：主窗口里的「铺满前台窗口」按钮，一点击前台就是本程序自己 —— 旧逻辑直接
+/// 拒绝，功能等于不可用（用户看到的只有一条红色错误）。改为后台记录用户上一个
+/// 真正的前台窗口，点按钮时若前台是自己就铺满那个窗口 —— 语义正是「我刚才在用
+/// 的那个窗口」，和用户预期一致。
+fn last_external_fg() -> &'static Mutex<isize> {
+    static S: OnceLock<Mutex<isize>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(0))
+}
+
+/// 该句柄是否仍是「可以铺满的外部窗口」：存在、可见、没最小化、不是桌面/任务栏、
+/// 面积足够大（过滤掉提示气泡、托盘溢出等小窗）。
+fn is_span_candidate(h: *mut std::ffi::c_void) -> bool {
+    unsafe {
+        if h.is_null() || IsWindow(h) == 0 || IsWindowVisible(h) == 0 || IsIconic(h) != 0 {
+            return false;
+        }
+        // 桌面 / 任务栏 / 开始菜单之类：铺满它们没有意义，还会把桌面弄乱
+        let mut buf = [0u16; 64];
+        let n = GetClassNameW(h, buf.as_mut_ptr(), buf.len() as i32);
+        if n > 0 {
+            let cls = String::from_utf16_lossy(&buf[..n as usize]).to_lowercase();
+            for bad in ["progman", "workerw", "shell_traywnd", "shell_secondarytraywnd", "windows.ui.core.corewindow"] {
+                if cls == bad {
+                    return false;
+                }
+            }
+        }
+        let mut r = [0i32; 4];
+        if GetWindowRect(h, &mut r) == 0 {
+            return false;
+        }
+        let (w, hh) = (r[2] - r[0], r[3] - r[1]);
+        w >= 320 && hh >= 240
+    }
+}
+
+/// 启动前台窗口跟踪线程（500ms 一次，代价可忽略）。
+pub fn track_foreground_start() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| loop {
+        unsafe {
+            let h = GetForegroundWindow();
+            if !h.is_null() {
+                let mut pid: u32 = 0;
+                GetWindowThreadProcessId(h, &mut pid);
+                if pid != std::process::id() && is_span_candidate(h) {
+                    if let Ok(mut g) = last_external_fg().lock() {
+                        *g = h as isize;
+                    }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    });
+}
+
+/// 取回最近的外部前台窗口（已失效/不可铺满时返回 None）。
+fn last_external_fg_hwnd() -> Option<i64> {
+    let v = *last_external_fg().lock().ok()?;
+    if v == 0 {
+        return None;
+    }
+    let h = v as *mut std::ffi::c_void;
+    if !is_span_candidate(h) {
+        return None;
+    }
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(h, &mut pid) };
+    if pid == std::process::id() {
+        return None;
+    }
+    Some(v as i64)
 }
 
 /// B1 入口闸门：当前前台窗口若是本进程自己的窗口，返回 Some(提示)。
@@ -4588,8 +4671,14 @@ fn foreground_is_self() -> Option<&'static str> {
 /// mode: 0 = 铺满整块桌面包围盒；1 = 以主屏为基准（高度取主屏，避免主屏底部被裁）
 pub fn span_foreground(mode: u32) -> Result<String, String> {
     // B1：入口第一步就拦截自身窗口 —— 任何分辨率操作都还没发生，零副作用
+    // B18：但用户是在本窗口里点按钮的，前台必然是「自己」。此时改铺满「最近一个
+    // 外部前台窗口」（就是他刚才在看的那个），而不是甩一条红色错误 —— 否则这个
+    // 按钮在主窗口里永远不可用。没有可用候选时才报错。
     if let Some(msg) = foreground_is_self() {
-        return Err(msg.to_string());
+        match last_external_fg_hwnd() {
+            Some(h) => return span_window(h, mode),
+            None => return Err(msg.to_string()),
+        }
     }
     mark_change(); // 用户主动改的显示配置：自动修复 120 秒内不要插手
     // mode=2：**先把两块屏的清晰度自动对齐**（竖向像素高度一致），再按包围盒铺满 ——
