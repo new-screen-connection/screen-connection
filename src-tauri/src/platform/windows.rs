@@ -4567,6 +4567,26 @@ extern "system" {
     fn IsIconic(hwnd: *mut std::ffi::c_void) -> i32;
     fn GetClassNameW(hwnd: *mut std::ffi::c_void, buf: *mut u16, n: i32) -> i32;
     fn GetWindowRect(hwnd: *mut std::ffi::c_void, r: *mut [i32; 4]) -> i32;
+    fn GetDpiForWindow(hwnd: *mut std::ffi::c_void) -> u32;
+}
+
+/// B23：窗口所在显示的**实时** DPI 缩放。
+///
+/// 为什么不用 Tauri 的 `scale_factor()`：显示模式被改过（mode=2 的自动对齐会
+/// 把主屏切到 2560x1440@100%）之后，Tauri 缓存的缩放可能停在旧值上，而 Windows
+/// 本身早已回到 150%。这时「物理宽 ÷ Tauri缩放」会把窗口 CSS 宽算得偏大，页面
+/// 按偏大的宽度排版，右边就被窗口边缘裁掉（用户看到的「内容被遮挡」）。
+/// `GetDpiForWindow` 是实时查询，不缓存。
+pub fn dpi_scale_for(hwnd: isize) -> f64 {
+    if hwnd == 0 {
+        return 0.0;
+    }
+    let d = unsafe { GetDpiForWindow(hwnd as *mut std::ffi::c_void) };
+    if d == 0 {
+        0.0
+    } else {
+        d as f64 / 96.0
+    }
 }
 
 /// 最近一个「外部」前台窗口（不属于本程序）。
@@ -5599,6 +5619,23 @@ fn diag_log_dir() -> std::path::PathBuf {
 /// 日志目录路径（界面显示用）
 pub fn diag_log_path() -> String {
     diag_log_dir().to_string_lossy().to_string()
+}
+
+/// B23：视口失同步诊断落盘（`%APPDATA%\Screenguard\logs\viewport.log`）。
+///
+/// 界面被裁的时候用户没法看控制台输出，事后也复现不了 —— 把每次守卫/手动恢复
+/// 动作的关键数值（CSS 宽、物理尺寸、Tauri 缩放、实时 DPI 缩放、期望宽）写一行，
+/// 排障时以这个文件为准。
+pub fn append_viewport_log(line: &str) {
+    use std::io::Write;
+    let p = diag_log_dir().join("viewport.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{secs}] {line}");
+    }
 }
 
 /// 在文件资源管理器里打开日志目录

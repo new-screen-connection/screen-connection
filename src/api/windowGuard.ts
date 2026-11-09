@@ -9,6 +9,8 @@ interface WindowGeometry {
   phys_w: number;
   phys_h: number;
   scale: number;
+  /** B23：Win32 GetDpiForWindow 拿到的实时缩放（Tauri 的 scale 可能停在旧值）。 */
+  dpi_scale?: number;
   expect_css_w: number;
   expect_css_h: number;
   suspicious: boolean;
@@ -41,6 +43,45 @@ function markReload(): void {
   } catch { /* 隐私模式等：放弃节流记录，仍允许重载 */ }
 }
 
+/** B23：界面排版错乱（内容比窗口宽/高）时，侧栏底部那个「恢复窗口」按钮会被推到
+ *  窗口外面根本点不到 —— 用户遇到的就是这种情况。这里在左上角补一个浮层按钮：
+ *  左上角在任何错位下都落在可见区内（内容总是从左上开始排），保证一定能点到。 */
+function showEmergencyRestore(): void {
+  if (document.getElementById('sc-emergency-restore')) return;
+  const b = document.createElement('button');
+  b.id = 'sc-emergency-restore';
+  b.textContent = '恢复窗口';
+  b.title = '界面显示异常时点这里：把窗口收回原尺寸并重新加载界面';
+  b.style.cssText = [
+    'position:fixed',
+    'left:10px',
+    'top:10px',
+    'z-index:2147483647',
+    'padding:5px 10px',
+    'font:600 12px/1.5 "Segoe UI","Microsoft YaHei",sans-serif',
+    'color:#ffffff',
+    'background:#e05c5c',
+    'border:1px solid #b94b4b',
+    'border-radius:7px',
+    'cursor:pointer',
+    'box-shadow:0 2px 10px rgba(0,0,0,.35)',
+  ].join(';');
+  b.onclick = () => {
+    b.textContent = '正在恢复…';
+    invoke<string>('recover_main_window')
+      .then(() => window.setTimeout(() => location.reload(), 260))
+      .catch(() => {
+        b.textContent = '恢复窗口';
+      });
+  };
+  document.body.appendChild(b);
+}
+
+function hideEmergencyRestore(): void {
+  const el = document.getElementById('sc-emergency-restore');
+  if (el) el.remove();
+}
+
 export function startWindowGuard(): void {
   // 只在主窗口跑（panel/notify 是独立入口，不挂本守卫）
   let bad = 0;
@@ -55,8 +96,13 @@ export function startWindowGuard(): void {
   const pinContentWidth = (physW: number, scale: number): void => {
     if (!(physW > 0) || !(scale > 0)) return;
     const byDpi = Math.round(physW / scale);
-    const iw = window.innerWidth;
-    const css = iw > 0 && iw < byDpi && iw > byDpi * 0.55 ? iw : byDpi;
+    // 三个候选都取最小：「物理宽 ÷ 实时 DPI」是权威值，innerWidth 是渲染器自己
+    // 认为的视口，visualViewport.width 是视觉视口。任何一个偏大都会让内容越过
+    // 窗口边缘被裁，所以取最小的那个 —— 宁可偏窄排完，也不要被切掉。
+    const cands = [byDpi, window.innerWidth, Math.round(window.visualViewport?.width ?? 0)].filter(
+      (v) => v > 0,
+    );
+    const css = Math.max(Math.min(...cands), Math.round(byDpi * 0.55));
     document.documentElement.style.setProperty('--app-css-w', `${css}px`);
   };
 
@@ -65,7 +111,7 @@ export function startWindowGuard(): void {
   const pinNow = async (): Promise<void> => {
     try {
       const g = await invoke<WindowGeometry>('window_geometry');
-      pinContentWidth(g.phys_w, g.scale);
+      pinContentWidth(g.phys_w, g.dpi_scale || g.scale);
     } catch { /* 非 Tauri 环境：忽略 */ }
   };
   void pinNow();
@@ -83,10 +129,11 @@ export function startWindowGuard(): void {
     } catch {
       return; // 非 Tauri 环境或窗口不在：静默跳过
     }
-    pinContentWidth(g.phys_w, g.scale);
+    pinContentWidth(g.phys_w, g.dpi_scale || g.scale);
     // 最大化是用户意图，不干预
     if (g.maximized) {
       bad = 0;
+      hideEmergencyRestore();
       return;
     }
     const drift = window.innerWidth - g.expect_css_w;
@@ -103,8 +150,11 @@ export function startWindowGuard(): void {
     if (Math.abs(drift) <= 8) {
       bad = 0;
       attempt = 0;
+      hideEmergencyRestore();
       return;
     }
+    // B23：界面已经错位时，侧栏底部那个按钮会被推到窗口外点不到 —— 补左上角浮层。
+    if (hard) showEmergencyRestore();
     bad += 1;
     if (bad < 2) return; // 连续两轮超差才动手（躲过单次过渡态）
     bad = 0;

@@ -95,6 +95,30 @@ fn norm_target_phys(w: &tauri::WebviewWindow, scale: f64) -> (i32, i32) {
     (ww, wh)
 }
 
+/// B23：窗口所在显示的**实时** DPI 缩放。
+///
+/// 不能只信 `w.scale_factor()`：显示模式被 mode=2 的自动对齐改过（主屏切到
+/// 2560x1440@100%）之后，Tauri 缓存的缩放可能停在中途值，而 Windows 早已回到
+/// 150%。此时「物理宽 ÷ 缓存缩放」会把窗口的 CSS 宽算大，所有归一化/守卫判定
+/// 都跟着错。全部改用 Win32 实时值（拿不到才回退 Tauri）。
+fn live_scale_of(w: &tauri::WebviewWindow) -> f64 {
+    let fallback = w.scale_factor().unwrap_or(1.0).max(0.2);
+    #[cfg(target_os = "windows")]
+    {
+        let h = w.hwnd().map(|h| h.0 as isize).unwrap_or(0);
+        let s = platform::dpi_scale_for(h);
+        if s > 0.2 {
+            s
+        } else {
+            fallback
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        fallback
+    }
+}
+
 /// 缩放错位的起始时刻。B17：错位本来是「显示模式变更中的过渡态」，跳过是对的；
 /// 但实测某些驱动/KVM 链路在「对齐→回滚」后会**长期**保持 mon 与 win 缩放不一致，
 /// 此时守卫与归一化会永久 SKIP —— 宽态定格、自愈失效（用户反馈的「点了铺满就变宽
@@ -138,7 +162,7 @@ fn snapshot_main_window(app: &tauri::AppHandle) -> Option<WinSnap> {
     use tauri::Manager;
     let w = app.get_webview_window("main")?;
     let size = w.inner_size().ok()?;
-    let scale = w.scale_factor().unwrap_or(1.0).max(0.5);
+    let scale = live_scale_of(&w).max(0.5);
     Some(WinSnap {
         css: (size.width as f64 / scale, size.height as f64 / scale),
         pos: w.outer_position().ok(),
@@ -162,7 +186,7 @@ fn restore_main_window(app: &tauri::AppHandle, snap: Option<WinSnap>) {
             std::thread::sleep(std::time::Duration::from_millis(*wait));
         }
         // B19：按逻辑尺寸判定/写回（物理值在 DPI 抖动期间不可靠，见 WinSnap 注释）
-        let scale = w.scale_factor().unwrap_or(1.0).max(0.5);
+        let scale = live_scale_of(&w).max(0.5);
         let cur = w.inner_size().unwrap_or_default();
         let css_w = cur.width as f64 / scale;
         let css_h = cur.height as f64 / scale;
@@ -227,9 +251,10 @@ fn spawn_main_size_watchdog(app: tauri::AppHandle) {
                 bad = 0;
                 continue;
             }
-            let (Ok(scale), Ok(cur)) = (w.scale_factor(), w.inner_size()) else {
+            let Ok(cur) = w.inner_size() else {
                 continue;
             };
+            let scale = live_scale_of(&w);
             let (tw, th) = norm_target_phys(&w, scale);
             // B19：同样按 CSS 逻辑尺寸判定（理由见 normalize_main_window）。
             // 物理值在 DPI 往返期间会被放大/缩小，拿它跟目标比会把「尺寸其实正常」
@@ -272,7 +297,8 @@ fn normalize_main_window(app: &tauri::AppHandle) {
     let pos = mon.position();
     let size = mon.size();
     let scale = mon.scale_factor();
-    let win_scale = w.scale_factor().unwrap_or(scale);
+    // B23：窗口自身 DPI 用 Win32 实时值（Tauri 缓存值可能在显示模式改过后失真）
+    let win_scale = live_scale_of(&w).max(0.2);
     // B12 交叉校验：主屏报告的缩放与窗口自身 DPI 上下文不一致 = 显示模式/DPI
     // 正在抖动（实测：对齐改分辨率瞬间 mon_scale=1.00 而 win_scale=1.50，还原
     // 时反向错位）。此时算出的目标尺寸是过渡值，set_size 会把窗口写死成错误
@@ -369,24 +395,30 @@ fn window_geometry(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     };
     let inner = w.inner_size().map_err(|e| e.to_string())?;
     let scale = w.scale_factor().map_err(|e| e.to_string())?;
+    // B23：Tauri 的 scale_factor 在显示模式被改过之后可能停在中途值（mode=2 的
+    // 自动对齐会把主屏切到 2560x1440@100%，再切回来时缓存未必刷新）。用 Win32
+    // GetDpiForWindow 拿实时值做权威口径 —— 否则「物理宽 ÷ 缓存缩放」把 CSS 宽
+    // 算大，页面按大宽度排版，右边被窗口边缘裁掉。
+    let live_scale = live_scale_of(&w);
     let mon_scale = w
         .primary_monitor()
         .ok()
         .flatten()
         .map(|m| m.scale_factor())
         .unwrap_or(scale);
-    let (tw, th) = norm_target_phys(&w, scale);
+    let (tw, th) = norm_target_phys(&w, live_scale);
     let maximized = w.is_maximized().unwrap_or(false);
     Ok(serde_json::json!({
         "phys_w": inner.width,
         "phys_h": inner.height,
         "scale": scale,
-        "expect_css_w": tw as f64 / scale,
-        "expect_css_h": th as f64 / scale,
+        "dpi_scale": live_scale,
+        "expect_css_w": tw as f64 / live_scale,
+        "expect_css_h": th as f64 / live_scale,
         // B17：错位只在「过渡态」时让守卫让路；持续 >6s 说明归位广播不会再来，
         // 不再算 suspicious —— 否则守卫会永久跳过，宽态再也修不回来。
-        "suspicious": (mon_scale - scale).abs() > 0.01
-            && !scale_mismatch_persistent(mon_scale, scale),
+        "suspicious": (mon_scale - live_scale).abs() > 0.01
+            && !scale_mismatch_persistent(mon_scale, live_scale),
         "maximized": maximized,
     }))
 }
@@ -409,15 +441,25 @@ async fn resync_main_window(
             return Err("主窗口不存在".into());
         };
         let scale = w.scale_factor().map_err(|e| e.to_string())?;
+        // B23：以 Win32 实时 DPI 为准（Tauri 的缓存值在显示模式改过后可能停在旧值，
+        // 那会把「物理宽 ÷ 缩放」算大 → 判定口径全错 → 越修越偏）。
+        let live = live_scale_of(&w);
         let inner = w.inner_size().map_err(|e| e.to_string())?;
-        let (tw, th) = norm_target_phys(&w, scale);
+        let (tw, th) = norm_target_phys(&w, live);
         // B19：按 CSS 逻辑尺寸判定（物理值在 DPI 抖动期间会被放大/缩小，拿它比对
         // 会在错的缩放下写出错误宽度）。宽度 3 CSS px、高度 40 CSS px —— 高度不跟
         // 用户手动拖高较劲。
-        let css_now_w = inner.width as f64 / scale;
-        let css_now_h = inner.height as f64 / scale;
-        let want_css_w = tw as f64 / scale;
-        let want_css_h = th as f64 / scale;
+        let css_now_w = inner.width as f64 / live;
+        let css_now_h = inner.height as f64 / live;
+        let want_css_w = tw as f64 / live;
+        let want_css_h = th as f64 / live;
+        #[cfg(target_os = "windows")]
+        platform::append_viewport_log(&format!(
+            "resync#{:?} css={css_width:.0} phys={}x{} tauri_scale={scale:.2} live_scale={live:.2} expect={want_css_w:.0}",
+            attempt.unwrap_or(0),
+            inner.width,
+            inner.height
+        ));
         if (css_now_w - want_css_w).abs() > 3.0 || (css_now_h - want_css_h).abs() > 40.0 {
             eprintln!(
                 "[guard] RESIZE phys={}x{} (css {css_now_w:.0}x{css_now_h:.0}) → {tw}x{th}",
@@ -491,7 +533,7 @@ async fn recover_main_window(app: tauri::AppHandle) -> Result<String, String> {
 
         // 一、窗口收回设计尺寸。先按当前 DPI 折算物理值，再补一次逻辑值 ——
         // 某些驱动下 scale_factor 还没定型，两次里总有一次是对的。
-        let scale = w.scale_factor().unwrap_or(1.0);
+        let scale = live_scale_of(&w);
         let (tw, th) = norm_target_phys(&w, scale);
         // 关键一步：先把窗口撑大再收回。只做 set_size 到目标值时，如果尺寸本来
         // 就"看着对"，Windows 不会发 WM_DPICHANGED、WebView2 也不会重算
