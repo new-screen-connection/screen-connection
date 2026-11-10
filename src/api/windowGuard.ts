@@ -108,9 +108,15 @@ export function startWindowGuard(): void {
 
   // 启动即钉一次，并在窗口尺寸变化后 120ms 内重钉（尺寸抖动发生时立刻生效，
   // 不用等下一轮 2s 轮询）。
+  // 启动期保护：窗口刚创建时客户区可能还是 0×0，此时「物理宽 ÷ 缩放」是 0，
+  // 跟期望 780 差一整屏，守卫会判定「被写坏」并每轮 set_size —— 实测启动阶段
+  // 连写 4800 次、日志涨到 484KB，窗口最后没能正常出现。尺寸没有意义时什么都不做。
+  const sizeReady = (g: WindowGeometry): boolean => g.phys_w > 120 && g.phys_h > 120;
+
   const pinNow = async (): Promise<void> => {
     try {
       const g = await invoke<WindowGeometry>('window_geometry');
+      if (!sizeReady(g)) return;
       pinContentWidth(g.phys_w, g.dpi_scale || g.scale);
     } catch { /* 非 Tauri 环境：忽略 */ }
   };
@@ -129,6 +135,7 @@ export function startWindowGuard(): void {
     } catch {
       return; // 非 Tauri 环境或窗口不在：静默跳过
     }
+    if (!sizeReady(g)) return; // 窗口还没尺寸：本轮所有判定都不可信
     pinContentWidth(g.phys_w, g.dpi_scale || g.scale);
     // 最大化是用户意图，不干预
     if (g.maximized) {

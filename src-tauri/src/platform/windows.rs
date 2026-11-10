@@ -5629,6 +5629,16 @@ pub fn diag_log_path() -> String {
 pub fn append_viewport_log(line: &str) {
     use std::io::Write;
     let p = diag_log_dir().join("viewport.log");
+    // 这个日志是排障用的，只在守卫反复动作时才写。但守卫一旦空转（例如启动期
+    // 客户区还是 0×0），每 4 秒一条，实测能把文件写到 484KB/4800 条。超过 256KiB
+    // 就轮转一份，避免长期运行时把用户磁盘写满。
+    if let Ok(m) = std::fs::metadata(&p) {
+        if m.len() > 256 * 1024 {
+            let old = diag_log_dir().join("viewport.log.1");
+            let _ = std::fs::remove_file(&old);
+            let _ = std::fs::rename(&p, &old);
+        }
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

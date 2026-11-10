@@ -445,6 +445,20 @@ async fn resync_main_window(
         // 那会把「物理宽 ÷ 缩放」算大 → 判定口径全错 → 越修越偏）。
         let live = live_scale_of(&w);
         let inner = w.inner_size().map_err(|e| e.to_string())?;
+        // 启动期保护：窗口刚创建时客户区可能还是 0×0（或极小），此时「物理宽 ÷ DPI」
+        // 得到 0，跟期望 780 差了 780 px，守卫会判定「尺寸被写坏」并无条件 set_size。
+        // 实测启动阶段每 4 秒写一次 RESIZE phys=0x0 → 1170x1140，连写 4800 次、日志
+        // 涨到 484KB，窗口最后没能正常出现。尺寸没意义时一律不碰窗口。
+        #[cfg(target_os = "windows")]
+        if inner.width < 120 || inner.height < 120 {
+            platform::append_viewport_log(&format!(
+                "resync#{:?} SKIP 窗口未初始化 phys={}x{}",
+                attempt.unwrap_or(0),
+                inner.width,
+                inner.height
+            ));
+            return Ok("skip".to_string());
+        }
         let (tw, th) = norm_target_phys(&w, live);
         // B19：按 CSS 逻辑尺寸判定（物理值在 DPI 抖动期间会被放大/缩小，拿它比对
         // 会在错的缩放下写出错误宽度）。宽度 3 CSS px、高度 40 CSS px —— 高度不跟
