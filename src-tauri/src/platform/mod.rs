@@ -93,8 +93,8 @@ pub fn run_cmd(program: &str, args: &[&str]) -> Result<String, String> {
 #[cfg(target_os = "macos")]
 pub fn open_external_page(page: &str) -> Result<(), String> {
     let url = match page {
-        "releases" => "https://github.com/Personalscreenguard/screenguard/releases/latest",
-        "privacy" => "https://github.com/Personalscreenguard/screenguard/blob/main/PRIVACY.md",
+        "releases" => "https://github.com/new-screen-connection/screen-connection/releases/latest",
+        "privacy" => "https://github.com/new-screen-connection/screen-connection/blob/main/PRIVACY.md",
         _ => return Err("不支持打开此外部页面".into()),
     };
     Command::new("/usr/bin/open").arg(url).spawn()
@@ -104,8 +104,8 @@ pub fn open_external_page(page: &str) -> Result<(), String> {
 #[cfg(target_os = "windows")]
 pub fn open_external_page(page: &str) -> Result<(), String> {
     let url = match page {
-        "releases" => "https://github.com/Personalscreenguard/screenguard/releases/latest",
-        "privacy" => "https://github.com/Personalscreenguard/screenguard/blob/main/PRIVACY.md",
+        "releases" => "https://github.com/new-screen-connection/screen-connection/releases/latest",
+        "privacy" => "https://github.com/new-screen-connection/screen-connection/blob/main/PRIVACY.md",
         _ => return Err("不支持打开此外部页面".into()),
     };
     Command::new("rundll32.exe").args(["url.dll,FileProtocolHandler", url]).spawn()
